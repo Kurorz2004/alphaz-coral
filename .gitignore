@@ -1,0 +1,24 @@
+# CORAL upstream clone (vendored separately; becomes a fork/submodule for Task 4)
+/coral-upstream/
+
+# CORAL runtime artifacts
+.coral/
+results/
+*.pid
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.uv/
+
+# Env / secrets
+.env
+.env.*
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store

@@ -4,9 +4,13 @@ Which CORAL mechanism actually matters for the job-shop scheduling task of Task 
 
 | Condition | Change | Runs |
 |---|---|---|
-| **Full CORAL** (control) | none | 3 (1 banked from Task 2 + 2 new) |
+| **Full CORAL** (control) | none | 3 |
 | **A — no knowledge** | `agents.knowledge=false` | 3 |
 | **B — no heartbeats** | `agents.heartbeat=[]` | 3 |
+
+All nine runs use **`agents.model=sonnet`**, not the Opus of Task 2 — see
+*The model is sonnet* below. Absolute scores are therefore not comparable to Task 2's
+headline number; every arm shares the model, so the ablation comparison is unaffected.
 
 Every run uses the **same** `../task2/task.yaml` — same objective text, same tips,
 same seed, same hidden instances, same `max_real_attempts: 12`, no `score_threshold`.
@@ -92,11 +96,48 @@ pooled with the two new full-CORAL runs.
    *capability* is preserved: the knowledge-free `CORAL.md` still tells agents to use
    web search for literature review. What is ablated is the scaffold, not the tool.
 
+## The model is sonnet
+
+The first attempt at this experiment ran on Opus and died on the API quota. Two Opus
+agents exhausted the rolling **5-hour** window in **2 h 50 m**. After that the agents
+exited 1 on every turn, the manager restarted them, the crash-burst breaker paused
+them, and one agent churned through 33 sessions producing nothing. The control run
+reached 10 real evals, never hit its 12th, never auto-stopped, and died on the driver's
+timeout — 78 `five_hour` rejections in its logs.
+
+The quota window is shared across models and Opus drains it several times faster, so
+the whole ablation runs on sonnet. `analyze.py` refuses to pool runs whose recorded
+`agents.model` differs from its `TARGET_MODEL`, and flags any run with a rate-limit
+rejection in its agent logs. The driver detects a rejection, kills the run, sleeps
+until the `resetsAt` epoch the agent logged, and retries from scratch.
+
+## Two leaks the audit caught, that inspection did not
+
+Condition A looked clean in the config and in `CORAL.md`, and was still leaking:
+
+1. **The worktree symlinks.** `setup_shared_state` linked every shared-state item
+   unconditionally. With the knowledge dirs deleted the links *dangled*, so
+   `ls .claude/` still showed the agent a `notes/` and a `skills/` directory.
+2. **The restart prompt.** `_build_score_prompt`, injected on every agent respawn and
+   entirely separate from `CORAL.md`, told Condition A agents to *"Check what other
+   agents have tried via `coral log -n 10`, `coral notes`, and `coral skills`"* and to
+   *"Consolidate scattered notes, distill reusable skills."*
+
+Both are fixed and pinned by regression tests. The lesson generalises: an ablation is
+only as good as the audit that checks it from the run's artifacts, because a flag
+proves intent, not effect.
+
+**One confound we cannot remove.** The agent subprocess is Claude Code, which carries
+its *own* global skills — including one named `deep-research`. CORAL's seeded copy is
+ablated; the user-level one is not, and is present in every arm. So Condition A removes
+CORAL's research scaffold, not the agent's. Since it is identical across arms it cannot
+bias the comparison, but the claim is "no CORAL knowledge channel", not "no skills".
+
 ## Running it
 
 Sequential, one run at a time. This is not a convenience: the grader gives each
 solver a 10 s **wall-clock** budget per instance, so a concurrent run would silently
-cost whichever condition shared the box. 8 runs × ~2 h ≈ 16 h.
+cost whichever condition shared the box. 9 runs × ~2 h ≈ 18 h.
 
 `coral start` spawns headless `claude` subprocesses, so **you** must launch it:
 
@@ -135,9 +176,9 @@ task3/
 └── results/           gitignored
     ├── manifest.jsonl one line per completed run
     ├── summary.json   written by analyze.py
-    ├── full/          full-1, full-2
-    ├── noknowledge/   nok-1, nok-2, nok-3
-    └── noheartbeat/   nohb-1, nohb-2, nohb-3
+    ├── full/          full-s1..s3
+    ├── noknowledge/   nok-s1..s3
+    └── noheartbeat/   nohb-s1..s3
 ```
 
 Task 4 should branch from `task3-ablation`: its "vanilla CORAL" arm is this branch

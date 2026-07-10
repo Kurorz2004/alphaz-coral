@@ -18,10 +18,12 @@ from pathlib import Path
 
 HERE = Path(__file__).parent
 
-# The banked Task 2 run is full-CORAL sample #1: same task.yaml, same budget,
-# same 16 cores, vanilla upstream code. The `agents.knowledge` commit is proven
-# byte-identical for knowledge=True (tests/test_knowledge_ablation.py), so runs
-# on the fork's control arm are poolable with it.
+# Every pooled run must share a model. Two Opus agents exhaust the 5-hour API
+# quota in under 3 h, so the ablation runs on sonnet. The banked Task 2 run and
+# the abandoned Opus attempt are reported as *reference rows*, never pooled.
+TARGET_MODEL = "sonnet"
+
+# Same task.yaml, same budget, same 16 cores, vanilla upstream code — but Opus.
 BANKED_FULL = HERE.parent / "task2/results/job-shop-scheduling/2026-07-09_235518"
 
 CONDITIONS = {
@@ -36,6 +38,7 @@ class Run:
     runid: str
     condition: str
     path: Path
+    model: str = "?"
     final_score: float | None = None
     real_attempts: int = 0
     tune_attempts: int = 0
@@ -48,7 +51,8 @@ class Run:
 
     @property
     def ok(self) -> bool:
-        return self.final_score is not None and not self.integrity
+        """Usable as a pooled sample: finished, clean, and on the pooled model."""
+        return self.final_score is not None and not self.integrity and self.model == TARGET_MODEL
 
 
 def _attempts(run: Path) -> list[dict]:
@@ -67,10 +71,41 @@ def _budget(a: dict) -> str:
     return (a.get("metadata") or {}).get("budget_class", "real")
 
 
+def _model_of(path: Path) -> str:
+    cfg = path / ".coral/config.yaml"
+    if not cfg.is_file():
+        return "?"
+    for line in cfg.read_text().splitlines():
+        s = line.strip()
+        if s.startswith("model:"):
+            return s.split(":", 1)[1].strip()
+    return "?"
+
+
+def _rate_limited(path: Path) -> bool:
+    """Did any agent get an API quota rejection during this run?
+
+    A rate-limited agent exits 1, gets restarted, trips the crash-burst breaker,
+    and produces nothing for the rest of the run. Its attempts before the first
+    rejection are fine; everything after is an artefact of the quota, not of the
+    condition. Any run with a rejection *and* no auto_stop is unusable.
+    """
+    logs = path / ".coral/public/logs"
+    return any('"status":"rejected"' in f.read_text(errors="replace") for f in logs.glob("*.log"))
+
+
 def load_run(runid: str, condition: str, path: Path) -> Run:
-    r = Run(runid=runid, condition=condition, path=path)
-    if not (path / ".coral/public/auto_stop.json").is_file():
+    r = Run(runid=runid, condition=condition, path=path, model=_model_of(path))
+    finished = (path / ".coral/public/auto_stop.json").is_file()
+    if not finished:
         r.integrity.append("no auto_stop.json — run did not finish its eval budget")
+    if _rate_limited(path):
+        r.integrity.append(
+            "API rate-limit rejection in agent logs"
+            + ("" if finished else " — run died on quota, not on the condition")
+        )
+    if r.model != TARGET_MODEL:
+        r.integrity.append(f"model={r.model!r}, not pooled (pooling {TARGET_MODEL!r})")
 
     atts = _attempts(path)
     if not atts:
@@ -138,9 +173,12 @@ def _audit_condition(path: Path, condition: str) -> list[str]:
             bad.append("config does not record knowledge=false")
         if knowledge_dirs:
             bad.append(f"knowledge dirs present despite ablation: {knowledge_dirs}")
-        for banned in ("create-notes", "deep-research", "librarian"):
+        # Match CORAL's *seeded* assets by the path they would live at. A bare
+        # name like "deep-research" also matches Claude Code's own global skill
+        # list, which every arm has and which CORAL does not control.
+        for banned in (".claude/skills/", ".claude/notes/", ".claude/roles/", "coral notes", "coral skills"):
             if banned in log_text:
-                bad.append(f"agent referenced ablated asset {banned!r}")
+                bad.append(f"agent reached the ablated channel via {banned!r}")
         if heartbeats_fired == 0:
             bad.append("no heartbeat fired (reflect/pivot should survive Condition A)")
         if "Knowledge Synthesis" in log_text or "Wiki Lint" in log_text:
@@ -164,8 +202,11 @@ def discover() -> list[Run]:
         d = HERE / "results" / cond
         if not d.is_dir():
             continue
-        for run_dir in sorted(p for p in d.iterdir() if p.is_dir() and p.name != "latest"):
-            runs.append(load_run(run_dir.name, cond, run_dir))
+        # `latest` is a symlink; `<task-slug>/` is a stray dir CORAL leaves behind
+        # when results_dir and run_dir disagree. A run is a dir with a .coral/.
+        for run_dir in sorted(p for p in d.iterdir() if p.is_dir() and not p.is_symlink()):
+            if (run_dir / ".coral").is_dir():
+                runs.append(load_run(run_dir.name, cond, run_dir))
     return runs
 
 
@@ -227,16 +268,15 @@ def main() -> None:
     print("=" * 100)
     print("PER-RUN")
     print("=" * 100)
-    hdr = f"{'run':<14}{'condition':<14}{'final':>10}{'real':>6}{'tune':>6}{'fail':>6}{'best@':>7}{'min':>7}  agents"
+    hdr = f"{'run':<14}{'condition':<14}{'model':<8}{'final':>10}{'real':>6}{'tune':>6}{'fail':>6}{'best@':>7}{'min':>7}"
     print(hdr)
     print("-" * 100)
     for r in runs:
         score = f"{r.final_score:.6f}" if r.final_score is not None else "—"
         wall = f"{r.wall_minutes:.0f}" if r.wall_minutes else "—"
-        agents = ",".join(f"{k}:{v}" for k, v in sorted(r.agents.items()))
         print(
-            f"{r.runid:<14}{r.condition:<14}{score:>10}{r.real_attempts:>6}"
-            f"{r.tune_attempts:>6}{r.failed_attempts:>6}{str(r.best_at_eval or '—'):>7}{wall:>7}  {agents}"
+            f"{r.runid:<14}{r.condition:<14}{r.model:<8}{score:>10}{r.real_attempts:>6}"
+            f"{r.tune_attempts:>6}{r.failed_attempts:>6}{str(r.best_at_eval or '—'):>7}{wall:>7}"
         )
         for msg in r.integrity:
             print(f"{'':>14}!! {msg}")

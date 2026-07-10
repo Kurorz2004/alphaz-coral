@@ -77,8 +77,8 @@ all cross-agent transfer.** That is the honest scope of the claim.
 not by inspection: the ON text of every template region was extracted verbatim from
 the pre-flag template, and `test_knowledge_on_renders_byte_identical_to_upstream`
 renders upstream's template straight out of git (`upstream-base` tag) and asserts the
-rendered `CORAL.md` matches byte-for-byte. That is what lets the banked Task 2 run be
-pooled with the two new full-CORAL runs.
+rendered `CORAL.md` matches byte-for-byte. So the control arm runs vanilla CORAL, even
+though it runs it through the fork.
 
 ### Known overlaps and confounds, stated up front
 

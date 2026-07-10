@@ -248,7 +248,8 @@ signal (eval 1 → eval 14) = 0.026957        ⇒  SNR ≈ 223×
 | 2 | **`workspace.setup` does not isolate dependencies.** `setup_worktree_env` (`coral/workspace/worktree.py:690-720`) sets `UV_PROJECT_ENVIRONMENT` intending a per-worktree venv — its docstring (line 699) says this "prevent[s] concurrent agents from corrupting a shared venv." But **`uv pip install` ignores that variable**; with no `VIRTUAL_ENV` it walks `PATH` and installs into whatever venv it finds. Task 1's run put numpy 2.5.1 + scipy 1.18.0 into `coral-upstream/.venv` and created no worktree venv. Affects every `examples/*` task using `uv pip install` in `workspace.setup`. | Fixed in `task2/task.yaml` by running `uv venv` **first**; verified CORAL's venv stays clean. Upstream still broken. |
 | 3 | **`coral ui` needs a Node toolchain despite shipping prebuilt assets.** `_ensure_ui_built` (`coral/cli/ui.py:35-48`) rebuilds if any `web/src/` file is newer than `coral/web/static/index.html`. A fresh clone stamps `Overview.tsx` 2 s later, so it always rebuilds — invoking `npm`, which here resolves to a Windows install unusable from Linux paths. | Worked around (touched the committed assets) |
 | 4 | **Grader/multiprocessing pickling.** The grader imports `solution` via an `importlib` spec, so `multiprocessing.Pool.map` raises `PicklingError: import of module 'solution' failed`. `Process` under `fork` works. **Found by agent `captain-ahab`**, which said it "bit me silently for four evals." See `task2/result/notes/infra/grader-multiprocessing-pickling.md`. | Documented |
-| 5 | **`agents.heartbeat: []` does not disable heartbeats.** `write_agent_heartbeat` / `write_global_heartbeat` re-inject `PROTECTED_LOCAL={reflect}` / `PROTECTED_GLOBAL={consolidate}` when absent, so the config silently regrows `reflect` every eval and `consolidate` every 10. A user disabling heartbeats gets no warning and no visible difference in `task.yaml`. | Fixed on `task3-ablation` (`protect` param); regression test added |
+| 5 | **`agents.heartbeat: []` does not disable heartbeats — two separate regrowth paths.** (a) `_preprocess` (`config.py`) back-fills every default the user did not *name*; an empty list names nothing, so `heartbeat: []` in task.yaml regrows **all four** defaults. (b) `write_agent_heartbeat` / `write_global_heartbeat` re-inject `PROTECTED_LOCAL={reflect}` / `PROTECTED_GLOBAL={consolidate}` when absent, which bites even the dotlist form that bypasses (a). Silent in both cases. Workaround on stock CORAL: name all four with `every: 1000000` (`every: 0` raises `ZeroDivisionError`). | Both fixed on `task3-ablation`; two regression tests |
+| 8 | **`SharingConfig` is dead config.** `sharing.attempts / notes / skills` (`config.py:315`) is a documented-looking switch for exactly the knowledge channel Task 3 ablates — and nothing in the entire `coral/` package ever reads `config.sharing`. Setting `sharing.notes: false` does nothing, with no warning. | Found, not fixed |
 | 6 | **`agents.research` is dead in multi-agent mode.** `generate_coral_md` computes `research_section`, `workflow_summary` and the step-number offsets, but `coral.md.template` contains none of those placeholders — only `coral_single.md.template` does. `str.format` ignores the extra kwargs, so `agents.research: false` silently does nothing for any run with `agents.count > 1`. | Found, not fixed (out of Task 3 scope) |
 | 7 | **Disabling heartbeats also disables the eval-result header.** `manager.py`'s `if not actions: continue` sits above the code that builds the `## Eval #N Results` block, so the two features are coupled: no heartbeat action ⇒ no injected score summary. Defensible, but undocumented, and it confounds any "disable heartbeats" ablation. | Documented; measured in `task3/analyze.py` |
 
@@ -286,18 +287,35 @@ CORAL.
 deliberately **no `score_threshold`**. Every condition must spend an identical eval budget
 or the means are incomparable. Do not add a score threshold.
 
-**~~Condition B is free~~ — WRONG, and it would have silently ruined the arm.**
-Setting `agents.heartbeat: []` does **not** disable heartbeats. `write_agent_heartbeat`
-and `write_global_heartbeat` (`coral/hub/heartbeat.py`) re-add `PROTECTED_LOCAL` /
-`PROTECTED_GLOBAL` whenever they are absent, so an empty list still yields `reflect`
-every eval and `consolidate` every 10 global evals. Verified by round-tripping the
-writers. Both now take `protect`; the manager passes `protect=False` when the list is
-empty by design. Defaults live at `coral/config.py` (`reflect` every 1, `consolidate`
-every 10 global, `pivot` after 5 plateau, `lint_wiki` every 10 global).
+**~~Condition B is free~~ — the recipe is wrong, though a config-only route exists.**
+Setting `agents.heartbeat: []` does **not** disable heartbeats. Two independent
+mechanisms regrow it, and both must be defeated:
 
-**Condition A also needs a code change** — there is no config flag. Both are now
-implemented on the fork branch `task3-ablation` as `agents.knowledge: bool = True`;
-see `task3/README.md` for the exact semantics and the stated confounds.
+1. `_preprocess` (`coral/config.py`) back-fills every default action the user did not
+   *name*. An empty list names nothing, so **`heartbeat: []` in task.yaml regrows all
+   four defaults** and is byte-identical to not setting it at all.
+2. `write_agent_heartbeat` / `write_global_heartbeat` (`coral/hub/heartbeat.py`) re-add
+   `PROTECTED_LOCAL={reflect}` / `PROTECTED_GLOBAL={consolidate}` whenever absent. This
+   bites even the dotlist form (`agents.heartbeat=[]`), which bypasses `_preprocess`.
+
+Both verified by running pristine `upstream-base` in a worktree and counting firings
+over 12 simulated evals.
+
+**There is a config-only way to run Condition B on stock CORAL**, and it is worth
+knowing: name all four actions with an unreachable interval
+(`every: 1000000`; plateau uses `streak >= every`, interval uses `count % every == 0`,
+and `every` has no upper bound). Naming all four defeats *both* regrowth paths. Do not
+use `every: 0` — `count % 0` raises `ZeroDivisionError`. Pinned by
+`test_unreachable_every_disables_heartbeats_without_any_code_change`.
+
+We instead fixed both regrowth paths on the fork branch `task3-ablation`, so
+`heartbeat: []` means what it says. That is a **defect fix, not a prerequisite** for
+the arm — say so in the write-up rather than claiming B was impossible without code.
+
+**Condition A genuinely does need a code change.** There is no working switch.
+`SharingConfig` (`sharing.notes` / `.skills` / `.attempts`) looks like one but is dead
+config — nothing in the upstream tree ever reads it. Implemented on the fork as
+`agents.knowledge: bool = True`; see `task3/README.md` for semantics and confounds.
 
 **Reuse the existing Task 2 run** (`task2/results/job-shop-scheduling/2026-07-09_235518/`)
 as one "full CORAL" sample; it is preserved. ~2 h per run, so 9 runs ≈ 18 h.

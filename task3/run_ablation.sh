@@ -86,6 +86,25 @@ preflight() {
   log "preflight OK — $(nproc) cores, timeout ${TIMEOUT_SEC}s/run"
 }
 
+# `.coral/config.yaml` lands in create_project, but the heartbeat JSONs are not
+# seeded until AgentManager.start() — after the grader venv install. Verifying
+# too early would fail on a file that simply has not been written yet.
+# Wait for _global.json plus one heartbeat file per agent.
+wait_for_seed() {
+  local rundir="$1" want=$((2 + 1)) waited=0 # agents.count=2, plus _global.json
+  while :; do
+    local n
+    n=$(find "$rundir/.coral/public/heartbeat" -name '*.json' 2>/dev/null | wc -l)
+    [ "$n" -ge "$want" ] && return 0
+    sleep 5
+    waited=$((waited + 5))
+    if [ $waited -ge 900 ]; then
+      log "  !! only $n/$want heartbeat files after ${waited}s"
+      return 1
+    fi
+  done
+}
+
 # Assert the condition actually took effect before spending 2 h on the run.
 verify_condition() {
   local rundir="$1" cond="$2" cfg="$1/.coral/config.yaml"
@@ -146,7 +165,7 @@ run_one() {
     [ $waited -ge 300 ] && { log "  !! run dir never appeared"; return 1; }
   done
 
-  if ! verify_condition "$rundir" "$cond"; then
+  if ! wait_for_seed "$rundir" || ! verify_condition "$rundir" "$cond"; then
     log "  !! condition $cond did not take effect — stopping run, NOT counting it"
     "${CORAL[@]}" stop >/dev/null 2>&1
     return 1
@@ -169,6 +188,12 @@ run_one() {
     fi
     sleep "$POLL_SEC"
   done
+
+  # Don't start the next run while this manager + grader daemon are still tearing
+  # down: they'd compete for CPU with the next run's graded evals.
+  local drain=0
+  while manager_alive && [ $drain -lt 300 ]; do sleep 10; drain=$((drain + 10)); done
+  manager_alive && { log "  manager still alive after ${drain}s — forcing stop"; "${CORAL[@]}" stop >/dev/null 2>&1; sleep 20; }
 
   local elapsed=$((SECONDS - t0))
   local n_attempts

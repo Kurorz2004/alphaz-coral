@@ -13,20 +13,47 @@ same seed, same hidden instances, same `max_real_attempts: 12`, no `score_thresh
 Conditions are expressed purely as dotlist overrides, so the prompt the agent reads
 cannot drift between arms.
 
-## Both conditions needed a code change
+## What each condition required
 
-Neither ablation was expressible in vanilla CORAL. The fork
-(`coral-upstream`, branch `task3-ablation`) adds them.
+**Condition B: `agents.heartbeat: []` is a silent no-op in stock CORAL.** Two
+independent mechanisms regrow the list, and both must be defeated:
 
-**Condition B was not free.** `agents.heartbeat: []` looks like it disables
-heartbeats, but `write_agent_heartbeat` / `write_global_heartbeat` re-add the
-`PROTECTED_LOCAL` / `PROTECTED_GLOBAL` actions whenever they are missing. An empty
-list still produced `reflect` every eval and `consolidate` every 10 global evals —
-condition B would have been a near no-op and nobody would have noticed. Both writers
-now take `protect`, and the manager passes `protect=False` when the list is empty by
-design. Regression test: `tests/test_knowledge_ablation.py::test_empty_heartbeat_list_is_honoured_only_without_protect`.
+1. `_preprocess` (`coral/config.py`) back-fills every default action the user did not
+   *name*. An empty list names nothing, so `heartbeat: []` in task.yaml regrows **all
+   four** defaults — byte-identical to not setting it at all.
+2. `write_agent_heartbeat` / `write_global_heartbeat` re-add `PROTECTED_LOCAL={reflect}`
+   / `PROTECTED_GLOBAL={consolidate}` whenever missing. This bites even the dotlist form
+   (`agents.heartbeat=[]`), which bypasses `_preprocess`.
 
-**Condition A is a new config field**, `agents.knowledge`. When false:
+Both were confirmed by running pristine `upstream-base` in a git worktree and counting
+heartbeat firings over 12 simulated evals: the default config and `heartbeat: []`
+produced the *same* 18 firings.
+
+**B did not strictly require a code change.** Naming all four actions with an
+unreachable interval defeats both regrowth paths, because interval actions fire on
+`count % every == 0`, plateau actions on `streak >= every`, and `every` has no upper
+bound:
+
+```yaml
+agents:
+  heartbeat:
+    - {name: reflect,     every: 1000000}
+    - {name: consolidate, every: 1000000, global: true}
+    - {name: pivot,       every: 1000000, trigger: plateau}
+    - {name: lint_wiki,   every: 1000000, global: true}
+```
+
+(Not `every: 0` — `count % 0` raises `ZeroDivisionError`.) This is pinned by
+`test_unreachable_every_disables_heartbeats_without_any_code_change`. We ran B via the
+fixed `heartbeat: []` instead, because the trick leaves four phantom actions visible to
+the agent in `coral heartbeat` output while CORAL.md is inviting it to
+`coral heartbeat set reflect --every 3`. **So the `protect` / `_preprocess` fixes are a
+defect fix, not a prerequisite for the arm.**
+
+**Condition A genuinely has no built-in switch.** `SharingConfig`
+(`sharing.notes` / `.skills` / `.attempts`, `config.py:315`) looks like exactly the
+right knob and is **dead config** — nothing in the upstream package ever reads
+`config.sharing`. So A is a new field, `agents.knowledge`. When false:
 
 - `notes/`, `skills/`, `agents/`, `roles/` are neither created nor seeded;
 - no bundled skills (`deep-research`, `create-notes`, `organize-files`, `skill-creator`)

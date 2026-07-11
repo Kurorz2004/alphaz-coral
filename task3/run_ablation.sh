@@ -59,7 +59,10 @@ PLAN=(
   "full-s3:full"
 )
 
-log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+# stdout of attempt_run IS its return value (`status=$(attempt_run ...)`), so
+# log() must never write there — otherwise status becomes "[HH:MM:SS] ...\nauto_stop"
+# and the `status = auto_stop` test silently fails on a run that finished fine.
+log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 die() { printf '\n!! %s\n' "$*" >&2; exit 1; }
 
 # The handoff's gotcha: `pgrep -f "coral.cli start"` matches this script's own
@@ -155,6 +158,40 @@ verify_condition() {
   return 0
 }
 
+# `agents.model=sonnet` is only a runtime *alias*. ~/.claude/settings.json's env
+# block can remap it (ANTHROPIC_DEFAULT_SONNET_MODEL=deepseek-v4-pro is how
+# full-s1/nok-s1 silently ran on deepseek while their config.yaml said "sonnet").
+# config.yaml records the alias; only the agent logs record what actually loaded.
+# Derive the expected real-model prefix from MODEL so the documented
+# `MODEL=opus ./run_ablation.sh` override is verified against claude-opus, not sonnet.
+case "$MODEL" in
+  sonnet) EXPECT_MODEL=${EXPECT_MODEL:-claude-sonnet} ;;
+  opus)   EXPECT_MODEL=${EXPECT_MODEL:-claude-opus} ;;
+  haiku)  EXPECT_MODEL=${EXPECT_MODEL:-claude-haiku} ;;
+  *)      EXPECT_MODEL=${EXPECT_MODEL:-$MODEL} ;;
+esac
+
+actual_model() {
+  grep -rhoE '"model":"[^"]+"' "$1/.coral/public/logs" 2>/dev/null |
+    sed -E 's/.*:"(.*)"/\1/' | grep -v '^<synthetic>$' |
+    sort | uniq -c | sort -rn | head -1 | awk '{print $2}'
+}
+
+verify_actual_model() {
+  local rundir="$1" waited=0 m=""
+  while [ $waited -lt 600 ]; do
+    m=$(actual_model "$rundir")
+    [ -n "$m" ] && break
+    sleep 10
+    waited=$((waited + 10))
+  done
+  [ -z "$m" ] && { log "  !! no model string in agent logs after ${waited}s"; return 1; }
+  case "$m" in
+    *"$EXPECT_MODEL"*) log "  actual model = $m"; return 0 ;;
+    *) log "  !! actual model is '$m', expected *${EXPECT_MODEL}* — check ANTHROPIC_DEFAULT_*_MODEL"; return 1 ;;
+  esac
+}
+
 stop_run() {
   "${CORAL[@]}" stop >/dev/null 2>&1
   local drain=0
@@ -185,6 +222,11 @@ attempt_run() {
   if ! wait_for_seed "$rundir" || ! verify_condition "$rundir" "$cond"; then
     stop_run
     echo "condition_not_applied"
+    return
+  fi
+  if ! verify_actual_model "$rundir"; then
+    stop_run
+    echo "wrong_model"
     return
   fi
   log "  condition verified (model=$MODEL); polling every ${POLL_SEC}s"

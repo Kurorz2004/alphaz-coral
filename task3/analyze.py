@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from itertools import combinations
@@ -72,13 +73,36 @@ def _budget(a: dict) -> str:
 
 
 def _model_of(path: Path) -> str:
+    """The model that *actually* ran, normalized to the alias vocabulary.
+
+    config.yaml only records the runtime alias (`model: sonnet`); ~/.claude
+    settings can remap that alias to another provider (ANTHROPIC_DEFAULT_SONNET_MODEL
+    = deepseek-v4-pro is how full-s1/nok-s1 ran on deepseek while their config said
+    sonnet). The agent logs carry the real `"model":"..."` string — trust those, and
+    fall back to the config label only when no logs exist yet.
+    """
+    logs = path / ".coral/public/logs"
+    counts: dict[str, int] = {}
+    for f in logs.glob("*.log"):
+        for m in re.findall(r'"model":"([^"]+)"', f.read_text(errors="replace")):
+            if m != "<synthetic>":
+                counts[m] = counts.get(m, 0) + 1
+    if counts:
+        real = max(counts, key=counts.get)
+        if real.startswith("claude-sonnet"):
+            return "sonnet"
+        if real.startswith("claude-opus"):
+            return "opus"
+        if real.startswith("claude-haiku"):
+            return "haiku"
+        return real  # deepseek-v4-pro, etc. — never matches TARGET_MODEL, so excluded
+
     cfg = path / ".coral/config.yaml"
-    if not cfg.is_file():
-        return "?"
-    for line in cfg.read_text().splitlines():
-        s = line.strip()
-        if s.startswith("model:"):
-            return s.split(":", 1)[1].strip()
+    if cfg.is_file():
+        for line in cfg.read_text().splitlines():
+            s = line.strip()
+            if s.startswith("model:"):
+                return s.split(":", 1)[1].strip()
     return "?"
 
 
@@ -92,6 +116,22 @@ def _rate_limited(path: Path) -> bool:
     """
     logs = path / ".coral/public/logs"
     return any('"status":"rejected"' in f.read_text(errors="replace") for f in logs.glob("*.log"))
+
+
+def _authoritative_real_count(path: Path) -> int | None:
+    """CORAL's own real-attempt tally from auto_stop.json.
+
+    This is the number CORAL used to decide `max_real_attempts` was reached, so
+    it is immune to verify-race duplicates and failed (score=None) evals that
+    leave extra files in the attempts dir. None if the run never auto-stopped.
+    """
+    f = path / ".coral/public/auto_stop.json"
+    if not f.is_file():
+        return None
+    try:
+        return int(json.loads(f.read_text()).get("real_attempt_count"))
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return None
 
 
 def load_run(runid: str, condition: str, path: Path) -> Run:
@@ -133,8 +173,14 @@ def load_run(runid: str, condition: str, path: Path) -> Run:
     if len(ts) >= 2:
         r.wall_minutes = (max(ts) - min(ts)).total_seconds() / 60
 
-    if r.real_attempts != 12:
-        r.integrity.append(f"expected 12 real attempts, found {r.real_attempts}")
+    # Prefer CORAL's own counter over the raw file count: a verify-race can leave
+    # an extra failed (score=None) attempt file that CORAL never counted toward
+    # its budget. Fall back to scored real attempts when there is no auto_stop.
+    authoritative = _authoritative_real_count(path)
+    if authoritative is None:
+        authoritative = len(scored)
+    if authoritative != 12:
+        r.integrity.append(f"expected 12 real attempts, found {authoritative}")
 
     r.integrity.extend(_audit_condition(path, condition))
     return r
@@ -154,7 +200,13 @@ def _audit_condition(path: Path, condition: str) -> list[str]:
     logs = sorted((pub / "logs").glob("*.log"))
     log_text = "\n".join(f.read_text(errors="replace") for f in logs)
 
-    knowledge_dirs = [d for d in ("notes", "skills", "roles", "agents") if (pub / d).exists()]
+    # A knowledge dir counts only if it holds actual content. `coral ui` (and the
+    # mid-run seed) create bare empty notes/skills dirs that carry no notes or
+    # skills — an empty shell is a tooling artifact, not a leak. Require a file.
+    def _has_content(d: Path) -> bool:
+        return d.is_dir() and any(f.is_file() for f in d.rglob("*"))
+
+    knowledge_dirs = [d for d in ("notes", "skills", "roles", "agents") if _has_content(pub / d)]
     # `## Heartbeat:` heads every injected heartbeat prompt; `## Eval #N Results`
     # heads the score report that rides along with it (manager.py builds them
     # together, which is why B loses both).

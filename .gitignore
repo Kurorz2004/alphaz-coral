@@ -5,6 +5,7 @@
 .coral/
 results/
 *.pid
+*.log
 
 # Python
 __pycache__/

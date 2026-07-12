@@ -1,0 +1,102 @@
+{
+  "G100_1165_01": {
+    "abcd_group": "1165",
+    "bks_distance": 10639,
+    "capacity": 1088,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 5,
+    "total_demand": 4980
+  },
+  "G100_1265_01": {
+    "abcd_group": "1265",
+    "bks_distance": 6769,
+    "capacity": 880,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 6,
+    "total_demand": 4912
+  },
+  "G100_1312_01": {
+    "abcd_group": "1312",
+    "bks_distance": 22841,
+    "capacity": 5,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 20,
+    "total_demand": 100
+  },
+  "G100_1356_01": {
+    "abcd_group": "1356",
+    "bks_distance": 8531,
+    "capacity": 1907,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 4,
+    "total_demand": 7318
+  },
+  "G100_2134_01": {
+    "abcd_group": "2134",
+    "bks_distance": 11103,
+    "capacity": 96,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 8,
+    "total_demand": 740
+  },
+  "G100_2245_01": {
+    "abcd_group": "2245",
+    "bks_distance": 6839,
+    "capacity": 1079,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 5,
+    "total_demand": 4938
+  },
+  "G100_2325_01": {
+    "abcd_group": "2325",
+    "bks_distance": 9359,
+    "capacity": 118,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 5,
+    "total_demand": 571
+  },
+  "G100_2371_01": {
+    "abcd_group": "2371",
+    "bks_distance": 28347,
+    "capacity": 121,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 33,
+    "total_demand": 3242
+  },
+  "G100_3133_01": {
+    "abcd_group": "3133",
+    "bks_distance": 19384,
+    "capacity": 80,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 10,
+    "total_demand": 765
+  },
+  "G100_3166_01": {
+    "abcd_group": "3166",
+    "bks_distance": 9415,
+    "capacity": 2082,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 3,
+    "total_demand": 4970
+  }
+}

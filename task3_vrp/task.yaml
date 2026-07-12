@@ -1,0 +1,125 @@
+task:
+  name: "Capacitated Vehicle Routing Problem"
+  description: |
+    Solve the Capacitated Vehicle Routing Problem (CVRP), minimising the total
+    distance travelled by a fleet of vehicles.
+
+    You are given a set of customers, each with a location and a demand. A fleet
+    of identical vehicles, each with the same capacity, serves all customers
+    starting and ending at a single depot. Every customer must be visited exactly
+    once; the total demand on any route must not exceed the vehicle capacity.
+
+    Your program `solution.py` must define:
+
+        solve(dimension, capacity, node_coords, demands, n_vehicles, time_limit, seed) -> routes
+
+      dimension     int, total number of nodes (depot + customers)
+      capacity      int, vehicle capacity
+      node_coords   list[tuple[int,int]], coordinates of each node. Node 0 is
+                    the depot; nodes 1..dimension-1 are customers.
+      demands       list[int], demand at each node. demands[0] = 0.
+      n_vehicles    int, number of vehicles available (always dimension - 1, i.e.
+                    one per customer — effectively unlimited). You may use fewer
+                    vehicles but not more.
+      time_limit    float, seconds you may spend on THIS instance
+      seed          int, for reproducible randomisation
+      routes        list[list[int]], each inner list is one vehicle's route
+                    (a sequence of customer indices starting and ending at the
+                    depot, which is implied — do NOT include 0 in the route).
+
+    **Distances.** The edge weight type is EUC_2D: Euclidean distance rounded to
+    the nearest integer, with double-precision computations:
+
+        dx = x[i] - x[j]; dy = y[i] - y[j]
+        d = int(math.sqrt(dx*dx + dy*dy) + 0.5)
+
+    **Feasibility.** A solution is infeasible if ANY of these holds:
+      1. A customer is visited more than once or not at all
+      2. A route's total demand exceeds `capacity`
+      3. More than `n_vehicles` routes are used
+      4. A route contains an invalid customer index (< 1 or >= dimension)
+    **Any infeasible or malformed solution fails the entire evaluation.**
+
+    **Scoring.** Score = mean over the hidden instances of
+    `reference_distance / solver_distance`. The reference distance for each
+    instance is not a proven optimum — it is a strong-heuristic reference,
+    produced by running PyVRP's hybrid genetic search with an unlimited fleet
+    and taking the best of 3 seeds x 60 seconds each. Measured on instances
+    from the same generator whose true optima are known, this reference lands
+    exactly on the optimum about two-thirds of the time; when it misses, the
+    mean gap is 0.07% (worst observed 0.62%). So it is a close but very
+    slightly loose upper bound on the true optimum.
+
+    Higher is strictly better, and there is no fixed ceiling on the score: if
+    your solver beats the reference on an instance, your score on that
+    instance will slightly exceed 1.0.
+
+    **Instances.** Every instance is a freshly generated CVRP with n = 100
+    customers (dimension 101). None have ever been published, and no optimum
+    is known for them, publicly or privately. There are 50 hidden instances
+    used for grading and 10 public instances for development, and the two
+    sets are disjoint — the dev set is not a subset of the graded set.
+
+    **Instances for development.** `instances/` holds 10 CVRP instances with
+    reference distances in `instances/reference.json`. Run `python
+    evaluate_local.py` to score yourself with the exact grader formula.
+
+    Consider:
+    - Clarke-Wright savings algorithm for initial construction
+    - 2-opt, 3-opt, Or-opt intra-route local search
+    - Relocate, exchange, cross-exchange inter-route moves
+    - Sweep heuristic for initial routes
+    - Record-to-record travel, simulated annealing, or tabu search
+    - Giant-tour representation with optimal splitting (Split algorithm)
+    - Population-based: genetic algorithms, HGS (hybrid genetic search)
+    - The Prins (2004) split algorithm turns any TSP tour into an optimal CVRP
+      solution for that ordering in O(n) time
+
+  tips: |
+    - Score = mean(reference_distance / solver_distance) over hidden instances;
+      it can slightly exceed 1.0 if you beat the reference on an instance.
+    - Distances are EUC_2D: compute `int(sqrt(dx²+dy²) + 0.5)`. Getting this
+      wrong silently invalidates your gaps.
+    - `n_vehicles` is always dimension - 1 (effectively unlimited); you may use
+      fewer but not more.
+    - `time_limit` is 10 seconds PER INSTANCE. At n=100 this is tight.
+    - `solve()` must be deterministic given `seed`. The grader fixes PYTHONHASHSEED
+      and seeds `random` before each call.
+    - Your program runs inside the grader's virtualenv. **numpy is available; no
+      exact solver is (no ortools, pulp, cvxpy, mip).** Writing a heuristic is
+      the task. Adding a pyproject.toml will not change the interpreter you get.
+    - `python evaluate_local.py` scores you on the visible instances for free — use
+      it liberally before spending an eval.
+
+preset: local-claude
+
+# 2 agents so that notes/skills act as a genuine cross-agent sharing channel —
+# the mechanism Task 3 ablates and Task 4 improves. A fixed eval budget with NO
+# score_threshold keeps every ablation condition directly comparable.
+agents:
+  count: 2
+  model: opus
+
+run:
+  stop:
+    max_real_attempts: 12
+
+grader:
+  entrypoint: "vrp_grader.grader:Grader"
+  setup:
+    - "uv pip install -e ./grader"
+  timeout: 1200
+  direction: maximize
+  private:
+    - "taskdata"   # hidden instances -> .coral/private/taskdata
+  args:
+    program_file: "solution.py"
+    time_limit: 10.0
+    base_seed: 12345
+
+workspace:
+  results_dir: "./results"
+  repo_path: "./seed"
+  setup:
+    - "uv venv"
+    - "uv pip install numpy"

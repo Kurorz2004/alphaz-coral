@@ -1,0 +1,502 @@
+{
+  "G100_1112_01": {
+    "abcd_group": "1112",
+    "bks_distance": 22138,
+    "capacity": 7,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 15,
+    "total_demand": 100
+  },
+  "G100_1125_01": {
+    "abcd_group": "1125",
+    "bks_distance": 11557,
+    "capacity": 94,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 6,
+    "total_demand": 542
+  },
+  "G100_1155_01": {
+    "abcd_group": "1155",
+    "bks_distance": 11170,
+    "capacity": 1727,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 5,
+    "total_demand": 7535
+  },
+  "G100_1162_01": {
+    "abcd_group": "1162",
+    "bks_distance": 21317,
+    "capacity": 313,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 16,
+    "total_demand": 4772
+  },
+  "G100_1173_01": {
+    "abcd_group": "1173",
+    "bks_distance": 16901,
+    "capacity": 147,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 10,
+    "total_demand": 1457
+  },
+  "G100_1211_01": {
+    "abcd_group": "1211",
+    "bks_distance": 61800,
+    "capacity": 3,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 34,
+    "total_demand": 100
+  },
+  "G100_1212_01": {
+    "abcd_group": "1212",
+    "bks_distance": 30009,
+    "capacity": 5,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 20,
+    "total_demand": 100
+  },
+  "G100_1213_01": {
+    "abcd_group": "1213",
+    "bks_distance": 16002,
+    "capacity": 8,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 13,
+    "total_demand": 100
+  },
+  "G100_1215_01": {
+    "abcd_group": "1215",
+    "bks_distance": 8047,
+    "capacity": 18,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 6,
+    "total_demand": 100
+  },
+  "G100_1244_01": {
+    "abcd_group": "1244",
+    "bks_distance": 13882,
+    "capacity": 659,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 8,
+    "total_demand": 4660
+  },
+  "G100_1262_01": {
+    "abcd_group": "1262",
+    "bks_distance": 17858,
+    "capacity": 429,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 15,
+    "total_demand": 6288
+  },
+  "G100_1264_01": {
+    "abcd_group": "1264",
+    "bks_distance": 10381,
+    "capacity": 718,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 8,
+    "total_demand": 5404
+  },
+  "G100_1271_01": {
+    "abcd_group": "1271",
+    "bks_distance": 34816,
+    "capacity": 125,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 25,
+    "total_demand": 2700
+  },
+  "G100_1313_01": {
+    "abcd_group": "1313",
+    "bks_distance": 17360,
+    "capacity": 9,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 12,
+    "total_demand": 100
+  },
+  "G100_1325_01": {
+    "abcd_group": "1325",
+    "bks_distance": 9114,
+    "capacity": 106,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 6,
+    "total_demand": 534
+  },
+  "G100_1375_01": {
+    "abcd_group": "1375",
+    "bks_distance": 9148,
+    "capacity": 209,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 6,
+    "total_demand": 1131
+  },
+  "G100_2111_01": {
+    "abcd_group": "2111",
+    "bks_distance": 30382,
+    "capacity": 3,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 34,
+    "total_demand": 100
+  },
+  "G100_2132_01": {
+    "abcd_group": "2132",
+    "bks_distance": 18327,
+    "capacity": 43,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 18,
+    "total_demand": 744
+  },
+  "G100_2162_01": {
+    "abcd_group": "2162",
+    "bks_distance": 16147,
+    "capacity": 355,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 15,
+    "total_demand": 5205
+  },
+  "G100_2163_01": {
+    "abcd_group": "2163",
+    "bks_distance": 12764,
+    "capacity": 546,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 10,
+    "total_demand": 4974
+  },
+  "G100_2216_01": {
+    "abcd_group": "2216",
+    "bks_distance": 5892,
+    "capacity": 36,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 3,
+    "total_demand": 100
+  },
+  "G100_2224_01": {
+    "abcd_group": "2224",
+    "bks_distance": 9971,
+    "capacity": 73,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 8,
+    "total_demand": 563
+  },
+  "G100_2235_01": {
+    "abcd_group": "2235",
+    "bks_distance": 6856,
+    "capacity": 181,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 5,
+    "total_demand": 772
+  },
+  "G100_2252_01": {
+    "abcd_group": "2252",
+    "bks_distance": 21375,
+    "capacity": 426,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 18,
+    "total_demand": 7307
+  },
+  "G100_2266_01": {
+    "abcd_group": "2266",
+    "bks_distance": 7293,
+    "capacity": 1389,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 4,
+    "total_demand": 5504
+  },
+  "G100_2312_01": {
+    "abcd_group": "2312",
+    "bks_distance": 15063,
+    "capacity": 7,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 15,
+    "total_demand": 100
+  },
+  "G100_2321_01": {
+    "abcd_group": "2321",
+    "bks_distance": 22122,
+    "capacity": 26,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 22,
+    "total_demand": 566
+  },
+  "G100_2322_01": {
+    "abcd_group": "2322",
+    "bks_distance": 15981,
+    "capacity": 34,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 17,
+    "total_demand": 561
+  },
+  "G100_2334_01": {
+    "abcd_group": "2334",
+    "bks_distance": 9997,
+    "capacity": 120,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 7,
+    "total_demand": 778
+  },
+  "G100_2344_01": {
+    "abcd_group": "2344",
+    "bks_distance": 10623,
+    "capacity": 735,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 8,
+    "total_demand": 5188
+  },
+  "G100_2355_01": {
+    "abcd_group": "2355",
+    "bks_distance": 9462,
+    "capacity": 1382,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 6,
+    "total_demand": 7404
+  },
+  "G100_2365_01": {
+    "abcd_group": "2365",
+    "bks_distance": 9903,
+    "capacity": 1027,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 5,
+    "total_demand": 5122
+  },
+  "G100_3111_01": {
+    "abcd_group": "3111",
+    "bks_distance": 54268,
+    "capacity": 3,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 34,
+    "total_demand": 100
+  },
+  "G100_3143_01": {
+    "abcd_group": "3143",
+    "bks_distance": 20340,
+    "capacity": 558,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 10,
+    "total_demand": 5227
+  },
+  "G100_3151_01": {
+    "abcd_group": "3151",
+    "bks_distance": 45277,
+    "capacity": 304,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 26,
+    "total_demand": 7514
+  },
+  "G100_3161_01": {
+    "abcd_group": "3161",
+    "bks_distance": 43340,
+    "capacity": 210,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 25,
+    "total_demand": 5128
+  },
+  "G100_3163_01": {
+    "abcd_group": "3163",
+    "bks_distance": 18645,
+    "capacity": 587,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 9,
+    "total_demand": 4941
+  },
+  "G100_3173_01": {
+    "abcd_group": "3173",
+    "bks_distance": 17707,
+    "capacity": 155,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 9,
+    "total_demand": 1353
+  },
+  "G100_3174_01": {
+    "abcd_group": "3174",
+    "bks_distance": 14471,
+    "capacity": 158,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 7,
+    "total_demand": 1030
+  },
+  "G100_3212_01": {
+    "abcd_group": "3212",
+    "bks_distance": 27740,
+    "capacity": 6,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 17,
+    "total_demand": 100
+  },
+  "G100_3213_01": {
+    "abcd_group": "3213",
+    "bks_distance": 23535,
+    "capacity": 8,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 13,
+    "total_demand": 100
+  },
+  "G100_3215_01": {
+    "abcd_group": "3215",
+    "bks_distance": 12827,
+    "capacity": 16,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 7,
+    "total_demand": 100
+  },
+  "G100_3226_01": {
+    "abcd_group": "3226",
+    "bks_distance": 6649,
+    "capacity": 181,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 4,
+    "total_demand": 596
+  },
+  "G100_3254_01": {
+    "abcd_group": "3254",
+    "bks_distance": 15204,
+    "capacity": 1162,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 7,
+    "total_demand": 7567
+  },
+  "G100_3256_01": {
+    "abcd_group": "3256",
+    "bks_distance": 9535,
+    "capacity": 2125,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 4,
+    "total_demand": 7525
+  },
+  "G100_3262_01": {
+    "abcd_group": "3262",
+    "bks_distance": 31437,
+    "capacity": 241,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 20,
+    "total_demand": 4671
+  },
+  "G100_3344_01": {
+    "abcd_group": "3344",
+    "bks_distance": 12936,
+    "capacity": 802,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 7,
+    "total_demand": 5092
+  },
+  "G100_3355_01": {
+    "abcd_group": "3355",
+    "bks_distance": 12427,
+    "capacity": 1388,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 6,
+    "total_demand": 7484
+  },
+  "G100_3374_01": {
+    "abcd_group": "3374",
+    "bks_distance": 12881,
+    "capacity": 163,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 7,
+    "total_demand": 1032
+  },
+  "G100_3376_01": {
+    "abcd_group": "3376",
+    "bks_distance": 8888,
+    "capacity": 283,
+    "dimension": 101,
+    "n_customers": 100,
+    "n_vehicles": 100,
+    "ref_n_routes": 3,
+    "total_demand": 673
+  }
+}

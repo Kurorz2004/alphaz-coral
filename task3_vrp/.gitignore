@@ -1,0 +1,11 @@
+/results/
+/data/
+
+# taskdata/ and seed/instances/ are committed on purpose (220K total).
+# HGS labelling is wall-clock bounded, so regenerating them yields slightly
+# different reference distances. Every ablation condition must divide by the
+# SAME denominator or the conditions are not comparable — so the labels are
+# frozen here rather than rebuilt per run.
+
+*.pyc
+__pycache__/

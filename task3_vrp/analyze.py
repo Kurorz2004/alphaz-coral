@@ -27,7 +27,7 @@ from pathlib import Path
 
 HERE = Path(__file__).parent
 RESULTS = HERE / "results"
-SEED_BASELINE_LOG = HERE / "data" / "seed_hidden.log"
+SEED_BASELINE = HERE / "seed_baseline.json"
 
 # run_ablation.sh pins agents.model=sonnet. Two Opus agents exhaust the 5-hour
 # API quota, so every pooled run must be sonnet; anything else is excluded.
@@ -149,14 +149,16 @@ def discover() -> list[Run]:
 
 
 def read_baseline() -> tuple[float | None, float | None]:
-    """Seed solver's score on the HIDDEN set - the floor every condition inherits."""
-    if not SEED_BASELINE_LOG.exists():
-        return None, None
-    m = re.search(
-        r"SEED HIDDEN SCORE\s*=\s*([\d.]+)\s+mean gap\s*=\s*([+-]?[\d.]+)%",
-        SEED_BASELINE_LOG.read_text(),
-    )
-    return (float(m.group(1)), float(m.group(2))) if m else (None, None)
+    """Seed solver's score on the HIDDEN set - the floor every condition inherits.
+
+    Committed as seed_baseline.json so this works on a fresh clone; data/ is
+    gitignored, so reading only the raw log would silently degrade to
+    "unavailable" for anyone who did not run it themselves.
+    """
+    if SEED_BASELINE.exists():
+        d = json.loads(SEED_BASELINE.read_text())
+        return d["score"], d["mean_gap_pct"]
+    return None, None
 
 
 # --- statistics --------------------------------------------------------------

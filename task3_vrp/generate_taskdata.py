@@ -38,7 +38,10 @@ import time
 from multiprocessing import Pool
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-GENERATOR = os.path.join(HERE, "data", "xml100", "generator.py")
+# Committed alongside this script (7.5K) so the pipeline reproduces from a clone
+# without re-downloading the 100 MB CVRPLIB corpus. Upstream source:
+# https://galgos.inf.puc-rio.br/cvrplib/uploads/files/xml100/generator.py
+GENERATOR = os.path.join(HERE, "generator.py")
 STAGING = os.path.join(HERE, "data", "generated_taskdata")
 TASKDATA_INSTANCES = os.path.join(HERE, "taskdata", "instances")
 TASKDATA_REF = os.path.join(HERE, "taskdata", "reference.json")

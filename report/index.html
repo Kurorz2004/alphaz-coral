@@ -589,9 +589,7 @@
 
     <p>The failure is therefore not fabrication that has to be policed when a note is written. The failure is that
       the reader has no way to tell a verified note from an unverified one, although everything needed to tell them
-      apart is already machine-checkable on the host. The Task 2 job-shop corpus shows the same pattern (every
-      citation that resolves also reconciles, and the notes without evidence are again the synthesis ones), so
-      this is not specific to CVRP.</p>
+      apart is already machine-checkable on the host.</p>
 
     <h3>2. The change: a publication gate</h3>
 
@@ -866,6 +864,27 @@
       the one that was measured. A note is carried into the next run's pack only if its claim cites an attempt hash
       that exists and whose recorded score matches, a check CORAL does not currently perform.
     </p>
+
+    <h3>3. Multi-tenant isolation</h3>
+
+    <p>I have not deployed a system of this kind for enterprise customers, so I will not pretend that I know the detail
+      tech stack for this part. But I will try to describe what I think should be private and what should be shared
+      accross tenants. </p>
+    <p>A piece of knowledge is general if it applies to any instance of the problem, and private if it depends on one
+      customer's instance. So the knowledge that should be shared is the one that can help optimize the solver
+      searching technique and searching time like: solver operators, savings insertion and 2-opt;
+      search control schedules; evaluation-speed engineering such as incremental scoring and caching; and defects in
+      the platform itself.</p>
+
+    <p>Not shared are the instance data, the grader and the objective weights, which together encode the customer's
+      operating rules, the champion solver, which was selected on that customer's instances and may carry their
+      constants, and the solving history and notes. Notes cannot cross at all, because a note is free text written by
+      an agent. The boundary between the two categories is settled by a test rather than by judgement. A candidate
+      leaves a tenant only as executable code containing no literal drawn
+      from that tenant's instances, and it enters the shared library only if it reproduces its gain on public benchmark
+      instances that the tenant never saw. Knowledge that still improves results on unfamiliar instances was not about
+      the customer; knowledge that fails there was a description of the customer, and it is precisely what must not
+      cross.</p>
 
     <h3>4. Fuzzy user feedback</h3>
 

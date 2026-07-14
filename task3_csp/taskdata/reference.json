@@ -1,0 +1,102 @@
+{
+  "bench_1dbpp_1dbpp_1": {
+    "bin_capacity": 80,
+    "n_types": 4,
+    "total_items": 51,
+    "total_size": 132,
+    "lower_bound": 2,
+    "ffd_bins": 2,
+    "ffd_score": 1.0,
+    "waste_pct": 17.5
+  },
+  "bench_1dbpp_1dbpp_2": {
+    "bin_capacity": 85,
+    "n_types": 5,
+    "total_items": 59,
+    "total_size": 159,
+    "lower_bound": 2,
+    "ffd_bins": 2,
+    "ffd_score": 1.0,
+    "waste_pct": 6.47
+  },
+  "bench_2dbpp_2dbpp_del_prior": {
+    "bin_capacity": 180,
+    "n_types": 7,
+    "total_items": 44,
+    "total_size": 931,
+    "lower_bound": 6,
+    "ffd_bins": 6,
+    "ffd_score": 1.0,
+    "waste_pct": 13.8
+  },
+  "bench_2dbpp_2dbpp_het_bins": {
+    "bin_capacity": 170,
+    "n_types": 10,
+    "total_items": 35,
+    "total_size": 873,
+    "lower_bound": 6,
+    "ffd_bins": 6,
+    "ffd_score": 1.0,
+    "waste_pct": 14.41
+  },
+  "bench_2dbpp_2dbpp_item_bins": {
+    "bin_capacity": 120,
+    "n_types": 8,
+    "total_items": 40,
+    "total_size": 802,
+    "lower_bound": 7,
+    "ffd_bins": 7,
+    "ffd_score": 1.0,
+    "waste_pct": 4.52
+  },
+  "bench_3dbpp_3dbpp_del_prior": {
+    "bin_capacity": 1200,
+    "n_types": 7,
+    "total_items": 42,
+    "total_size": 11159,
+    "lower_bound": 10,
+    "ffd_bins": 10,
+    "ffd_score": 1.0,
+    "waste_pct": 7.01
+  },
+  "bench_3dbpp_3dbpp_het_bins": {
+    "bin_capacity": 1200,
+    "n_types": 10,
+    "total_items": 51,
+    "total_size": 13316,
+    "lower_bound": 12,
+    "ffd_bins": 12,
+    "ffd_score": 1.0,
+    "waste_pct": 7.53
+  },
+  "bench_3dbpp_3dbpp_item_bins": {
+    "bin_capacity": 900,
+    "n_types": 9,
+    "total_items": 57,
+    "total_size": 15636,
+    "lower_bound": 18,
+    "ffd_bins": 20,
+    "ffd_score": 0.9,
+    "waste_pct": 13.13
+  },
+  "bench_real_world_3dbpp_real_world_1": {
+    "bin_capacity": 1600,
+    "n_types": 7,
+    "total_items": 41,
+    "total_size": 10712,
+    "lower_bound": 7,
+    "ffd_bins": 7,
+    "ffd_score": 1.0,
+    "waste_pct": 4.36
+  },
+  "bench_real_world_3dbpp_real_world_2": {
+    "bin_capacity": 900,
+    "n_types": 9,
+    "total_items": 55,
+    "total_size": 14846,
+    "lower_bound": 17,
+    "ffd_bins": 19,
+    "ffd_score": 0.894737,
+    "waste_pct": 13.18
+  }
+}

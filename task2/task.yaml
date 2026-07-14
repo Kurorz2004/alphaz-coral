@@ -1,0 +1,120 @@
+task:
+  name: "Job Shop Scheduling"
+  description: |
+    Solve the classic Job-Shop Scheduling Problem (JSSP), minimising makespan.
+
+    An instance has `n_jobs` jobs and `n_machines` machines. Each job is an ordered
+    chain of exactly `n_machines` operations; operation k of job j must run on machine
+    `machines[j][k]` for `durations[j][k]` time units. Operations within a job are
+    strictly sequential; a machine processes at most one operation at a time; no
+    preemption. The makespan is the completion time of the last operation.
+
+    Your program `solution.py` must define:
+
+        solve(machines, durations, time_limit, seed) -> starts
+
+      machines[j][k]   int, the machine running operation k of job j
+      durations[j][k]  int, its processing time
+      time_limit       float, seconds you may spend on THIS instance
+      seed             int, for reproducible randomisation
+      starts[j][k]     int, the start time you assign to operation k of job j
+
+    A schedule is feasible if and only if:
+      1. Precedence  — starts[j][k] >= starts[j][k-1] + durations[j][k-1]
+      2. Disjunction — two operations on the same machine never overlap
+      3. starts are non-negative integers
+
+    **Any infeasible or malformed schedule fails the entire evaluation.** Feasibility
+    cannot be traded for score. The grader re-derives the makespan itself; it does not
+    trust a value you report.
+
+    **Scoring.** Score = mean over the hidden instances of `lower_bound / makespan`,
+    where `lower_bound = max(busiest machine's total load, longest single-job chain)`.
+    That bound is exact and provably unbeatable, so the score lies in (0, 1]. It is
+    NOT tight: at these sizes even an optimal schedule scores well below 1.0. Treat
+    the score as a relative measure — higher is strictly better — not as "% of optimal".
+
+    **Instances are large and square.** The hidden set is 3 x 20x20, 3 x 50x50 and
+    3 x 100x100 (up to 10,000 operations). Square shapes (jobs ≈ machines) are the
+    hard regime: the machine-load bound and the longest-job bound are balanced, so
+    neither is achievable and the makespan is determined by conflicts between jobs.
+    Exact methods are hopeless here — a good heuristic is the only route.
+
+    **The hidden instances are freshly generated**, using Taillard's (1993) scheme
+    (durations ~ U[1,99], uniformly random machine order per job). They are NOT drawn
+    from any public benchmark library, so no published or memorised schedule applies.
+
+    **Instances for development.** `instances/` holds six visible instances from the
+    same generator and the same three shapes, with exact lower bounds in
+    `instances/reference.json`. Run `python evaluate_local.py` to score yourself with
+    the grader's formula. `benchmarks/` additionally holds ten classic OR-Library
+    instances (ft10, la21, ta01, ...) with *published optima*, if you want to check
+    your solver against the literature.
+
+    Consider:
+    - Priority dispatching rules (SPT, MWKR, LWKR) and randomised restarts over them
+    - Giffler-Thompson active/non-delay schedule generation
+    - Local search on the disjunctive graph: critical-path / N5 / N7 neighbourhoods
+    - Tabu search (Nowicki-Smutnicki style), simulated annealing
+    - Large-neighbourhood search: rip out a machine's sequence and re-optimise
+    - Shifting bottleneck heuristic
+    - At 10,000 operations, the cost of *evaluating* a move dominates. Incremental
+      makespan estimation (e.g. Taillard's head/tail update) is worth more than a
+      cleverer neighbourhood.
+  tips: |
+    - Score = mean(lower_bound / makespan) over 9 hidden instances: 3 x 20x20,
+      3 x 50x50, 3 x 100x100.
+    - Reference points on the hidden set (mean gap over the lower bound in brackets):
+        LWKR dispatch             0.5082  (97.2%)
+        seed / FIFO dispatch      0.5424  (84.8%)   <- your starting point
+        LPT dispatch              0.5437  (84.5%)
+        SPT dispatch              0.6034  (66.2%)
+        MWKR dispatch             0.6376  (56.9%)   <- best simple rule
+        tabu search (20s/inst)    0.7038  (42.8%)   <- a solid classical baseline
+        lower bound               1.0000  ( 0.0%)   <- unattainable
+      Beating 0.7038 means beating a competent Nowicki-Smutnicki tabu implementation.
+    - `time_limit` is 10 seconds PER INSTANCE. The seed solves a 100x100 in well under
+      a second, so most of that budget is unused.
+    - `solve()` must be deterministic given `seed`. The grader fixes PYTHONHASHSEED and
+      seeds `random` before each call.
+    - Your program runs inside the grader's virtualenv. **numpy is available; no exact
+      solver is (no ortools, pulp, cvxpy, mip).** Writing a heuristic is the task.
+      Adding a pyproject.toml will not change the interpreter you get.
+    - `python evaluate_local.py` scores you on the visible instances for free — use it
+      liberally before spending an eval.
+
+preset: local-claude
+
+# 2 agents so that notes/skills act as a genuine cross-agent sharing channel —
+# the mechanism Task 3 ablates and Task 4 improves. A fixed eval budget with NO
+# score_threshold keeps every ablation condition directly comparable.
+agents:
+  count: 2
+  model: opus
+
+run:
+  stop:
+    max_real_attempts: 12
+
+grader:
+  entrypoint: "jssp_grader.grader:Grader"
+  setup:
+    - "uv pip install -e ./grader"
+  # 9 instances x (10s budget + slack). A slow solver can burn 90s each.
+  timeout: 1200
+  direction: maximize
+  private:
+    - "taskdata"   # hidden instances + exact lower bounds -> .coral/private/taskdata
+  args:
+    program_file: "solution.py"
+    time_limit: 10.0
+    base_seed: 12345
+
+workspace:
+  results_dir: "./results"
+  repo_path: "./seed"
+  # `uv venv` FIRST: `uv pip install` ignores UV_PROJECT_ENVIRONMENT and would
+  # otherwise install into whatever venv is on PATH (CORAL's own). See task1/REPORT.md.
+  setup:
+    - "uv venv"
+    - "uv pip install numpy"

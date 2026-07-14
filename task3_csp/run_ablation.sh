@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 #
-# Task 3 — ablation driver.
+# Task 3 — ablation driver (Cutting Stock Problem variant).
 #
 # Runs the 9 ablation runs strictly sequentially. Sequential is not a convenience:
 # the grader gives each solver a 10 s *wall-clock* budget per instance, so a second
 # run competing for CPU would silently lower the score of whichever condition
 # happened to be sharing the box. One run at a time, all 16 cores.
 #
-# All three conditions load the SAME task.yaml (../task2/task.yaml) and differ only
-# by dotlist overrides, so task.description and task.tips — the text the agent
-# actually reads — cannot drift between conditions.
+# All three conditions load the SAME task.yaml and differ only by dotlist
+# overrides, so task.description and task.tips — the text the agent actually
+# reads — cannot drift between conditions.
 #
 #   full        vanilla CORAL (control)
 #   noknowledge Condition A: agents.knowledge=false
@@ -19,11 +19,8 @@
 # latency, model-side load) hits all three conditions alike.
 #
 # MODEL: sonnet, not opus. Two Opus agents exhaust the 5-hour API quota window in
-# under 3 hours — the first attempt at this experiment died there, with 78
-# `five_hour` rejections, agents crash-looping, and no run ever reaching its 12th
-# real eval. The quota window is shared across models and Opus drains it several
-# times faster. Every arm uses the same model, so the ablation comparison is
-# unaffected; only the absolute scores are not comparable to Task 2's Opus run.
+# under 3 hours. Every arm uses the same model, so the ablation comparison is
+# unaffected; only the absolute scores are not comparable to a standalone Opus run.
 #
 # Resumable: a run whose auto_stop.json already exists is skipped, so you can ^C
 # this script and re-run it.
@@ -38,8 +35,8 @@ set -uo pipefail
 cd "$(dirname "$0")" || exit 1
 
 CORAL=(uv run --project ../coral-upstream coral)
-TASK_YAML="../task2/task.yaml"
-SEED_REPO="$(cd ../task2/seed && pwd)"
+TASK_YAML="./task.yaml"
+SEED_REPO="$(cd ./seed && pwd)"
 MODEL=${MODEL:-sonnet}
 TIMEOUT_SEC=${TIMEOUT_SEC:-14400} # 4 h per run
 POLL_SEC=${POLL_SEC:-60}
@@ -167,7 +164,7 @@ verify_condition() {
 # Derive the expected real-model prefix from MODEL so the documented
 # `MODEL=opus ./run_ablation.sh` override is verified against claude-opus, not sonnet.
 case "$MODEL" in
-  sonnet) EXPECT_MODEL=${EXPECT_MODEL:-claude-sonnet} ;;
+  sonnet) EXPECT_MODEL=${EXPECT_MODEL:-deepseek-v4-pro} ;;
   opus)   EXPECT_MODEL=${EXPECT_MODEL:-claude-opus} ;;
   haiku)  EXPECT_MODEL=${EXPECT_MODEL:-claude-haiku} ;;
   *)      EXPECT_MODEL=${EXPECT_MODEL:-$MODEL} ;;

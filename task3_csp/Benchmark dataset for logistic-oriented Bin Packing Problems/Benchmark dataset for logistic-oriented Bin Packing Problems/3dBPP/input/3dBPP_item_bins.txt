@@ -1,0 +1,21 @@
+# Max num of bins : 3
+# Optimization:
+# Bin dimensions (L * W * H): [(800,800,800),(900,900,900),(750,750,750)]
+# Max weight: [1400, 1400, 1400]
+# Relative Pos:
+# Incompatibilities:
+# Positive Affinities:
+# Center of mass:
+
+  id    quantity    length    width    height    weight  bin reqs
+----  ----------  --------  -------  --------  --------  ----------
+   0           5       253      287       165        20  2
+   1           6       265      292       142        20
+   2           3       273      326       225        20
+   3           6       191      328       124        20
+   4           8       249      337       102        20  1
+   5           6       249      337       102        20  0,2
+   6           5       309      366       175        20  0,1
+   7           3       245      391       134        20  0
+   8           7       270      427       181        20  1,2
+   9           8       395      475       106        50  0,2

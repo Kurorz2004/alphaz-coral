@@ -1,0 +1,9 @@
+# bin_capacity
+85
+# n_item_types
+5
+5 3
+4 9
+3 17
+2 27
+1 3

@@ -1,0 +1,101 @@
+{
+  "gen_020x020_a": {
+    "best_known": 1647,
+    "best_known_gap_pct": 28.27,
+    "generator_seed": 20001,
+    "jobs": 20,
+    "lb_job": 1284,
+    "lb_machine": 1233,
+    "lower_bound": 1284,
+    "machines": 20,
+    "operations": 400
+  },
+  "gen_020x020_b": {
+    "best_known": 1538,
+    "best_known_gap_pct": 32.7,
+    "generator_seed": 20002,
+    "jobs": 20,
+    "lb_job": 1114,
+    "lb_machine": 1159,
+    "lower_bound": 1159,
+    "machines": 20,
+    "operations": 400
+  },
+  "gen_020x020_c": {
+    "best_known": 1561,
+    "best_known_gap_pct": 33.76,
+    "generator_seed": 20003,
+    "jobs": 20,
+    "lb_job": 1167,
+    "lb_machine": 1162,
+    "lower_bound": 1167,
+    "machines": 20,
+    "operations": 400
+  },
+  "gen_050x050_a": {
+    "best_known": 4142,
+    "best_known_gap_pct": 39.46,
+    "generator_seed": 50001,
+    "jobs": 50,
+    "lb_job": 2970,
+    "lb_machine": 2892,
+    "lower_bound": 2970,
+    "machines": 50,
+    "operations": 2500
+  },
+  "gen_050x050_b": {
+    "best_known": 4173,
+    "best_known_gap_pct": 43.5,
+    "generator_seed": 50002,
+    "jobs": 50,
+    "lb_job": 2908,
+    "lb_machine": 2895,
+    "lower_bound": 2908,
+    "machines": 50,
+    "operations": 2500
+  },
+  "gen_050x050_c": {
+    "best_known": 4183,
+    "best_known_gap_pct": 39.29,
+    "generator_seed": 50003,
+    "jobs": 50,
+    "lb_job": 3003,
+    "lb_machine": 2878,
+    "lower_bound": 3003,
+    "machines": 50,
+    "operations": 2500
+  },
+  "gen_100x100_a": {
+    "best_known": 8908,
+    "best_known_gap_pct": 55.84,
+    "generator_seed": 100001,
+    "jobs": 100,
+    "lb_job": 5716,
+    "lb_machine": 5710,
+    "lower_bound": 5716,
+    "machines": 100,
+    "operations": 10000
+  },
+  "gen_100x100_b": {
+    "best_known": 9085,
+    "best_known_gap_pct": 56.29,
+    "generator_seed": 100002,
+    "jobs": 100,
+    "lb_job": 5813,
+    "lb_machine": 5706,
+    "lower_bound": 5813,
+    "machines": 100,
+    "operations": 10000
+  },
+  "gen_100x100_c": {
+    "best_known": 9119,
+    "best_known_gap_pct": 56.2,
+    "generator_seed": 100003,
+    "jobs": 100,
+    "lb_job": 5833,
+    "lb_machine": 5838,
+    "lower_bound": 5838,
+    "machines": 100,
+    "operations": 10000
+  }
+}

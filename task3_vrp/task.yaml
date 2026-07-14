@@ -1,3 +1,25 @@
+# ---------------------------------------------------------------------------
+# CVRP task — HINT-FREE REWRITE.
+#
+# The previous version (task.leaky.old.yaml) handed the agents the answer. Its
+# `Consider:` block named Clarke-Wright, sweep, 2-opt/3-opt/Or-opt, relocate/
+# exchange/cross-exchange, SA/tabu/RRT, giant-tour + Split, GA/HGS — and spelled
+# out "The Prins (2004) split algorithm turns any TSP tour into an optimal CVRP
+# solution for that ordering in O(n) time". Every algorithm any agent used on
+# attempt 1 of the first study was named in that block. The scoring section also
+# named the reference solver (PyVRP hybrid genetic search), and `tips` named the
+# available/unavailable libraries.
+#
+# That is why Task 3 found nothing: a knowledge-accumulation channel was measured
+# on a task whose answer was in the briefing. See OBSERVATIONS.md § 3.
+#
+# This file states the PROBLEM, the INTERFACE, and the RULES — and nothing about
+# how to solve it. Everything an agent needs to discover (which algorithms work,
+# which libraries exist, what the reference is) is now genuinely discoverable
+# knowledge, i.e. exactly the traffic the notes channel is supposed to carry.
+#
+# ---------------------------------------------------------------------------
+
 task:
   name: "Capacitated Vehicle Routing Problem"
   description: |
@@ -42,17 +64,12 @@ task:
 
     **Scoring.** Score = mean over the hidden instances of
     `reference_distance / solver_distance`. The reference distance for each
-    instance is not a proven optimum — it is a strong-heuristic reference,
-    produced by running PyVRP's hybrid genetic search with an unlimited fleet
-    and taking the best of 3 seeds x 60 seconds each. Measured on instances
-    from the same generator whose true optima are known, this reference lands
-    exactly on the optimum about two-thirds of the time; when it misses, the
-    mean gap is 0.07% (worst observed 0.62%). So it is a close but very
-    slightly loose upper bound on the true optimum.
+    instance is a fixed constant computed in advance. It is NOT a proven optimum
+    — it is close to one, but slightly loose.
 
     Higher is strictly better, and there is no fixed ceiling on the score: if
-    your solver beats the reference on an instance, your score on that
-    instance will slightly exceed 1.0.
+    your solver beats the reference on an instance, your score on that instance
+    will slightly exceed 1.0.
 
     **Instances.** Every instance is a freshly generated CVRP with n = 100
     customers (dimension 101). None have ever been published, and no optimum
@@ -64,17 +81,6 @@ task:
     reference distances in `instances/reference.json`. Run `python
     evaluate_local.py` to score yourself with the exact grader formula.
 
-    Consider:
-    - Clarke-Wright savings algorithm for initial construction
-    - 2-opt, 3-opt, Or-opt intra-route local search
-    - Relocate, exchange, cross-exchange inter-route moves
-    - Sweep heuristic for initial routes
-    - Record-to-record travel, simulated annealing, or tabu search
-    - Giant-tour representation with optimal splitting (Split algorithm)
-    - Population-based: genetic algorithms, HGS (hybrid genetic search)
-    - The Prins (2004) split algorithm turns any TSP tour into an optimal CVRP
-      solution for that ordering in O(n) time
-
   tips: |
     - Score = mean(reference_distance / solver_distance) over hidden instances;
       it can slightly exceed 1.0 if you beat the reference on an instance.
@@ -85,9 +91,9 @@ task:
     - `time_limit` is 10 seconds PER INSTANCE. At n=100 this is tight.
     - `solve()` must be deterministic given `seed`. The grader fixes PYTHONHASHSEED
       and seeds `random` before each call.
-    - Your program runs inside the grader's virtualenv. **numpy is available; no
-      exact solver is (no ortools, pulp, cvxpy, mip).** Writing a heuristic is
-      the task. Adding a pyproject.toml will not change the interpreter you get.
+    - Your program runs inside a fixed virtualenv that you cannot add packages to.
+      Adding a pyproject.toml will not change the interpreter you get. Check what
+      is importable before you rely on it.
     - `python evaluate_local.py` scores you on the visible instances for free — use
       it liberally before spending an eval.
 
@@ -111,7 +117,7 @@ grader:
   timeout: 1200
   direction: maximize
   private:
-    - "taskdata"   # hidden instances -> .coral/private/taskdata
+    - "../taskdata"
   args:
     program_file: "solution.py"
     time_limit: 10.0

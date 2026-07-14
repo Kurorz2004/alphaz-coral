@@ -29,9 +29,10 @@ HERE = Path(__file__).parent
 RESULTS = HERE / "results"
 SEED_BASELINE = HERE / "seed_baseline.json"
 
-# run_ablation.sh pins agents.model=sonnet. Two Opus agents exhaust the 5-hour
-# API quota, so every pooled run must be sonnet; anything else is excluded.
-TARGET_MODEL = "sonnet"
+# The ablation runs MODEL=deepseek-v4-flash, the same model task.yaml uses for
+# Task 2, so the arms are comparable to it. Every pooled run must be that model;
+# anything else is excluded.
+TARGET_MODEL = "deepseek-v4-flash"
 
 EXPECTED_REAL_ATTEMPTS = 12  # run.stop.max_real_attempts in task.yaml
 

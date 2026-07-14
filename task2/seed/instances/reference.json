@@ -1,0 +1,56 @@
+{
+  "train_020x020_a": {
+    "generator_seed": 21001,
+    "jobs": 20,
+    "lb_job": 1188,
+    "lb_machine": 1245,
+    "lower_bound": 1245,
+    "machines": 20,
+    "operations": 400
+  },
+  "train_020x020_b": {
+    "generator_seed": 21002,
+    "jobs": 20,
+    "lb_job": 1250,
+    "lb_machine": 1339,
+    "lower_bound": 1339,
+    "machines": 20,
+    "operations": 400
+  },
+  "train_050x050_a": {
+    "generator_seed": 51001,
+    "jobs": 50,
+    "lb_job": 3063,
+    "lb_machine": 2987,
+    "lower_bound": 3063,
+    "machines": 50,
+    "operations": 2500
+  },
+  "train_050x050_b": {
+    "generator_seed": 51002,
+    "jobs": 50,
+    "lb_job": 2861,
+    "lb_machine": 2882,
+    "lower_bound": 2882,
+    "machines": 50,
+    "operations": 2500
+  },
+  "train_100x100_a": {
+    "generator_seed": 101001,
+    "jobs": 100,
+    "lb_job": 5651,
+    "lb_machine": 5721,
+    "lower_bound": 5721,
+    "machines": 100,
+    "operations": 10000
+  },
+  "train_100x100_b": {
+    "generator_seed": 101002,
+    "jobs": 100,
+    "lb_job": 5637,
+    "lb_machine": 5729,
+    "lower_bound": 5729,
+    "machines": 100,
+    "operations": 10000
+  }
+}

@@ -1,0 +1,964 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Alpha Z Technical Assessment: CORAL</title>
+  <style>
+    html {
+      background: #fff;
+    }
+
+    body {
+      margin: 0 auto;
+      max-width: 44em;
+      padding: 56px 24px 80px;
+      background: #fff;
+      color: #000;
+      font-family: "Times New Roman", Times, serif;
+      font-size: 17px;
+      line-height: 1.55;
+    }
+
+    h1 {
+      font-size: 23px;
+      font-weight: 700;
+      margin: 0 0 6px;
+    }
+
+    h2 {
+      font-size: 18px;
+      font-weight: 700;
+      margin: 0 0 4px;
+    }
+
+    h3 {
+      font-size: 17px;
+      font-weight: 700;
+      margin: 26px 0 6px;
+    }
+
+    .sub {
+      margin: 0 0 8px;
+    }
+
+    .env {
+      margin: 0 0 36px;
+      padding-bottom: 20px;
+      border-bottom: 1px solid #000;
+    }
+
+    section {
+      margin-bottom: 44px;
+    }
+
+    .ask {
+      font-style: italic;
+      color: #444;
+      margin: 0 0 16px;
+    }
+
+    p {
+      margin: 0 0 14px;
+    }
+
+    code {
+      font-family: "Courier New", Courier, monospace;
+      font-size: .9em;
+    }
+
+    dl.kv {
+      margin: 0 0 18px;
+    }
+
+    dl.kv dt {
+      float: left;
+      clear: left;
+      width: 9em;
+      font-weight: 700;
+    }
+
+    dl.kv dd {
+      margin: 0 0 4px 9em;
+    }
+
+    dl.kv dd .v {
+      font-weight: 700;
+    }
+
+    .scroll {
+      overflow-x: auto;
+      margin: 0 0 12px;
+    }
+
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: 16px;
+    }
+
+    caption {
+      caption-side: bottom;
+      text-align: left;
+      font-size: 14px;
+      color: #444;
+      padding-top: 8px;
+    }
+
+    th,
+    td {
+      text-align: left;
+      padding: 5px 16px 5px 0;
+      border-bottom: 1px solid #ccc;
+    }
+
+    thead th {
+      border-bottom: 1px solid #000;
+      font-weight: 700;
+    }
+
+    tbody tr:last-child td {
+      border-bottom: 1px solid #000;
+    }
+
+    .n {
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+      padding-right: 20px;
+    }
+
+    tr.hi td {
+      font-weight: 700;
+    }
+
+    .note {
+      margin: 16px 0 0;
+    }
+
+    .fig {
+      margin: 24px 0 6px;
+      text-align: center;
+    }
+
+    .fig svg {
+      max-width: 100%;
+      height: auto;
+    }
+
+    .figcap {
+      font-size: 14px;
+      color: #444;
+      margin: 0 0 22px;
+    }
+
+    ol.mods {
+      margin: 0 0 14px;
+      padding-left: 22px;
+    }
+
+    ol.mods li {
+      margin-bottom: 6px;
+    }
+
+    .todo {
+      color: #444;
+      font-style: italic;
+    }
+
+    h4 {
+      font-size: 17px;
+      font-weight: 700;
+      margin: 18px 0 6px;
+    }
+
+    .hdr {
+      font-weight: 700;
+      margin: 0 0 2px;
+    }
+  </style>
+</head>
+
+<body>
+
+  <h1>Alpha Z Technical Assessment: CORAL</h1>
+  <p>The experiments and reports are done with the help of Claude Code.</p>
+  <section>
+    <h2>What I understand about CORAL</h2>
+    <p>CORAL is a harness that evolves a program. It launches N coding agents as ordinary CLI subprocesses, each working
+      on its own git branch
+      of the same seed program. An agent decides for itself when it is ready to be judged; that commits its code and
+      files a pending attempt. A grader picks the attempt
+      up, checks the commit out into an isolated worktree, runs the task's grader against data the agent cannot see,
+      and writes the score back. A manager process watches for newly scored attempts and, on a cadence measured in
+      evaluations rather than seconds, interrupts an agent mid-session and resumes it with the eval result plus an
+      instruction to reflect, consolidate or pivot. Two things therefore accumulate: the program, as commits ranked
+      by score, and a shared directory of markdown notes and skills that the agents write and read at will.</p>
+
+    <div class="fig">
+      <svg viewBox="0 0 700 240" role="img" aria-label="CORAL run architecture and data flow"
+        xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M0,0 L10,5 L0,10 z" fill="#000" />
+          </marker>
+        </defs>
+        <g fill="none" stroke="#000" stroke-width="1">
+          <rect x="255" y="8" width="215" height="40" />
+          <rect x="8" y="90" width="180" height="100" />
+          <rect x="18" y="102" width="160" height="32" />
+          <rect x="18" y="146" width="160" height="32" />
+          <rect x="255" y="90" width="215" height="90" />
+          <rect x="530" y="90" width="155" height="50" />
+          <rect x="530" y="170" width="155" height="50" />
+        </g>
+        <g font-family="Times New Roman, Times, serif" font-size="13" fill="#000">
+          <text x="362" y="26" text-anchor="middle">AgentManager: monitor loop</text>
+          <text x="362" y="41" text-anchor="middle" font-size="11">watches attempts, fires heartbeats</text>
+          <text x="98" y="123" text-anchor="middle">Agent 1</text>
+          <text x="98" y="167" text-anchor="middle">Agent 2</text>
+          <text x="98" y="206" text-anchor="middle" font-size="11">agents run in parallel,</text>
+          <text x="98" y="220" text-anchor="middle" font-size="11">one git worktree each</text>
+          <text x="362" y="112" text-anchor="middle">.coral/public/ (shared state)</text>
+          <text x="362" y="136" text-anchor="middle" font-size="11">attempts: the score of every commit</text>
+          <text x="362" y="158" text-anchor="middle" font-size="11">notes, skills: shared accumulated knowledge
+          </text>
+          <text x="607" y="110" text-anchor="middle">Grader</text>
+          <text x="607" y="126" text-anchor="middle" font-size="11">isolated checkout</text>
+          <text x="607" y="190" text-anchor="middle">.coral/private/</text>
+          <text x="607" y="206" text-anchor="middle" font-size="11">hidden data to agents</text>
+        </g>
+        <g fill="none" stroke="#000" stroke-width="1" marker-end="url(#ah)">
+          <path d="M188,132 L253,132" />
+          <path d="M188,148 L253,148" />
+          <path d="M253,148 L188,148" />
+          <path d="M470,108 L528,108" />
+          <path d="M528,130 L472,130" />
+          <path d="M607,140 L607,168" />
+          <path d="M362,48 L362,88" />
+          <path d="M255,28 L98,28 L98,88" />
+        </g>
+        <g font-family="Times New Roman, Times, serif" font-size="11" fill="#000">
+          <text x="220" y="126" text-anchor="middle">coral eval</text>
+          <text x="220" y="161" text-anchor="middle">notes / skills</text>
+          <text x="499" y="102" text-anchor="middle">pending</text>
+          <text x="500" y="124" text-anchor="middle">score</text>
+          <text x="369" y="70">watches for new scores</text>
+          <text x="106" y="56">interrupt and resume with</text>
+          <text x="106" y="70">eval result + heartbeat prompt</text>
+        </g>
+      </svg>
+    </div>
+  </section>
+  <!-- ---------------- TASK 1 ---------------- -->
+  <section id="task1">
+    <h2>Task 1: Replicate a task result</h2>
+    <p>Task <code>circle_packing</code> (26 circles in a unit square, maximise the sum of radii),
+      Claude Opus 4.8, unmodified upstream grader and seed.</p>
+
+    <dl class="kv">
+      <dt>Final Score</dt>
+      <dd><span class="v">1.000002</span>. Sum of radii 2.635983084918, from a seed measured at 0.364102.</dd>
+      <dt>#Evals</dt>
+      <dd><span class="v">2</span>. The run auto-stopped on <code>score_threshold</code> after roughly 54 minutes.</dd>
+    </dl>
+
+    <div class="scroll">
+      <table>
+        <caption>Score = sum of radii / 2.635977. Baselines are the paper's Table 1 (single-agent, Claude Opus 4.6).
+        </caption>
+        <thead>
+          <tr>
+            <th>Method</th>
+            <th class="n">Sum of radii</th>
+            <th class="n">Score</th>
+            <th class="n">#Evals</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Seed program (measured)</td>
+            <td class="n">0.959764</td>
+            <td class="n">0.364102</td>
+            <td class="n">n/a</td>
+          </tr>
+          <tr>
+            <td>ShinkaEvolve</td>
+            <td class="n">2.6001</td>
+            <td class="n">0.986389</td>
+            <td class="n">62</td>
+          </tr>
+          <tr>
+            <td>OpenEvolve</td>
+            <td class="n">2.6293</td>
+            <td class="n">0.997467</td>
+            <td class="n">100</td>
+          </tr>
+          <tr>
+            <td>EvoX</td>
+            <td class="n">2.6320</td>
+            <td class="n">0.998491</td>
+            <td class="n">48</td>
+          </tr>
+          <tr>
+            <td>CORAL (paper)</td>
+            <td class="n">2.6360</td>
+            <td class="n">1.000009</td>
+            <td class="n">11</td>
+          </tr>
+          <tr class="hi">
+            <td>CORAL (this run)</td>
+            <td class="n">2.635983</td>
+            <td class="n">1.000002</td>
+            <td class="n">2</td>
+          </tr>
+          <tr>
+            <td>AlphaEvolve (SOTA)</td>
+            <td class="n">2.635977</td>
+            <td class="n">1.000000</td>
+            <td class="n">n/a</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p class="note">Reading of the numbers. The run beats the benchmark by 6.085e-6 in sum of radii, which is the
+      same order as the rounding in the grader's hardcoded constant <code>BENCHMARK = 2.635977</code>. The claim is
+      therefore that CORAL matched AlphaEvolve to six significant figures, not that it beat it. Because the winning
+      margin is smaller than the grader's own constraint tolerance of 1e-6, feasibility was re-checked at machine
+      precision: the worst constraint violation is 6.106e-15.</p>
+  </section>
+
+  <!-- ---------------- TASK 2 ---------------- -->
+  <section id="task2">
+    <h2>Task 2: Apply CORAL to a classic OR problem</h2>
+
+    <p>Problem chosen: Capacitated Vehicle Routing Problem (CVRP). A fleet of identical vehicles, each of
+      capacity <i>Q</i>, leaves a single depot, serves every customer exactly once, and returns; the load on any
+      route may not exceed <i>Q</i>. The objective is to minimise total distance travelled. Every instance has 100
+      customers, distances are EUC_2D (Euclidean, rounded to the nearest integer), and the fleet is effectively
+      unlimited, so the solver chooses how many routes to open. The solver gets 10 seconds per instance.</p>
+
+    <p>Instances were generated with the XML100 generator published alongside CVRPLIB
+      (galgos.inf.puc-rio.br/cvrplib/uploads/files/xml100/generator.py), described in Uchoa et al. (2017),
+      <i>New benchmark instances for the Capacitated Vehicle Routing Problem</i>, EJOR, and Queiroga et al. (2022),
+      <i>10,000 optimal CVRP solutions for testing machine learning based heuristics</i>. Sixty instances were
+      generated, stratified across the generator's four factors (depot position, customer position, demand
+      distribution and average route size), then split into 50 hidden instances for grading and 10 disjoint public
+      instances for development. They were generated fresh rather than taken from CVRPLIB Set X because Set X's
+      optimal routes are published and its <code>dimension</code> field uniquely identifies each instance, so an
+      agent with web access could hardcode a lookup table and score near 1.0 without solving anything.
+    </p>
+
+    <p><code>grader.py</code> loads the hidden instances, calls the agent's
+      <code>solve()</code> once per instance, rejects any solution that revisits a customer, misses one, overloads a
+      route or opens too many, and scores the run as the mean of <code>reference_distance / solver_distance</code>
+      over the 50 instances. The reference distance for each instance is PyVRP's hybrid genetic search, best of three
+      seeds at 60 seconds each, with every label independently re-validated against the grader's own feasibility
+      rules. The seed program is a greedy nearest-neighbour construction with no improvement step.
+      <code>task.yaml</code> runs 2 agents on <code>deepseek-v4-flash</code> with a fixed budget of 12 evaluations
+      and no score threshold, and states the problem, the interface and the rules without naming any algorithm,
+      library or reference solver.
+    </p>
+
+    <dl class="kv">
+      <dt>Final Score</dt>
+      <dd><span class="v">0.985405</span>. Mean gap +1.50% over the reference, up from the seed's 0.789815.</dd>
+      <dt>#Evals</dt>
+      <dd><span class="v">12</span>. The run stopped on <code>max_real_attempts</code> after 1 h 46 min.</dd>
+    </dl>
+
+    <div class="scroll">
+      <table>
+        <caption>Score = mean over the 50 hidden instances of reference distance / solver distance. Gap is the mean
+          per-instance excess over the reference. The grader passes the same 10-second budget to every program.
+        </caption>
+        <thead>
+          <tr>
+            <th>Solver</th>
+            <th class="n">Score</th>
+            <th class="n">Mean gap</th>
+            <th class="n">Budget per instance</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Seed: greedy nearest neighbour</td>
+            <td class="n">0.789815</td>
+            <td class="n">+28.24%</td>
+            <td class="n">10 s</td>
+          </tr>
+          <tr class="hi">
+            <td>CORAL (this run)</td>
+            <td class="n">0.985405</td>
+            <td class="n">+1.50%</td>
+            <td class="n">10 s</td>
+          </tr>
+          <tr>
+            <td>Reference: PyVRP hybrid genetic search</td>
+            <td class="n">1.000000</td>
+            <td class="n">0.00%</td>
+            <td class="n">3 × 60 s</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p class="note">Reading of the numbers. CORAL improved the seed by 24.8% in score, closing the gap to the
+      reference from +28.24% to +1.50%. The winning program is a construction heuristic followed by local search with
+      incremental delta evaluation, discovered by the agents themselves; the task briefing names no algorithm. The
+      reference is not a proven optimum, only a
+      strong one, and it was given roughly eighteen times more compute per instance than the agents were; the
+      remaining 1.5% is the distance to a well-tuned classical solver under a much tighter budget, not the distance
+      to optimality.</p>
+  </section>
+
+  <!-- ---------------- TASK 3 ---------------- -->
+  <section id="task3">
+    <h2>Task 3: Ablation study</h2>
+    <p>Three conditions × three runs: <b>control</b> (full CORAL), <b>A</b> with the notes
+      and skills directories disabled, and <b>B</b> with heartbeats disabled. CORAL's <code>agents.model</code> is only
+      a runtime alias, so each run's model is verified from the agent logs rather than the config, and any run that
+      drifts off-model or ends early is excluded from the pool rather than silently averaged in.</p>
+
+    <h3>Implementing the two conditions</h3>
+
+    <p>Condition A: The <code>SharingConfig</code> block reads like the intended switch but
+      is dead code. Nothing in the codebase consults <code>config.sharing</code>, so the flag had to be built. A new
+      <code>agents.knowledge</code> field was added to <code>AgentConfig</code>, together with the plumbing behind it:
+      when false, the four shared-state subdirectories (<code>notes</code>, <code>skills</code>, <code>roles</code>,
+      <code>agents</code>) are neither created, seeded, nor symlinked into an agent's worktree; the knowledge passages
+      of <code>CORAL.md</code> are factored into separate template fragments and omitted from the generated prompt; and
+      the note-writing heartbeat actions (<code>consolidate</code>, <code>lint_wiki</code>) are dropped, with
+      <code>reflect</code> and <code>pivot</code> falling back to note-free variants.
+    </p>
+
+    <p>Condition B: <code>agents.heartbeat=[]</code> is made to mean what it says, in two files. In
+      <code>coral/config.py</code>, <code>_preprocess</code> back-fills the default actions only into a partial list,
+      and leaves an explicitly empty one empty. In <code>coral/hub/heartbeat.py</code>,
+      <code>write_agent_heartbeat</code> and <code>write_global_heartbeat</code> take a new <code>protect</code> flag,
+      set false when the list is empty, so the protected actions (<code>reflect</code>, <code>consolidate</code>) are
+      not re-added. No heartbeat is then registered, and none can fire.
+    </p>
+
+    <h3>Results</h3>
+
+    <div class="scroll">
+      <table>
+        <caption>Final Score = mean over the 50 hidden instances of reference distance / solver distance, as in Task 2.
+          Three runs per condition, each to the same budget of 12 evaluations.
+        </caption>
+        <thead>
+          <tr>
+            <th>Condition</th>
+            <th class="n">n</th>
+            <th class="n">Final Score (mean ± sd)</th>
+            <th class="n">Mean gap</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Seed: greedy nearest neighbour</td>
+            <td class="n">—</td>
+            <td class="n">0.789815</td>
+            <td class="n">+28.24%</td>
+          </tr>
+          <tr class="hi">
+            <td>Control: full CORAL</td>
+            <td class="n">3</td>
+            <td class="n">0.9877 ± 0.0024</td>
+            <td class="n">+1.26%</td>
+          </tr>
+          <tr>
+            <td>A: notes/skills disabled</td>
+            <td class="n">3</td>
+            <td class="n">0.9805 ± 0.0120</td>
+            <td class="n">+2.01%</td>
+          </tr>
+          <tr>
+            <td>B: heartbeats disabled</td>
+            <td class="n">3</td>
+            <td class="n">0.9829 ± 0.0068</td>
+            <td class="n">+1.77%</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p class="note">Reading of the numbers. The three arms are statistically indistinguishable: the largest separation
+      from the control (0.0072, condition A) lies within the between-run dispersion of the conditions themselves
+      (sd 0.0024–0.0120). The likely explanation is that this task leaves the agents little to accumulate. The seed
+      scores 0.789815, yet the first evaluated attempt of almost every run already scores between 0.94 and 0.98, so
+      the greater part of the total improvement is realised before any note, skill or heartbeat can have taken effect.
+      CVRP is a canonical operations-research problem with an extensive published literature, and an agent with web
+      access can therefore retrieve an established construction heuristic (Clarke–Wright savings, a Prins-style
+      optimal split of a giant tour) together with a standard local-search refinement, and reconstruct a competitive
+      solver at the first attempt.
+      That's why I think even if we run more than 3 times for each condition, the result is still likely to be
+      statistically insignificant.
+    </p>
+  </section>
+
+  <!-- ---------------- TASK 4 ---------------- -->
+  <section id="task4">
+    <h2>Task 4: Improve CORAL, knowledge distillation and memory management</h2>
+
+    <h3>1. The failure mode, with evidence</h3>
+
+    <p>The assessment names three expected problems: noise accumulation, retrieval degradation and redundancy. All
+      three appear in the Task 3 runs, and they share one root cause. A note becomes visible to every agent the
+      moment it is written, because <code>notes/</code> and <code>skills/</code> in each worktree are symlinks into
+      the shared state, and nothing evaluates it afterwards. The attempt store that could check every claim sits in
+      the same directory, but no code path joins the two.</p>
+
+    <p>A note's <code>status</code> and <code>confidence</code> fields are self-declared, and nothing reads them
+      except a format linter and the dashboard. The only ordering in the retrieval path (<code>_sort_key</code>) is
+      the timestamp. The listing an agent sees (<code>format_notes_list</code>) prints date, title and creator
+      only. A refuted note and a confirmed one therefore look the same everywhere except inside the file body.</p>
+
+    <ol class="mods">
+      <li><b>Noise accumulation.</b> Six notes across the three runs are marked <code>refuted</code> by their own
+        authors. Nothing demotes or flags them, and they are served to every later reader in the same way as the
+        confirmed ones.</li>
+      <li><b>Retrieval degradation.</b> The only upkeep the corpus gets is an <code>index.md</code> the agents
+        maintain by hand, and it broke within one run. The index of <code>full-s1</code> lists six entries: one
+        links to a note that does not exist, five real notes are missing, and a refuted experiment is shown with a
+        healthy-looking score and no marker.</li>
+      <li><b>Redundancy.</b> In <code>full-s1</code> the two agents built the same first improvement separately,
+        Clarke-Wright construction plus local search, and wrote it up as two confirmed notes scoring 0.952658 and
+        0.952742.</li>
+    </ol>
+
+    <div class="scroll">
+      <table>
+        <caption>Every note in the three full-CORAL runs of Task 3, checked read-only against the same run's
+          attempt store. Note counts exclude the index and housekeeping files. A citation resolves when the cited
+          hash exists in the store as a real, scored attempt whose agent matches the note's creator.</caption>
+        <thead>
+          <tr>
+            <th>Run</th>
+            <th class="n">Notes</th>
+            <th class="n">Refuted</th>
+            <th class="n">Cite an attempt</th>
+            <th class="n">Citation resolves</th>
+            <th class="n">Quoted scores match</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>full-s1</td>
+            <td class="n">10</td>
+            <td class="n">2</td>
+            <td class="n">9</td>
+            <td class="n">9/9</td>
+            <td class="n">9/9</td>
+          </tr>
+          <tr>
+            <td>full-s2</td>
+            <td class="n">6</td>
+            <td class="n">1</td>
+            <td class="n">5</td>
+            <td class="n">5/5</td>
+            <td class="n">5/5</td>
+          </tr>
+          <tr>
+            <td>full-s3</td>
+            <td class="n">8</td>
+            <td class="n">3</td>
+            <td class="n">7</td>
+            <td class="n">7/7</td>
+            <td class="n">7/7</td>
+          </tr>
+          <tr class="hi">
+            <td>Total</td>
+            <td class="n">24</td>
+            <td class="n">6</td>
+            <td class="n">21</td>
+            <td class="n">21/21</td>
+            <td class="n">21/21</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p class="note">Reading of the numbers. The corpus is honest: every note that cites evidence cites a real,
+      scored attempt made by its own author, and every score quoted in a note matches the store. The notes that
+      cite no evidence are the three <code>_synthesis</code> summaries, which exist to sum up the corpus for the
+      next reader, and all three stamp themselves <code>confirmed</code>. 19 of the 24 notes declare high
+      confidence, so the declared confidence carries no signal.</p>
+
+    <p>The failure is therefore not fabrication that has to be policed when a note is written. The failure is that
+      the reader has no way to tell a verified note from an unverified one, although everything needed to tell them
+      apart is already machine-checkable on the host. The Task 2 job-shop corpus shows the same pattern (every
+      citation that resolves also reconciles, and the notes without evidence are again the synthesis ones), so
+      this is not specific to CVRP.</p>
+
+    <h3>2. The change: a publication gate</h3>
+
+    <p>The gate runs on its existing monitor loop, over every note that is new or has changed
+      since the last tick. It is aimed at the two problems the evidence shows: notes that cannot be trusted, and
+      notes that repeat each other. Everything in it is plain code: JSON reads, frontmatter parsing, number
+      comparison, and set overlap on tags; there is no LLM call and no embedding model in the path. A model-based
+      judge would be slower, non-deterministic, and itself a new source of wrong verdicts, while every check here
+      is exact and reproducible.</p>
+
+    <p>The gate will help prevent 2 things:</p>
+
+    <ol class="mods">
+      <li><b>Noise accumulation.</b> For each note, the pass parses the evidence block and looks the cited hash up
+        in the attempt store. The note is verified only if the hash exists, the attempt is real and scored, the
+        note's creator is the agent that made that attempt, and every score the note quotes equals the recorded one
+        (run offline over the Task 3 corpora, this check confirms the 21 citing notes and leaves the three
+        evidence-free synthesis notes unverified; the 21/21 columns in the table are its output). The
+        verdict is written into the note as computed fields authored by the framework, next to the agent's
+        self-declared ones, and the served list is ordered by computed confidence first, recency second. Notes that
+        fail the check, and notes marked <code>refuted</code>, are moved to the bottom of the view with an
+        annotation line; nothing is deleted, so the record of what failed stays readable.</li>
+      <li><b>Redundancy.</b> After verification, the pass looks for duplicates with two rules, both mechanical.
+        Notes that cite the same attempt hash describe the same experiment and are folded into one entry; notes
+        whose frontmatter tag sets overlap beyond a set threshold are grouped, with the best-verified note as the
+        entry and the rest as "see also" lines under it. The duplicated Clarke-Wright pair in <code>full-s1</code>
+        is caught by the tag rule, since the two notes cite different attempts but share nearly the same tags. A
+        paraphrase written with fresh tags escapes both rules; an embedding-similarity check could be added later,
+        but the duplicates observed in the runs do not need one.</li>
+    </ol>
+
+    <p>What lands in each worktree is a generated view: <code>notes/</code> and <code>skills/</code> stop being
+      symlinks and become a directory the manager writes, one file at a time with atomic renames, because under
+      Docker the worktree is a bind mount and a directory swap would not propagate. The index is generated as well,
+      so it cannot link to missing notes or omit real ones, which removes the rot seen in <code>full-s1</code>.
+      Everything else is untouched: attempts, grading, heartbeats and <code>agents.knowledge=false</code> (Task 3's
+      condition A) behave as before, and the vanilla arm of the comparison is the unmodified code path.</p>
+
+
+    <h3>3. The system after the change</h3>
+
+    <p>The run loop is unchanged except for the knowledge path. Agents still submit attempts, the grader still
+      scores them against hidden data, and heartbeats still fire. The shared <code>notes/</code> directory becomes
+      a pool of unverified drafts, the publication pass joins each draft with the attempt store, and each agent's
+      worktree receives a verified, ranked view instead of a raw symlink.</p>
+
+    <div class="fig">
+      <svg viewBox="0 0 700 310" role="img"
+        aria-label="CORAL run architecture after the change: notes pass through a publication gate before peers read them"
+        xmlns="http://www.w3.org/2000/svg">
+        <g fill="none" stroke="#000" stroke-width="1">
+          <rect x="255" y="8" width="215" height="52" />
+          <rect x="8" y="90" width="180" height="100" />
+          <rect x="18" y="102" width="160" height="32" />
+          <rect x="18" y="146" width="160" height="32" />
+          <rect x="255" y="90" width="215" height="90" />
+          <rect x="530" y="90" width="155" height="50" />
+          <rect x="530" y="170" width="155" height="50" />
+          <rect x="8" y="240" width="180" height="52" />
+        </g>
+        <g font-family="Times New Roman, Times, serif" font-size="13" fill="#000">
+          <text x="362" y="26" text-anchor="middle">AgentManager: monitor loop</text>
+          <text x="362" y="41" text-anchor="middle" font-size="11">watches attempts, fires heartbeats,</text>
+          <text x="362" y="54" text-anchor="middle" font-size="11">runs the publication pass</text>
+          <text x="98" y="123" text-anchor="middle">Agent 1</text>
+          <text x="98" y="167" text-anchor="middle">Agent 2</text>
+          <text x="98" y="206" text-anchor="middle" font-size="11">agents run in parallel,</text>
+          <text x="98" y="220" text-anchor="middle" font-size="11">one git worktree each</text>
+          <text x="362" y="112" text-anchor="middle">.coral/public/ (shared state)</text>
+          <text x="362" y="136" text-anchor="middle" font-size="11">attempts: the score of every commit</text>
+          <text x="362" y="158" text-anchor="middle" font-size="11">notes, skills: unverified agent drafts</text>
+          <text x="607" y="110" text-anchor="middle">Grader</text>
+          <text x="607" y="126" text-anchor="middle" font-size="11">isolated checkout</text>
+          <text x="607" y="190" text-anchor="middle">.coral/private/</text>
+          <text x="607" y="206" text-anchor="middle" font-size="11">hidden data to agents</text>
+          <text x="98" y="261" text-anchor="middle">read view, per agent</text>
+          <text x="98" y="277" text-anchor="middle" font-size="11">verified, ranked notes and skills</text>
+        </g>
+        <g fill="none" stroke="#000" stroke-width="1" marker-end="url(#ah)">
+          <path d="M188,132 L253,132" />
+          <path d="M188,148 L253,148" />
+          <path d="M470,108 L528,108" />
+          <path d="M528,130 L472,130" />
+          <path d="M607,140 L607,168" />
+          <path d="M362,60 L362,88" />
+          <path d="M255,28 L98,28 L98,88" />
+          <path d="M362,180 L362,266 L192,266" />
+          <path d="M160,238 L160,192" />
+        </g>
+        <g font-family="Times New Roman, Times, serif" font-size="11" fill="#000">
+          <text x="220" y="126" text-anchor="middle">coral eval</text>
+          <text x="220" y="161" text-anchor="middle">draft notes</text>
+          <text x="499" y="102" text-anchor="middle">pending</text>
+          <text x="500" y="124" text-anchor="middle">score</text>
+          <text x="369" y="70">watches for new scores</text>
+          <text x="106" y="56">interrupt and resume with</text>
+          <text x="106" y="70">eval result + heartbeat prompt</text>
+          <text x="372" y="210">publication pass: verify</text>
+          <text x="372" y="224">claims against attempts,</text>
+          <text x="372" y="238">group duplicates, rank,</text>
+          <text x="372" y="252">demote refuted</text>
+          <text x="175" y="233" text-anchor="middle">reads</text>
+        </g>
+      </svg>
+    </div>
+    <p class="figcap">The run after the change; compare the first figure. Writing is unchanged: agents still put
+      notes and skills into the shared state at will. Reading is not: <code>notes/</code> and <code>skills/</code>
+      in a worktree are a view the manager generates, and the publication pass checks every claim against the
+      attempt store on the way through.</p>
+
+    <h3>4. Comparative experiment</h3>
+
+    <p>Modified against vanilla CORAL on the Task 2 CVRP task, with the same 2 agents and 12-attempt budget, at
+      least 3 runs per arm, reported as mean ± std of Final Score. Task 3 says the headline number will most
+      likely be flat. The ablation arms there were statistically indistinguishable, because seed-to-seed noise is
+      larger than the condition effect and half of the gain lands on the first attempt. A knowledge-quality change
+      has no more room to move that number than knowledge removal did.</p>
+
+    <p>The one route to a score effect is waste: at 12 attempts, an evaluation spent re-testing an approach that a
+      served note already refuted costs about 8% of the search. The secondary metrics are therefore where the
+      change acts: the rank of refuted notes in the view each agent was served, the gap between declared and
+      computed confidence, and the number of evaluations spent re-testing refuted approaches.
+      <span class="todo">Comparative runs pending; results to follow.</span>
+    </p>
+  </section>
+
+  <!-- ---------------- TASK 5 ---------------- -->
+  <section id="task5">
+    <h2>Task 5: Product plan</h2>
+
+    <h3>1. System architecture</h3>
+    <ol class="mods">
+      <li><b>Modelling and data intake:</b> Customer data and stated rules become a canonical instance and an explicit
+        constraint set. Hard constraints (capacity, licences, legal rest periods) are separated from soft ones
+        (fairness, overtime, preference) here, because that split is what later makes vague feedback actionable.</li>
+      <li><b>Objective and weights:</b> Checks feasibility against the hard constraints and computes a weighted
+        objective over the soft ones. This is the ground truth of the whole system and the only thing the agents
+        optimise against, so it is versioned and owned like production code, not like a config.</li>
+      <li><b>Evolution engine (CORAL):</b> Runs against the tenant's historical instances as the hidden set, scored
+        by the objective from module 2.</li>
+      <li><b>Knowledge layer:</b> Replaces the shared folder: a tenant-private store of what worked on this
+        customer's instances, and a shared, distilled library of solver strategies that carries across tenants
+        without carrying their data. Detailed in sections 2 and 3.</li>
+      <li><b>Champion solver:</b> Find the winning eval/run from the evolution engine, and serve it as the
+        current champion. Run daily solves with the current champion.</li>
+      <li><b>Feedback:</b> Receive feedback from users (both implicit and explicit). The feedback is used to
+        update the weights of the objective, or to add new constraints.</li>
+    </ol>
+
+    <div class="fig">
+      <svg viewBox="140 0 530 400" role="img" aria-label="Product module breakdown and data flow"
+        xmlns="http://www.w3.org/2000/svg">
+        <g fill="none" stroke="#000" stroke-width="1">
+          <rect x="150" y="8" width="400" height="42" />
+          <rect x="150" y="76" width="400" height="42" />
+          <rect x="150" y="144" width="400" height="50" />
+          <rect x="150" y="220" width="400" height="42" />
+          <rect x="150" y="288" width="400" height="42" />
+          <rect x="150" y="356" width="400" height="36" />
+        </g>
+        <g font-family="Times New Roman, Times, serif" font-size="13" fill="#000">
+          <text x="350" y="27" text-anchor="middle">1 · Modelling and data intake</text>
+          <text x="350" y="42" text-anchor="middle" font-size="11">customer data + rules → instance + constraint
+            set</text>
+          <text x="350" y="95" text-anchor="middle">2 · Objective and weights</text>
+          <text x="350" y="110" text-anchor="middle" font-size="11">feasibility check + weighted objective</text>
+          <text x="350" y="167" text-anchor="middle">3 · Evolution engine (CORAL)</text>
+          <text x="350" y="182" text-anchor="middle" font-size="11">agents, worktrees, grader daemon, leaderboard</text>
+          <text x="350" y="239" text-anchor="middle">4 · Knowledge layer</text>
+          <text x="350" y="254" text-anchor="middle" font-size="11">tenant-private memory + shared distilled
+            strategies</text>
+          <text x="350" y="307" text-anchor="middle">5 · Champion solver</text>
+          <text x="350" y="322" text-anchor="middle" font-size="11">promote champion, daily solves</text>
+          <text x="350" y="379" text-anchor="middle">6 · Feedback</text>
+        </g>
+        <g fill="none" stroke="#000" stroke-width="1" marker-end="url(#ah)">
+          <path d="M350,50 L350,74" />
+          <path d="M350,118 L350,142" />
+          <path d="M350,194 L350,218" />
+          <path d="M350,262 L350,286" />
+          <path d="M350,330 L350,354" />
+          <path d="M550,374 L640,374 L640,97 L552,97" />
+          <path d="M550,169 L600,169 L600,241 L552,241" />
+        </g>
+        <g font-family="Times New Roman, Times, serif" font-size="11" fill="#000">
+          <text x="655" y="240" text-anchor="middle" transform="rotate(-90 655 240)">feedback rewrites the constraints
+            and weights</text>
+          <text x="609" y="207" text-anchor="middle" transform="rotate(-90 609 207)">reads / writes</text>
+        </g>
+      </svg>
+    </div>
+    <p class="figcap">Product module breakdown. All six modules are the product; module 3 is CORAL as it exists
+      today. The loop that makes it a product is the arrow on the right, from user feedback back into the objective
+      and its weights.</p>
+
+    <h3>2. Knowledge accumulation</h3>
+
+    <p>CORAL's notes are advisory. No code path reads a note, injects one into an agent's prompt, or verifies that an
+      agent complied with it; agents are told only where the directory is. Knowledge that must be obeyed cannot be
+      stored there. Customer knowledge is therefore classified by enforcement rather than by importance: knowledge
+      that determines whether a solution is acceptable is compiled into the grader, and knowledge that only
+      accelerates the search is placed in the knowledge channel. This yields four categories with four distinct
+      injection points.</p>
+
+    <div class="fig">
+      <svg viewBox="0 0 700 300" role="img" aria-label="Four kinds of customer knowledge and their injection points"
+        xmlns="http://www.w3.org/2000/svg">
+        <g fill="none" stroke="#000" stroke-width="1">
+          <rect x="10" y="28" width="212" height="40" />
+          <rect x="10" y="84" width="212" height="40" />
+          <rect x="10" y="140" width="212" height="40" />
+          <rect x="10" y="196" width="212" height="40" />
+          <rect x="400" y="28" width="250" height="40" />
+          <rect x="400" y="84" width="250" height="40" />
+          <rect x="400" y="140" width="250" height="40" />
+          <rect x="400" y="196" width="250" height="40" />
+          <rect x="400" y="258" width="250" height="34" />
+        </g>
+        <g font-family="Times New Roman, Times, serif" font-size="12" fill="#000">
+          <text x="116" y="16" text-anchor="middle" font-size="11">What the customer knows</text>
+          <text x="525" y="16" text-anchor="middle" font-size="11">Where it has to go</text>
+          <text x="116" y="53" text-anchor="middle">Their manual dispatching procedure</text>
+          <text x="116" y="109" text-anchor="middle">Unwritten hard constraints</text>
+          <text x="116" y="165" text-anchor="middle">Heuristics and experience</text>
+          <text x="116" y="221" text-anchor="middle">Plan approval history</text>
+          <text x="525" y="45" text-anchor="middle">seed/manual_baseline.py</text>
+          <text x="525" y="60" text-anchor="middle" font-size="10">the starting program, and the baseline</text>
+          <text x="525" y="101" text-anchor="middle">grader evaluate() + task.description</text>
+          <text x="525" y="116" text-anchor="middle" font-size="10">stated to the agent, enforced by the grader</text>
+          <text x="525" y="157" text-anchor="middle">notes/ and skills/</text>
+          <text x="525" y="172" text-anchor="middle" font-size="10">seeded per tenant (needs a code change)</text>
+          <text x="525" y="213" text-anchor="middle">objective weights</text>
+          <text x="525" y="228" text-anchor="middle" font-size="10">learned, not declared (section 4)</text>
+          <text x="525" y="279" text-anchor="middle">the winning commit of run N</text>
+        </g>
+        <g fill="none" stroke="#000" stroke-width="1" marker-end="url(#ah)">
+          <path d="M222,48 L398,48" />
+          <path d="M222,104 L398,104" />
+          <path d="M222,160 L398,160" />
+          <path d="M222,216 L398,216" />
+          <path d="M650,275 L674,275 L674,48 L652,48" />
+        </g>
+        <g font-family="Times New Roman, Times, serif" font-size="10" fill="#000">
+          <text x="688" y="160" text-anchor="middle" transform="rotate(-90 688 160)">becomes the seed of run N+1</text>
+        </g>
+      </svg>
+    </div>
+
+    <ol class="mods">
+      <li><b>Manual procedure: the seed program.</b> The dispatcher's current process is implemented as
+        <code>seed/manual_baseline.py</code>. Every agent worktree branches from that HEAD, which makes it the common
+        starting point rather than a suggestion.
+      </li>
+      <li><b>Unwritten hard constraints: grader and task description.</b> Any strict rule is implemented as a
+        feasibility check in <code>TaskGrader.evaluate()</code> and simultaneously stated in
+        <code>task.description</code>,
+        which CORAL renders into the agent's instruction file. If stated but not enforced, the rule is abandoned under
+        score
+        pressure; if enforced but not stated, it must be rediscovered by trial.
+      </li>
+      <li><b>Heuristics and domain experience: notes and skills, seeded per tenant.</b> This is the only category
+        that requires a change to CORAL. <code>create_project()</code> constructs an empty <code>.coral/</code> on
+        every run and provides no mechanism for carrying knowledge between runs; it must be extended to seed a tenant
+        knowledge pack. Within the pack, executable skills rank above prose notes: a skill, such as a script that
+        queries the customer's travel-time matrix, is invoked and measured, whereas a note may never be read.</li>
+      <li><b>Plan approval history: objective weights.</b> The record of which plans were accepted, edited or
+        rejected is a signal for weight estimation and is done in module 2.</li>
+    </ol>
+
+    <p>Accumulation between runs is carried by the program, not by the notes. On completion of a run,
+      <code>coral export</code> promotes the winning commit to the seed of the next run, so the artefact retained is
+      the one that was measured. A note is carried into the next run's pack only if its claim cites an attempt hash
+      that exists and whose recorded score matches, a check CORAL does not currently perform.
+    </p>
+
+    <h3>4. Fuzzy user feedback</h3>
+
+    <p>Statements such as "the drivers are too tired" are not defect reports against one schedule; they are evidence
+      that the objective is mis-weighted. Feedback is therefore first routed, not answered. If the plan could not
+      have been executed at all, the model is missing a constraint and the correction belongs in modules 1 and 2. If
+      the plan was executable but unwanted, the objective priced something wrongly and the correction is a weight.
+      Only the second class drives evolution.</p>
+
+    <p>The path is not a set of independent channels but a single pipeline of three stages: a divergence is detected, a
+      question is asked about that specific divergence, and the answer is classified. No stage asks the user to
+      quantify anything.</p>
+
+    <ol class="mods">
+      <li><b>Detection.</b> Dispatchers edit a plan before releasing it. The planning interface records both the plan
+        that was served and the plan that was actually released. Each divergence between them is, in itself, an
+        inequality over the objective's weights: under the true objective, the plan the dispatcher chose scores at
+        least as well as the plan that was proposed. The inequality is obtained at no cost in user effort and is
+        undistorted by phrasing, but it is silent about intent. Its second and more important function is to localise
+        the omission: it identifies the one decision at which an unstated rule took effect.</li>
+      <li><b>Interrogation.</b> The knowledge governing routine dispatching is enacted daily, and familiarity renders
+        it self-evident to the expert and therefore not worth stating, so open requests of the form "is there anything
+        else we should know" under-report precisely the rules that carry the most weight. The omission is not evasion
+        but an ordinary consequence of expertise, known in expert-systems practice as the knowledge-acquisition
+        bottleneck. Knowledge is obtained only when the question is specific enough to touch the rule in question;
+        the divergence recorded in stage 1 supplies that specificity, and is put back to the
+        dispatcher as a contrastive question about that case, for example "stop 14 was moved from route B to route C
+        before release; what made route B unusable". The record localises the unstated rule; the question extracts
+        it.</li>
+      <li><b>Classification.</b> The answer returns as natural language, as does any unprompted comment left against
+        a plan. A model maps that language onto the objective's existing terms: which term is implicated (driver
+        hours, overtime, distance, lateness, fairness), in which direction, and at what scope (this instance, this
+        depot, always). "The drivers are too tired" becomes a proposed increase in the penalty on driver hours. The
+        model performs classification only. It never sets a number and never writes to the grader; it emits a
+        proposal, which enters the weight estimation alongside every other observation.</li>
+    </ol>
+
+
+    <p class="note">A caution on incumbency. Every instrument above learns from what the dispatchers do, and the
+      dispatchers have done the same thing for years. Left unguarded the loop amplifies incumbency: an unfamiliar
+      plan is rejected because it is unfamiliar, the rejection is read as a revealed preference, the objective is
+      adjusted to penalise whatever made the plan unfamiliar, and the system converges on the practice it was
+      procured to improve. The loss would not appear as a loss, because the objective that would have measured it has
+      itself moved.</p>
+
+
+    <h3>5. Foreseeable failure modes</h3>
+
+    <p>I think the most deployments of this kind fail because the problem was modelled wrongly, not because the search
+      was weak.</p>
+
+    <h4>Failure 1. Model and data</h4>
+
+    <p class="hdr">Problem</p>
+    <p>The objective may not state what the customer actually wants. The grader returns a high score, the dispatcher
+      calls
+      the plan unusable and fixes it by hand, and the measured gain is lost, because that plan breaks a rule nobody
+      wrote down. The data may be wrong and the solver will optimise them
+      faithfully, with wrong coordinates. For example it can be an out of date travel time matrix, or a vehicle capacity
+      that the fleet does
+      not actually meet.</p>
+
+    <p class="hdr">Strategy to mitigate</p>
+    <p>We need constant discussion with the customer to ensure the objective states what the customer actually wants.
+      As for data accuracy, we want a checking layer runs before the solver and rejects bad input rather than repairing
+      it. Every rule the customer
+      states is tested against the record of past approved plans before it is accepted, because a rule that a fair
+      number
+      of executed plans already break is a preference and should enter as a weight. If we write it into the grader as a
+      hard rule instead, it would cut away part of the legal solution space, and the agent could never again find the
+      better plan that was inside it.</p>
+
+    <h4>Failure 2. The self directed agent</h4>
+
+    <p class="hdr">Problem</p>
+    <p>The agent can read exactly how it is scored. In CORAL the grading code sits in the task's <code>grader/</code>
+      folder and is shown to every agent as read only, and this stays true even when the agent runs inside a sandbox or
+      a container, because only the hidden data, not the scoring code, is placed behind that wall. So an agent that
+      writes its own program, sees its own score, and can read the code that produced it will, after several hundred
+      rounds, drift toward the cheapest way to raise the number. Often the cheapest way is not to solve the problem but
+      to cheat the measurement. It may store answers for instances it has already seen, read a known optimum from a
+      value in the input, use a rounding or tie breaking detail in the grader, or special case the few visible
+      development instances. The score is then high and the solver is useless.</p>
+
+    <p class="hdr">Strategy to mitigate</p>
+    <p>Because the scoring code cannot be hidden, we assume the agent knows it in full and build the harness so that the
+      only way to raise the score is to actually solve new instances. First, we keep a holdout set the agent never
+      sees, and the gap between the development score and the holdout score tells us how far the agent has fitted the
+      grader instead of the problem. Second, the promotion gate scores the champion again on instances created after it
+      was written, and probes change an instance in ways that must not change the answer, so a program that only
+      memorised or special cased earlier cases is exposed. This does not eliminate the risk entirely, but it makes it
+      harder for the agent to cheat the measurement. </p>
+  </section>
+</body>
+
+</html>

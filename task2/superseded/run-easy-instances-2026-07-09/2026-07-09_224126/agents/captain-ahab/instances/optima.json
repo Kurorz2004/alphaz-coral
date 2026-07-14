@@ -1,0 +1,72 @@
+{
+  "abz5": {
+    "jobs": 10,
+    "machines": 10,
+    "optimum": 1234,
+    "proven": true,
+    "source": "JSPLIB"
+  },
+  "ft10": {
+    "jobs": 10,
+    "machines": 10,
+    "optimum": 930,
+    "proven": true,
+    "source": "JSPLIB"
+  },
+  "ft20": {
+    "jobs": 20,
+    "machines": 5,
+    "optimum": 1165,
+    "proven": true,
+    "source": "JSPLIB"
+  },
+  "la16": {
+    "jobs": 10,
+    "machines": 10,
+    "optimum": 945,
+    "proven": true,
+    "source": "JSPLIB"
+  },
+  "la21": {
+    "jobs": 15,
+    "machines": 10,
+    "optimum": 1046,
+    "proven": true,
+    "source": "JSPLIB"
+  },
+  "la26": {
+    "jobs": 20,
+    "machines": 10,
+    "optimum": 1218,
+    "proven": true,
+    "source": "JSPLIB"
+  },
+  "la36": {
+    "jobs": 15,
+    "machines": 15,
+    "optimum": 1268,
+    "proven": true,
+    "source": "JSPLIB"
+  },
+  "orb01": {
+    "jobs": 10,
+    "machines": 10,
+    "optimum": 1059,
+    "proven": true,
+    "source": "JSPLIB"
+  },
+  "swv01": {
+    "jobs": 20,
+    "machines": 10,
+    "optimum": 1407,
+    "proven": true,
+    "source": "JSPLIB"
+  },
+  "ta01": {
+    "jobs": 15,
+    "machines": 15,
+    "optimum": 1231,
+    "proven": true,
+    "source": "JSPLIB"
+  }
+}

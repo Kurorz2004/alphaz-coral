@@ -621,6 +621,13 @@
         but the duplicates observed in the runs do not need one.</li>
     </ol>
 
+    <p>On top of the grouping there is one model-assisted step, added for the experiment below. When a duplicate
+      group forms, a single LLM call drafts one merged note, and the draft is accepted only if it passes the same
+      mechanical verification as any other note: every attempt it cites must resolve in the store with the exact
+      recorded score. On success the originals move to an archive outside the served view, so the agents see only
+      the merged note; on any failure nothing is touched and the group is cached so the call is not repeated. The
+      model only writes prose; what counts as true is still decided by the mechanical checks.</p>
+
     <p>What lands in each worktree is a generated view: <code>notes/</code> and <code>skills/</code> stop being
       symlinks and become a directory the manager writes, one file at a time with atomic renames, because under
       Docker the worktree is a bind mount and a directory swap would not propagate. The index is generated as well,
@@ -712,8 +719,76 @@
       served note already refuted costs about 8% of the search. The secondary metrics are therefore where the
       change acts: the rank of refuted notes in the view each agent was served, the gap between declared and
       computed confidence, and the number of evaluations spent re-testing refuted approaches.
-      <span class="todo">Comparative runs pending; results to follow.</span>
     </p>
+
+    <p>The experiment ran on 2026-07-15: three runs with the gate and consolidator on, against the three Task 3
+      full-CORAL runs as the vanilla arm. Same task, same two agents, same model (deepseek-v4-flash), same
+      12-real-attempt budget; Final Score is the best real attempt of a run, the same metric as Task 3. All six
+      runs completed their full budget. The numbers below were audited by an independent reviewer against the raw
+      run artifacts before publication.</p>
+
+    <div class="scroll">
+      <table>
+        <caption>Final Score per run and per arm. Runs are independent seeds, not pairs; the row alignment is
+          positional only.</caption>
+        <thead>
+          <tr>
+            <th>Run</th>
+            <th class="n">Vanilla</th>
+            <th class="n">Gate + consolidation</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>s1</td>
+            <td class="n">0.9854</td>
+            <td class="n">0.9860</td>
+          </tr>
+          <tr>
+            <td>s2</td>
+            <td class="n">0.9902</td>
+            <td class="n">0.9933</td>
+          </tr>
+          <tr>
+            <td>s3</td>
+            <td class="n">0.9875</td>
+            <td class="n">0.9841</td>
+          </tr>
+          <tr class="hi">
+            <td>mean &plusmn; std</td>
+            <td class="n">0.9877 &plusmn; 0.0024</td>
+            <td class="n">0.9878 &plusmn; 0.0048</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <ol class="mods">
+      <li><b>Score.</b> Flat, as predicted above: a difference of +0.0001 with run-to-run spread more than twenty
+        times larger. The knowledge change neither helps nor hurts the headline number on this task, which repeats
+        the Task 3 result.</li>
+      <li><b>Verification.</b> The three runs ended with 22 notes in the shared store. 16 were verified against
+        the attempt store and served as such; 6 whose citations could not be checked (no evidence cited, or a
+        cited attempt absent from the store) were marked unverified and ranked below the verified ones. The
+        generated index stayed correct in all three runs; the hand-kept index rot seen in <code>full-s1</code> did
+        not recur.</li>
+      <li><b>Consolidation.</b> Five duplicate groups formed and two were merged by the LLM step, in both cases a
+        pair of notes describing the same line of work (an ILS pair in s2, a perturbation pair in s3). Each merged
+        note passed verification before it replaced anything, the four originals went to the archive, and both
+        agents' views then showed only the merged note. No note was lost in any run.</li>
+    </ol>
+
+    <p>The three failed merges share one cause. One group member documented crashed attempts, which have no score,
+      so the merged draft cannot quote every cited attempt with its recorded number, and the acceptance check
+      rejects it; we reproduced this offline against the same notes and attempt store. A failed merge leaves the
+      member notes untouched and is cached, so it costs one LLM call and nothing else. Extending the output
+      contract to unscored attempts is the clear next step.</p>
+
+    <p>One incident in the first run is disclosed rather than hidden. One agent wrote its notes to a wrong
+      absolute path outside its worktree, where the harvest cannot see them. Four of those notes were moved into
+      the correct view by hand mid-run and were then served as unverified, since they cite no evidence; a fifth,
+      written after the last pass, stayed stranded. The wrong path is agent behavior rather than a gate defect,
+      but it marks a real boundary: the gate can only govern what reaches a worktree view.</p>
   </section>
 
   <!-- ---------------- TASK 5 ---------------- -->

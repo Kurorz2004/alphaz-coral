@@ -1,0 +1,366 @@
+From d67c233534ec74586145784829fa9ace200dcc07 Mon Sep 17 00:00:00 2001
+From: Steve <steventhanhtuan@gmail.com>
+Date: Tue, 14 Jul 2026 17:09:33 +0700
+Subject: [PATCH 09/17] task4: gate the worktree symlinks, notes/skills become
+ generated dirs
+
+setup_shared_state(publication_gate=True) creates notes/ and skills/ as
+real directories seeded verbatim from shared state (first harvest pass
+sees no diff); every other shared-state item stays a symlink. Gate off
+executes the pre-gate code path byte-for-byte, including the legacy
+real-dir self-heal, so the control arm is exactly vanilla; knowledge
+ablation wins over the gate. repoint_shared_state skips gated real
+dirs with a warning instead of destroying agent drafts.
+
+Reviewed; one control-arm violation (self-heal skip firing with the
+gate off) found by side-by-side repro and fixed. 691 passed, ruff clean.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ coral/workspace/worktree.py    |  69 ++++++++++++
+ tests/test_publication_gate.py | 197 +++++++++++++++++++++++++++++++++
+ 2 files changed, 266 insertions(+)
+
+diff --git a/coral/workspace/worktree.py b/coral/workspace/worktree.py
+index 49e97d6..5a2fb91 100644
+--- a/coral/workspace/worktree.py
++++ b/coral/workspace/worktree.py
+@@ -170,6 +170,7 @@ def setup_shared_state(
+     shared_dir_name: str = ".claude",
+     island_id: str | int | None = None,
+     knowledge: bool = True,
++    publication_gate: bool = False,
+ ) -> None:
+     """Create a shared state directory in the worktree with symlinks into the island root.
+ 
+@@ -187,12 +188,40 @@ def setup_shared_state(
+     a notes/ and skills/ directory that the ablation deleted — the same reason
+     the grader link below is guarded on existence.
+ 
++    With ``publication_gate=True`` (and ``knowledge=True``), ``notes/`` and
++    ``skills/`` are *not* symlinked. Instead each is created as a real
++    directory in the worktree, seeded with a verbatim recursive copy of the
++    current shared-state content. This mirrors the first-run migration
++    semantics of ``coral.hub.publication``: the agent's view starts
++    byte-identical to shared state, so the first harvest pass sees no diff
++    and is a no-op. Every other ``_SHARED_STATE_ITEMS`` entry is still
++    symlinked exactly as when the gate is off — this is v1 of the gate,
++    scoped to the notes/skills channel only. When ``publication_gate=False``
++    (the default), behavior is byte-identical to pre-gate code: this is the
++    experiment's control arm. ``knowledge=False`` always wins over the gate
++    (no notes/skills of either kind get created at all).
++
++    Self-heal: if a prior run (gate off, or an earlier pass before the gate
++    turned on) left ``notes/``/``skills/`` as a symlink and the gate is now
++    on, the symlink is replaced with a seeded real directory. The reverse
++    direction needs no special case: when the gate is off, ``notes``/``skills``
++    fall through to the same pre-existing, item-agnostic self-heal below that
++    has always covered every ``_SHARED_STATE_ITEMS`` entry. That self-heal
++    moves only files shared state lacks and skips same-named ones, and its
++    rmdir of the leftover dir is guarded, so a gated directory whose files
++    exactly match shared state simply stays a real directory (harmless, no
++    data loss and no duplication) rather than being re-symlinked.
++    ``publication_gate=False`` always executes the pre-gate code path
++    byte-for-byte, for every item.
++
+     Args:
+         worktree_path: Path to the agent's git worktree
+         coral_dir: Path to the shared .coral directory
+         shared_dir_name: Name of the shared dir in the worktree (e.g. ".claude")
+         island_id: The agent's island id (str/int), or None for single-island mode.
+         knowledge: False to omit the knowledge channel (see ``agents.knowledge``).
++        publication_gate: True to seed notes/skills as real, verified-content
++            directories instead of symlinks (see ``agents.publication_gate``).
+     """
+     from coral.hub._island import island_root
+ 
+@@ -212,6 +241,26 @@ def setup_shared_state(
+     for item in items:
+         src = state_root / item
+         dst = shared_dir / item
++
++        if publication_gate and item in _PUBLICATION_GATE_ITEMS:
++            if dst.is_symlink():
++                # Self-heal: convert a stale symlink into a seeded real dir.
++                dst.unlink()
++            if not dst.exists():
++                src.mkdir(parents=True, exist_ok=True)
++                shutil.copytree(src, dst)
++            # else: already a real directory (this worktree was already
++            # gated) -- never touch it again, it may hold agent drafts not
++            # yet harvested.
++            continue
++
++        # Gate is off (or item isn't notes/skills) here -- falls straight
++        # into the pre-existing, item-agnostic self-heal below, exactly as
++        # every _SHARED_STATE_ITEMS entry has always been handled. A real
++        # notes/skills dir found at this point (e.g. left over from a run
++        # where the gate was on) is migrated into shared state and replaced
++        # with a symlink like any other item, not left untouched.
++
+         # If a previous (buggy) run wrote into a real local dir at this path
+         # instead of a symlink, migrate any files into the shared dir then
+         # replace the local dir with a symlink.
+@@ -271,6 +320,11 @@ _SHARED_STATE_ITEMS: tuple[str, ...] = (
+     "eval_logs",
+ )
+ 
++# The subset of _SHARED_STATE_ITEMS the publication gate (agents.publication_gate)
++# seeds as real directories instead of symlinks. v1 is single-island only and
++# scoped to the notes/skills channel -- see setup_shared_state's docstring.
++_PUBLICATION_GATE_ITEMS: frozenset[str] = frozenset({"notes", "skills"})
++
+ 
+ def repoint_shared_state(
+     worktree_path: Path,
+@@ -292,6 +346,13 @@ def repoint_shared_state(
+     when ``dst.exists()`` is True, and a symlink to the still-existing
+     old island satisfies ``exists()``.
+ 
++    Publication-gate aware: the gate (v1) is single-island only, so a
++    ``notes``/``skills`` entry that is a real directory (not a symlink) --
++    i.e. this worktree was set up with ``publication_gate=True`` -- is left
++    alone: repointing it is skipped and a warning is logged, rather than
++    unlinking it (``rmtree``-ing a real dir here would destroy agent
++    drafts not yet harvested into shared state).
++
+     Raises:
+         ValueError: if ``new_island_id`` is None or fails island_root
+             validation (path separators, etc.).
+@@ -313,6 +374,14 @@ def repoint_shared_state(
+         # destination island hasn't seen any agent activity yet).
+         src.mkdir(parents=True, exist_ok=True)
+ 
++        if item in _PUBLICATION_GATE_ITEMS and dst.exists() and not dst.is_symlink():
++            logger.warning(
++                f"repoint_shared_state: {dst} is a real directory (publication gate "
++                "v1 is single-island only) -- skipping repoint to avoid destroying "
++                "agent drafts"
++            )
++            continue
++
+         if dst.is_symlink():
+             dst.unlink()
+         elif dst.exists() and dst.is_dir():
+diff --git a/tests/test_publication_gate.py b/tests/test_publication_gate.py
+index 3971f94..5770d0a 100644
+--- a/tests/test_publication_gate.py
++++ b/tests/test_publication_gate.py
+@@ -8,6 +8,7 @@ land the gate's verification logic.
+ 
+ from __future__ import annotations
+ 
++import logging
+ from datetime import UTC, datetime
+ from pathlib import Path
+ 
+@@ -29,6 +30,7 @@ from coral.hub.publication import (
+     verify_note,
+ )
+ from coral.types import Attempt
++from coral.workspace.worktree import repoint_shared_state, setup_shared_state
+ 
+ # --------------------------------------------------------------------------- #
+ # Task 1 — config flag
+@@ -1322,3 +1324,198 @@ def test_stamp_verdicts_transition_from_verified_to_unverifiable_clears_stale_ve
+ 
+     assert formatted2.endswith("[unverified]")
+     assert "[verified" not in formatted2
++
++
++# --------------------------------------------------------------------------- #
++# Task 8 — worktree symlinks gated by publication_gate                        #
++# --------------------------------------------------------------------------- #
++
++
++def _seed_state_root(state_root: Path) -> None:
++    """Minimal shared-state tree: attempts/logs/heartbeat/eval_logs plumbing
++    plus notes/skills seeded with real content, mirroring what
++    ``_build_island_subtree`` seeds for a knowledge=True island."""
++    for sub in ("attempts", "logs", "heartbeat", "eval_logs"):
++        (state_root / sub).mkdir(parents=True, exist_ok=True)
++    (state_root / "notes").mkdir(parents=True, exist_ok=True)
++    (state_root / "notes" / "note.md").write_text(
++        "---\ncreator: agent-1\n---\n\n# Note\nShared finding.\n"
++    )
++    (state_root / "skills" / "my-skill").mkdir(parents=True, exist_ok=True)
++    (state_root / "skills" / "my-skill" / "SKILL.md").write_text("# My Skill\n")
++
++
++def test_publication_gate_on_seeds_real_notes_and_skills_dirs(tmp_path):
++    """Gate ON + knowledge ON: notes/skills become real dirs, seeded byte-
++    identical to shared state; the rest of the channel stays symlinked."""
++    coral_dir = tmp_path / ".coral"
++    public = coral_dir / "public"
++    _seed_state_root(public)
++    worktree = tmp_path / "worktree"
++    worktree.mkdir()
++
++    setup_shared_state(worktree, coral_dir, ".claude", knowledge=True, publication_gate=True)
++
++    shared = worktree / ".claude"
++    notes_dir = shared / "notes"
++    skills_dir = shared / "skills"
++    assert notes_dir.is_dir() and not notes_dir.is_symlink()
++    assert skills_dir.is_dir() and not skills_dir.is_symlink()
++    assert (notes_dir / "note.md").read_text() == (public / "notes" / "note.md").read_text()
++    assert (skills_dir / "my-skill" / "SKILL.md").read_text() == "# My Skill\n"
++
++    for item in ("attempts", "logs", "heartbeat", "eval_logs"):
++        link = shared / item
++        assert link.is_symlink(), f"{item} must remain a symlink under the gate"
++
++
++def test_publication_gate_off_notes_skills_stay_symlinks(tmp_path):
++    """Control arm: gate OFF must be byte-identical to pre-gate behavior --
++    notes/skills are plain symlinks, exactly like every other shared item."""
++    coral_dir = tmp_path / ".coral"
++    public = coral_dir / "public"
++    _seed_state_root(public)
++    worktree = tmp_path / "worktree"
++    worktree.mkdir()
++
++    setup_shared_state(worktree, coral_dir, ".claude", knowledge=True, publication_gate=False)
++
++    shared = worktree / ".claude"
++    for item in ("notes", "skills"):
++        link = shared / item
++        assert link.is_symlink(), f"{item} must be a symlink when publication_gate is off"
++        assert link.resolve() == (public / item).resolve()
++
++
++def test_publication_gate_on_knowledge_off_ablation_prunes_notes_skills(tmp_path):
++    """knowledge=False wins over the gate: no notes/skills of either kind."""
++    coral_dir = tmp_path / ".coral"
++    public = coral_dir / "public"
++    for sub in ("attempts", "logs", "heartbeat", "eval_logs"):
++        (public / sub).mkdir(parents=True)
++    worktree = tmp_path / "worktree"
++    worktree.mkdir()
++
++    setup_shared_state(worktree, coral_dir, ".claude", knowledge=False, publication_gate=True)
++
++    shared = worktree / ".claude"
++    assert not (shared / "notes").exists()
++    assert not (shared / "notes").is_symlink()
++    assert not (shared / "skills").exists()
++    assert not (shared / "skills").is_symlink()
++
++
++def test_publication_gate_selfheals_preexisting_symlink_into_seeded_real_dir(tmp_path):
++    """A worktree set up before the gate flipped on (or under the gate off)
++    has notes/ as a symlink; the next setup_shared_state call with the gate
++    on must convert it into a seeded real dir, not leave the stale link."""
++    coral_dir = tmp_path / ".coral"
++    public = coral_dir / "public"
++    _seed_state_root(public)
++    worktree = tmp_path / "worktree"
++    worktree.mkdir()
++
++    setup_shared_state(worktree, coral_dir, ".claude", knowledge=True, publication_gate=False)
++    notes_dir = worktree / ".claude" / "notes"
++    skills_dir = worktree / ".claude" / "skills"
++    assert notes_dir.is_symlink()
++    assert skills_dir.is_symlink()
++
++    setup_shared_state(worktree, coral_dir, ".claude", knowledge=True, publication_gate=True)
++
++    assert notes_dir.is_dir() and not notes_dir.is_symlink()
++    assert skills_dir.is_dir() and not skills_dir.is_symlink()
++    assert (notes_dir / "note.md").read_text() == (public / "notes" / "note.md").read_text()
++    assert (skills_dir / "my-skill" / "SKILL.md").read_text() == "# My Skill\n"
++
++
++def test_repoint_shared_state_skips_real_dir_notes_and_warns(tmp_path, caplog):
++    """The gate is v1 single-island only: repoint_shared_state must not
++    rmtree a real notes/ dir (that would destroy un-harvested agent
++    drafts) -- it skips that entry and logs a warning instead."""
++    coral_dir = tmp_path / ".coral"
++    island0 = coral_dir / "islands" / "0"
++    _seed_state_root(island0)
++    (coral_dir / "islands" / "1").mkdir(parents=True)
++    worktree = tmp_path / "worktree"
++    worktree.mkdir()
++
++    setup_shared_state(worktree, coral_dir, ".claude", island_id="0", publication_gate=True)
++    notes_dir = worktree / ".claude" / "notes"
++    assert notes_dir.is_dir() and not notes_dir.is_symlink()
++    (notes_dir / "draft.md").write_text("agent draft, not yet harvested\n")
++
++    with caplog.at_level(logging.WARNING):
++        repoint_shared_state(worktree, coral_dir, ".claude", new_island_id="1")
++
++    # Skipped: still the same real dir, contents intact.
++    assert notes_dir.is_dir() and not notes_dir.is_symlink()
++    assert (notes_dir / "draft.md").read_text() == "agent draft, not yet harvested\n"
++    assert (notes_dir / "note.md").read_text() == (island0 / "notes" / "note.md").read_text()
++    assert any(
++        "notes" in record.message and "real directory" in record.message
++        for record in caplog.records
++    )
++
++    # Everything else still repoints normally to island 1.
++    attempts_link = worktree / ".claude" / "attempts"
++    assert attempts_link.is_symlink()
++    assert attempts_link.resolve() == (coral_dir / "islands" / "1" / "attempts").resolve()
++    assert (worktree / ".coral_island").read_text() == "1"
++
++
++# --------------------------------------------------------------------------- #
++# Regression: control-arm lock -- gate OFF must run the legacy self-heal      #
++# --------------------------------------------------------------------------- #
++
++
++def test_publication_gate_off_migrates_preexisting_real_notes_and_skills_dirs(tmp_path):
++    """Control-arm lock: mirrors test_workspace.py::test_setup_shared_state_
++    migrates_real_roles_dir but for notes/skills. Gate OFF must still run the
++    pre-existing, item-agnostic self-heal (migrate a real local dir's
++    contents into shared state, then replace it with a symlink) -- exactly
++    like every other _SHARED_STATE_ITEMS entry. Regression for a bug where a
++    gate-off-only skip silently disabled this migration for notes/skills."""
++    coral_dir = tmp_path / ".coral"
++    public = coral_dir / "public"
++    (public / "notes").mkdir(parents=True)
++    (public / "skills").mkdir(parents=True)
++    worktree = tmp_path / "worktree"
++    (worktree / ".claude" / "notes").mkdir(parents=True)
++    (worktree / ".claude" / "skills").mkdir(parents=True)
++    # An agent wrote directly into a real local dir before the symlink
++    # behavior applied here -- must not be lost.
++    (worktree / ".claude" / "notes" / "agent-1.md").write_text("local note content")
++    (worktree / ".claude" / "skills" / "agent-skill.md").write_text("local skill content")
++
++    setup_shared_state(worktree, coral_dir, ".claude", knowledge=True, publication_gate=False)
++
++    notes_link = worktree / ".claude" / "notes"
++    skills_link = worktree / ".claude" / "skills"
++    assert notes_link.is_symlink()
++    assert skills_link.is_symlink()
++    assert (public / "notes" / "agent-1.md").read_text() == "local note content"
++    assert (public / "skills" / "agent-skill.md").read_text() == "local skill content"
++
++
++def test_publication_gate_on_rerun_preserves_existing_real_dir_and_drafts(tmp_path):
++    """Re-running setup_shared_state with the gate on against an already-
++    gated worktree must never touch an existing real notes/ dir -- an
++    un-harvested agent draft (and the originally seeded content) survives
++    fully intact."""
++    coral_dir = tmp_path / ".coral"
++    public = coral_dir / "public"
++    _seed_state_root(public)
++    worktree = tmp_path / "worktree"
++    worktree.mkdir()
++
++    setup_shared_state(worktree, coral_dir, ".claude", knowledge=True, publication_gate=True)
++    notes_dir = worktree / ".claude" / "notes"
++    draft = notes_dir / "draft.md"
++    draft.write_text("agent draft, not yet harvested\n")
++
++    setup_shared_state(worktree, coral_dir, ".claude", knowledge=True, publication_gate=True)
++
++    assert notes_dir.is_dir() and not notes_dir.is_symlink()
++    assert draft.read_text() == "agent draft, not yet harvested\n"
++    assert (notes_dir / "note.md").read_text() == (public / "notes" / "note.md").read_text()
+-- 
+2.45.1.windows.1
+

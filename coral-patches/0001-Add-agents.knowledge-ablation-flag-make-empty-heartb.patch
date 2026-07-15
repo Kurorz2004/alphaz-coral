@@ -1,0 +1,1342 @@
+From def08097a5d60e27f33fcdc7074d72457b7972c3 Mon Sep 17 00:00:00 2001
+From: Steve <steventhanhtuan@gmail.com>
+Date: Fri, 10 Jul 2026 09:32:09 +0700
+Subject: [PATCH 01/17] Add agents.knowledge ablation flag + make empty
+ heartbeat lists honoured
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Task 3 of the assessment needs two ablation conditions that CORAL cannot
+currently express:
+
+  A) disable notes/skills  -> new `agents.knowledge: false`
+  B) disable all heartbeats -> `agents.heartbeat: []`, which was a no-op
+
+(B) was the surprise. `write_agent_heartbeat` / `write_global_heartbeat`
+re-add the PROTECTED actions whenever they are absent, so an empty
+`agents.heartbeat` list still produced `reflect` every eval and
+`consolidate` every 10 global evals. Both writers now take `protect`, and
+the manager passes protect=False when the list is empty by design.
+
+(A) is a new AgentConfig field. When false:
+  - notes/, skills/, agents/, roles/ are neither created nor seeded
+  - no bundled skills (deep-research, create-notes, organize-files,
+    skill-creator) or subagents (deep-researcher, librarian)
+  - the note-writing heartbeats (consolidate, lint_wiki) are dropped, and
+    reflect/pivot fall back to note-free prompts
+  - CORAL.md's knowledge sections are swapped for knowledge-free text
+Attempts, the leaderboard, eval messages and `coral show --diff` are
+untouched: agents still read each other's code and scores.
+
+The 21 knowledge-dependent regions of coral.md.template are now
+placeholders, with both variants of each region living side by side in
+template/knowledge/<region>.md. The ON text was extracted verbatim, and
+test_knowledge_on_renders_byte_identical_to_upstream renders the pre-flag
+template out of git and asserts equality — the control condition of the
+ablation is a control by construction, not by inspection.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ coral/agent/manager.py                        |  32 +++-
+ coral/config.py                               |   9 +
+ coral/hub/heartbeat.py                        |  95 ++++++----
+ coral/hub/prompts/pivot_noknowledge.md        |  63 +++++++
+ coral/hub/prompts/reflect_noknowledge.md      |  36 ++++
+ coral/template/coral.md.template              | 166 ++---------------
+ coral/template/coral_md.py                    |  28 +++
+ .../knowledge/after_eval_knowledge.md         |   8 +
+ coral/template/knowledge/collab_line.md       |   4 +
+ coral/template/knowledge/floor_claim_line.md  |   4 +
+ coral/template/knowledge/handle_line.md       |   4 +
+ .../knowledge/heartbeat_blurb_line.md         |   4 +
+ .../template/knowledge/heartbeat_cli_block.md |   6 +
+ coral/template/knowledge/notes_cli_block.md   |   8 +
+ coral/template/knowledge/orientation_extra.md |  10 +
+ .../knowledge/plan_knowledge_bullet.md        |   4 +
+ coral/template/knowledge/repeat_line.md       |   4 +
+ coral/template/knowledge/role_section.md      | 121 ++++++++++++
+ .../knowledge/share_knowledge_section.md      |  37 ++++
+ coral/template/knowledge/shared_state_line.md |   4 +
+ coral/template/knowledge/shared_state_rows.md |   6 +
+ coral/template/knowledge/stop_note_line.md    |   4 +
+ coral/template/knowledge/task_line.md         |   4 +
+ coral/template/knowledge/tune_finding_line.md |   4 +
+ coral/template/knowledge/uncertainty_line.md  |   4 +
+ coral/workspace/project.py                    |  25 ++-
+ tests/test_knowledge_ablation.py              | 175 ++++++++++++++++++
+ 27 files changed, 675 insertions(+), 194 deletions(-)
+ create mode 100644 coral/hub/prompts/pivot_noknowledge.md
+ create mode 100644 coral/hub/prompts/reflect_noknowledge.md
+ create mode 100644 coral/template/knowledge/after_eval_knowledge.md
+ create mode 100644 coral/template/knowledge/collab_line.md
+ create mode 100644 coral/template/knowledge/floor_claim_line.md
+ create mode 100644 coral/template/knowledge/handle_line.md
+ create mode 100644 coral/template/knowledge/heartbeat_blurb_line.md
+ create mode 100644 coral/template/knowledge/heartbeat_cli_block.md
+ create mode 100644 coral/template/knowledge/notes_cli_block.md
+ create mode 100644 coral/template/knowledge/orientation_extra.md
+ create mode 100644 coral/template/knowledge/plan_knowledge_bullet.md
+ create mode 100644 coral/template/knowledge/repeat_line.md
+ create mode 100644 coral/template/knowledge/role_section.md
+ create mode 100644 coral/template/knowledge/share_knowledge_section.md
+ create mode 100644 coral/template/knowledge/shared_state_line.md
+ create mode 100644 coral/template/knowledge/shared_state_rows.md
+ create mode 100644 coral/template/knowledge/stop_note_line.md
+ create mode 100644 coral/template/knowledge/task_line.md
+ create mode 100644 coral/template/knowledge/tune_finding_line.md
+ create mode 100644 coral/template/knowledge/uncertainty_line.md
+ create mode 100644 tests/test_knowledge_ablation.py
+
+diff --git a/coral/agent/manager.py b/coral/agent/manager.py
+index 8f1bc3f..7987254 100644
+--- a/coral/agent/manager.py
++++ b/coral/agent/manager.py
+@@ -233,6 +233,11 @@ class AgentManager:
+         # In multi-island mode, every island gets its own _global.json so
+         # cadence reads the per-island eval_count for "global" actions like
+         # consolidate.
++        # `protect` re-adds `consolidate` when it is missing. That is right for a
++        # user who trimmed the list, but wrong for the two ways it can be missing
++        # by design: heartbeats disabled outright, or knowledge ablated (nothing
++        # to consolidate). Without this the two ablations silently regrow it.
++        protect_global = bool(self.config.agents.heartbeat) and self.config.agents.knowledge
+         if self.config.islands.count > 1:
+             for island_id in {s.island_id for s in self.specs if s.island_id is not None}:
+                 if not read_global_heartbeat(self.paths.coral_dir, island_id=island_id):
+@@ -240,11 +245,16 @@ class AgentManager:
+                         self.paths.coral_dir,
+                         default_global_actions(self.config),
+                         island_id=island_id,
++                        protect=protect_global,
+                     )
+                     logger.info(f"Seeded global heartbeat config for island {island_id}")
+         else:
+             if not read_global_heartbeat(self.paths.coral_dir):
+-                write_global_heartbeat(self.paths.coral_dir, default_global_actions(self.config))
++                write_global_heartbeat(
++                    self.paths.coral_dir,
++                    default_global_actions(self.config),
++                    protect=protect_global,
++                )
+                 logger.info("Seeded global heartbeat config")
+ 
+         # 3. Warm-start research phase (optional)
+@@ -650,6 +660,7 @@ class AgentManager:
+                 agent_id,
+                 default_local_actions(self.config),
+                 island_id=island_id,
++                protect=bool(self.config.agents.heartbeat),
+             )
+             logger.info(f"  Seeded heartbeat config for {agent_id}")
+ 
+@@ -662,14 +673,17 @@ class AgentManager:
+         # the bundled blank template is rendered. In multi-island runs the
+         # file lands under islands/<id>/roles/ so the worktree symlink
+         # installed by setup_shared_state resolves to a real file.
+-        role_file = (runtime_options or {}).get("role_file")
+-        seed_agent_role(
+-            self.paths.coral_dir,
+-            agent_id,
+-            source=role_file,
+-            base_dir=self._mounts_base_dir() if role_file else None,
+-            island_id=island_id,
+-        )
++        # Role files are part of the knowledge channel: durable shared markdown
++        # that every agent reads. Ablated together with notes and skills.
++        if self.config.agents.knowledge:
++            role_file = (runtime_options or {}).get("role_file")
++            seed_agent_role(
++                self.paths.coral_dir,
++                agent_id,
++                source=role_file,
++                base_dir=self._mounts_base_dir() if role_file else None,
++                island_id=island_id,
++            )
+ 
+         # Generate instruction file (CLAUDE.md, AGENTS.md, etc.)
+         instruction_file = runtime.instruction_filename
+diff --git a/coral/config.py b/coral/config.py
+index fb70767..acaf853 100644
+--- a/coral/config.py
++++ b/coral/config.py
+@@ -248,6 +248,15 @@ class AgentConfig:
+     )
+     skills: list[str] = field(default_factory=list)  # skill dirs copied to .coral/public/skills/
+     research: bool = True  # enable web search / literature review step in workflow
++    # Knowledge accumulation: the durable notes / skills / roles channel.
++    # False ablates it — no notes/, skills/, agents/ or roles/ directories are
++    # created, no bundled skills or subagents are seeded, CORAL.md's knowledge
++    # sections are replaced with knowledge-free text, and the note-writing
++    # heartbeat actions (consolidate, lint_wiki) are dropped while reflect and
++    # pivot fall back to note-free prompts. Attempts, the leaderboard, eval
++    # messages and `coral show --diff` are untouched: agents still see each
++    # other's code and scores. True reproduces upstream behaviour exactly.
++    knowledge: bool = True
+     stagger_seconds: int = 0  # delay between spawning each agent (rate-limit backpressure)
+ 
+     # Reliability: crash-burst circuit breaker.
+diff --git a/coral/hub/heartbeat.py b/coral/hub/heartbeat.py
+index 8c08080..7d0a6df 100644
+--- a/coral/hub/heartbeat.py
++++ b/coral/hub/heartbeat.py
+@@ -40,6 +40,26 @@ DEFAULT_PROMPTS: dict[str, str] = {
+     "lint_wiki": _load_prompt("lint_wiki"),
+ }
+ 
++# Actions that exist only to write and curate notes/skills. Under
++# ``agents.knowledge: false`` they have nothing to act on and are dropped.
++KNOWLEDGE_ACTIONS: frozenset[str] = frozenset({"consolidate", "lint_wiki"})
++
++# reflect and pivot survive the ablation, but their stock prompts instruct the
++# agent to write experiment notes, role files and focus notes. These variants
++# keep the reflection and the direction-change and drop the artifacts.
++NO_KNOWLEDGE_PROMPTS: dict[str, str] = {
++    "reflect": _load_prompt("reflect_noknowledge"),
++    "pivot": _load_prompt("pivot_noknowledge"),
++}
++
++
++def default_prompt_for(name: str, knowledge: bool = True) -> str:
++    """Return the built-in prompt for ``name``, honouring the knowledge ablation."""
++    if not knowledge and name in NO_KNOWLEDGE_PROMPTS:
++        return NO_KNOWLEDGE_PROMPTS[name]
++    return DEFAULT_PROMPTS.get(name, "")
++
++
+ # Which built-in actions default to global scope
+ DEFAULT_GLOBAL: dict[str, bool] = {
+     "reflect": False,
+@@ -148,15 +168,18 @@ def write_agent_heartbeat(
+     agent_id: str,
+     actions: list[dict],
+     island_id: str | int | None = None,
++    protect: bool = True,
+ ) -> None:
+     """Write local heartbeat actions for an agent.
+ 
+-    Protected local actions (reflect) are re-added if missing.
++    Protected local actions (reflect) are re-added if missing, unless
++    ``protect=False`` — which is how a deliberately empty ``agents.heartbeat``
++    list stays empty instead of silently regrowing ``reflect``.
+     """
+     coral_dir = Path(coral_dir)
+     _require_write_scope(coral_dir, island_id)
+     present = {a["name"] for a in actions}
+-    for name in PROTECTED_LOCAL:
++    for name in PROTECTED_LOCAL if protect else ():
+         if name not in present:
+             actions.append(
+                 {
+@@ -211,15 +234,18 @@ def write_global_heartbeat(
+     coral_dir: Path,
+     actions: list[dict],
+     island_id: str | int | None = None,
++    protect: bool = True,
+ ) -> None:
+     """Write global heartbeat actions.
+ 
+-    Protected global actions (consolidate) are re-added if missing.
++    Protected global actions (consolidate) are re-added if missing, unless
++    ``protect=False`` — used when heartbeats are disabled outright, or when
++    ``agents.knowledge`` is false and ``consolidate`` has no notes to curate.
+     """
+     coral_dir = Path(coral_dir)
+     _require_write_scope(coral_dir, island_id)
+     present = {a["name"] for a in actions}
+-    for name in PROTECTED_GLOBAL:
++    for name in PROTECTED_GLOBAL if protect else ():
+         if name not in present:
+             actions.append(
+                 {
+@@ -234,43 +260,40 @@ def write_global_heartbeat(
+ # --- Defaults from config ---
+ 
+ 
+-def default_local_actions(config) -> list[dict]:
+-    """Extract local actions from config's heartbeat list."""
++def _actions_from_config(config, *, want_global: bool) -> list[dict]:
++    """Extract the local or global actions from config's heartbeat list.
++
++    Under ``agents.knowledge: false`` the note-curating actions are dropped and
++    the survivors fall back to their note-free prompts.
++    """
++    knowledge = getattr(config.agents, "knowledge", True)
+     actions = []
+     for action_cfg in config.agents.heartbeat:
++        if not knowledge and action_cfg.name in KNOWLEDGE_ACTIONS:
++            continue
+         is_global = action_cfg.is_global or DEFAULT_GLOBAL.get(action_cfg.name, False)
+-        if not is_global:
+-            trigger = getattr(action_cfg, "trigger", None) or DEFAULT_TRIGGER.get(
+-                action_cfg.name, "interval"
+-            )
+-            actions.append(
+-                {
+-                    "name": action_cfg.name,
+-                    "every": action_cfg.every,
+-                    "prompt": action_cfg.prompt or DEFAULT_PROMPTS.get(action_cfg.name, ""),
+-                    "trigger": trigger,
+-                    "options": dict(getattr(action_cfg, "options", {}) or {}),
+-                }
+-            )
++        if is_global != want_global:
++            continue
++        trigger = getattr(action_cfg, "trigger", None) or DEFAULT_TRIGGER.get(
++            action_cfg.name, "interval"
++        )
++        actions.append(
++            {
++                "name": action_cfg.name,
++                "every": action_cfg.every,
++                "prompt": action_cfg.prompt or default_prompt_for(action_cfg.name, knowledge),
++                "trigger": trigger,
++                "options": dict(getattr(action_cfg, "options", {}) or {}),
++            }
++        )
+     return actions
+ 
+ 
++def default_local_actions(config) -> list[dict]:
++    """Extract local actions from config's heartbeat list."""
++    return _actions_from_config(config, want_global=False)
++
++
+ def default_global_actions(config) -> list[dict]:
+     """Extract global actions from config's heartbeat list."""
+-    actions = []
+-    for action_cfg in config.agents.heartbeat:
+-        is_global = action_cfg.is_global or DEFAULT_GLOBAL.get(action_cfg.name, False)
+-        if is_global:
+-            trigger = getattr(action_cfg, "trigger", None) or DEFAULT_TRIGGER.get(
+-                action_cfg.name, "interval"
+-            )
+-            actions.append(
+-                {
+-                    "name": action_cfg.name,
+-                    "every": action_cfg.every,
+-                    "prompt": action_cfg.prompt or DEFAULT_PROMPTS.get(action_cfg.name, ""),
+-                    "trigger": trigger,
+-                    "options": dict(getattr(action_cfg, "options", {}) or {}),
+-                }
+-            )
+-    return actions
++    return _actions_from_config(config, want_global=True)
+diff --git a/coral/hub/prompts/pivot_noknowledge.md b/coral/hub/prompts/pivot_noknowledge.md
+new file mode 100644
+index 0000000..8e11799
+--- /dev/null
++++ b/coral/hub/prompts/pivot_noknowledge.md
+@@ -0,0 +1,63 @@
++## Heartbeat: Plateau Detected — Pick the Hardest Unexplored Idea and Commit
++
++**You have not improved your score in several consecutive evals.** Tweaks to your current approach are unlikely to help. This prompt is not a stop signal — it is a *direction-change* signal. **Do not treat it as permission to write a "final summary" and wind down.** Your job right now is to identify the highest-EV idea that nobody on the team has actually tried, and commit a real budget to it.
++
++### Step 1: Diagnose the ceiling honestly
++
++Before changing direction, understand *why* you're stuck:
++
++- Run `coral log --agent {agent_id}` to see your recent score trajectory.
++- Run `coral log -n 10` to see the team's leaderboard.
++- Look at your last 5+ attempts. Are scores flat? Oscillating around the same value? Is every agent stuck at the *same* value?
++
++If multiple agents are all stuck at the same score, do **not** read that as proof of a structural floor. Read it as evidence that the whole team is exploring the same local basin. The strongest possible signal that you should attempt the *hardest* unexplored idea is "everyone agrees the easy ideas don't work."
++
++*Example: "Both of us are at 0.73. We've all tried tuning, ablation, and one-shot scheduler swaps. Nobody has actually implemented the large-neighbourhood search. That's the next move."*
++
++### Step 2: Find the highest-EV unexplored idea
++
++Read — don't skim — the eval messages of every attempt on the board: `coral log --recent -n 20`, then `coral show <hash> --diff` on the ones that look structural. Those messages are the only written record of what has been tried.
++
++- Build the list of what has *not* been tried. Use web search to add candidates the team has not considered at all.
++- For each candidate, ask honestly: was it ruled out by *evidence* (someone implemented it well and it failed) or by *reluctance* (it looked expensive and everyone moved on)?
++- The candidates ruled out by reluctance are your shortlist. Pick the one with the highest plausible payoff.
++
++If a teammate's eval message says "this probably won't work" without an attempt behind it, that is a hypothesis, not a result. Do not let speculation rule out an unexplored direction.
++
++### Step 3: Commit, do not dabble
++
++Once you pick a direction, **commit at least 3 real evals to it before judging.** Structural changes are almost never right on the first attempt:
++
++- Eval 1 will likely have a correctness bug or a tuning issue. That is *expected*. Fix and continue.
++- Eval 2 establishes whether the idea is correct and whether it moves the score in *some* direction (even regression is information).
++- Eval 3 is where you tune the implementation and decide whether it can break the plateau.
++
++Mark each eval message clearly: `"structural attempt 1/3 on <name>"`, `"2/3"`, `"3/3"`. This signals to teammates that you are mid-investigation and they should not use your intermediate scores as evidence the direction is dead.
++
++If you abandon the direction before eval 3, you have not actually tested it.
++
++### Step 4: Claim the lane and the posture in your eval message
++
++Your `coral eval -m` message is the contract you are making with the team. When you commit to the new direction, put four things in it:
++
++- **Posture** — pick the functional role **most missing** from the team, not the most comfortable. See the *Postures* section of CORAL.md for definitions. If both agents are engineers and the team is stuck, the highest-EV move may not be a different technique — it may be becoming the *performance engineer* who finds the real bottleneck, or the *reviewer* who designs an experiment that would falsify the team's "this is the floor" belief.
++- **Lane** — the specific technique or area you are taking up.
++- **Budget** — how many evals you intend to spend before judging.
++- **Abandon-if** — a concrete, testable gate (a specific score or failure mode, not a vibe).
++
++This is what lets the other agent pick a *different* lane and posture instead of duplicating yours.
++
++### Step 5: Start from the right base
++
++- `coral checkout <hash>` to reset to the best-scoring attempt (yours or another agent's), so your structural change builds on the strongest current foundation.
++- Do not carry over assumptions from your previous approach.
++
++### Use `coral eval --tune` carefully during the pivot
++
++Tune mode is useful for sweeping configs *within* your new approach (it does not tick the plateau counter). It is **not** a substitute for real evals on the new direction itself. If a structural change improves tune but not real, that is a finding to state in your next eval message — not a reason to keep iterating in tune. Real-mode evidence is what counts.
++
++The first time you submit `--tune` on this task, the result feedback prints a `[--tune mode]` line that explains what tune actually does in this grader. Read it. If tune mode is on a non-binding constraint relative to real, tune scores will not predict real and you should treat them as smoke tests, not gates.
++
++---
++
++**Remember:** "It's hard to implement" and "I think it probably won't work" are not results. The team has measured what's easy. Now measure what's hard.
+diff --git a/coral/hub/prompts/reflect_noknowledge.md b/coral/hub/prompts/reflect_noknowledge.md
+new file mode 100644
+index 0000000..f02847b
+--- /dev/null
++++ b/coral/hub/prompts/reflect_noknowledge.md
+@@ -0,0 +1,36 @@
++## Heartbeat: Reflection
++
++Pause and reflect on your recent work. This run has no shared notes directory —
++your reflection lives in your own reasoning and in the `coral eval -m` messages
++you write from here on. Make those messages carry it.
++
++### What to reflect on
++
++Three questions, in order.
++
++1. **Anchor in concrete results.** What specific change moved the score?
++   `coral log -n 5 --recent` will show the trajectory.
++2. **Examine surprises + analyze causes.** What did not go as expected? Why?
++3. **Assess confidence + plan next.** What would change your mind? What's
++   the highest-EV next experiment? Be honest about which lever you expect to
++   move the score most, and which of your current beliefs is least tested.
++
++Be specific about what you *don't* know. A belief you have never tested is a
++hypothesis, not a result — do not carry it forward as though it were settled.
++
++### Check your lane and posture
++
++Ask whether your understanding of what you contribute to this team has
++meaningfully shifted since your last reflection. A meaningful shift is one of:
++
++- You have started or finished a contribution that changes the evidence you can
++  cite (a new diagnostic script, a falsified claim, a composed delta).
++- You have abandoned a posture you previously held, or grown into a new one.
++- You have noticed a pattern in your own work you hadn't named before (e.g.
++  "I keep abandoning structural attempts at eval 1 — I should pre-commit to 3").
++
++If it has shifted, say so explicitly in your next `coral eval -m` message: that
++message is the only channel through which teammates can see it. If nothing has
++shifted, do nothing — most evals do not warrant a re-examination.
++
++After reflecting, continue optimizing.
+diff --git a/coral/template/coral.md.template b/coral/template/coral.md.template
+index ba90f46..36841a5 100644
+--- a/coral/template/coral.md.template
++++ b/coral/template/coral.md.template
+@@ -20,19 +20,19 @@ You relate to other agents as genuine collaborators. You assume good faith by de
+ Two words that are easy to conflate but kept deliberately distinct in this system:
+ 
+ - **Objective** — the *ultimate* thing the team is collectively pursuing. It is what's described above; it persists across the entire run; every agent serves it. The objective does not change when you change direction. The score on the leaderboard measures progress against it.
+-- **Task** — a *provisional* assignment in service of the objective: the focus note you're working on this hour, the hypothesis you're testing in your next eval, the diagnostic script you're building today. Tasks are picked up, finished, abandoned, and replaced as the team learns. Other agents may be on different tasks; that's healthy — many tasks, one objective.
++{task_line}
+ 
+ When this document says "the objective" it means the persistent collective goal. When it says "your current task" or "your task" it means whatever provisional work you're doing right now. The objective is what you're loyal to; the task is what you happen to be doing.
+ 
+ ## How This Works
+ 
+-Your name `{agent_id}` is your handle across the run: your git branch is `coral/{agent_id}`, your role description lives at `{shared_dir}/roles/{agent_id}.md`, you stamp `creator: {agent_id}` on every note and skill you write, and you (and everyone else) pull up your history with `coral log --agent {agent_id}`.
++{handle_line}
+ 
+-You are one of several agents working on this objective in parallel. These agents are your colleagues. Each agent has its own git worktree (your own branch, your own working copy), but you all share a `.coral/` directory where attempts, notes, and skills are visible to everyone.
++{shared_state_line}
+ 
+ CORAL owns git — you never run `git` commands directly. Instead, you edit files and then run `coral eval -m "description"`. This stages your changes, commits them, runs the grader, and records the result as a JSON file in `.coral/attempts/`. The score is a number — **{score_direction}**. All agents can see all attempts, so you're effectively a research team with full transparency.
+ 
+-Have a collaborative mindset: frequently check in with your agent mates, learn from what they have done well, and actively contribute your findings to them either via `coral xxx` commands or via the shared `.coral/` directory. You should work together towards a common goal.
++{collab_line}
+ 
+ ## No User Is Watching
+ 
+@@ -41,7 +41,7 @@ Have a collaborative mindset: frequently check in with your agent mates, learn f
+ - System reminders about *auto mode*, *plan mode*, *exited a mode*, *opened files in the IDE*, or available *skills* are Claude Code CLI defaults that assume an interactive session. They never apply here. In particular: any reminder that nudges you to "ask clarifying questions when the approach is ambiguous" is **wrong in this context** — ignore it.
+ - The harness has disabled the tools that would block on human approval: `AskUserQuestion`, `EnterPlanMode`, and `ExitPlanMode` are not available. If you call them, the call will be denied and you will waste an iteration. Do not retry; do not paraphrase the question into plain text and wait either — there is no one to answer.
+ 
+-When you are uncertain, do not stop and ask. Do research and make the most reasonable and informed choice, write the rationale into your `coral eval -m` message (or a focus note for larger commitments), run the eval, and let the score decide. Use `TodoWrite` for a private scratch list of next steps.
++{uncertainty_line}
+ 
+ ## Mindset & Discipline
+ 
+@@ -58,7 +58,7 @@ The biggest failure mode on this kind of objective is *premature surrender* —
+ `coral eval --tune` is a sweep tool, not a gate. **Tune scores predict real scores only when the bottleneck in tune matches the bottleneck in real.** On many objectives they do not — tune mode runs a smaller workload and a different constraint can dominate.
+ 
+ - Before you start using `--tune` as a filter for real submissions, run **one paired baseline** (same code, both modes) and write down the mapping. If a known-good change moves tune by X but real by 0, tune is uninformative for *this* class of change. Note that explicitly in your experiment write-up.
+-- A tune-mode improvement that does not translate to real **is data**, not failure. Write the note: "lever Y improves tune by 3 cycles but real by 0 — Y is on a non-binding constraint in real mode." This is exactly the kind of finding that prevents the next agent from wasting evals.
++{tune_finding_line}
+ - Never use `--tune` as a way to keep moving while avoiding the harder question of why real isn't improving. If real has plateaued, the answer is in real-mode evidence, not in more tune sweeps.
+ 
+ ### Resist premature consensus
+@@ -66,88 +66,10 @@ The biggest failure mode on this kind of objective is *premature surrender* —
+ Cross-agent agreement on a "floor" after a small number of evals is evidence that you're all in the same local basin, not evidence that the basin is the global optimum.
+ 
+ - Treat such agreement as a *signal to invest in the riskiest unexplored idea*, not as a signal to wind down.
+-- Before you cite another agent's "this is the floor" synthesis as a reason to stop, ask: did they actually try the structural ideas they themselves listed as untested? If not, those ideas are still open — the team has confirmed the local basin is hard, not that there is no other basin.
+-- A "stop note" or "final summary" written by you or a teammate after fewer than ~15 evals is almost always premature on a non-trivial objective. Read it as a status report, not a verdict.
++{floor_claim_line}
++{stop_note_line}
+ 
+-## Your Role
+-
+-Your **role** is *what you do on the team*: the posture, lane, contributions, and self-knowledge you accumulate over the run. Like a *task*, it is provisional by design — you discover it, write it down, and rewrite it as you grow.
+-
+-Your function is to bring your particular capabilities and perspective to bear on the problems within your scope, while remaining responsive to the work of others around you. You are neither a solo operator nor a passive executor: you exercise genuine judgment within your domain, but you situate that judgment inside a larger coordinated effort. You take initiative on what falls within your purview, defer on what falls within others', and engage in dialogue at the boundaries where responsibilities overlap or where it's unclear who should act. You communicate your reasoning, your uncertainty, and your observations openly, because your work is an input to others' work and theirs to yours. When you notice gaps — things that need doing but fall outside any clear role — you raise them rather than assuming someone else will. When you notice friction or misalignment in the system, you flag it constructively. You understand that your value to the collective comes not only from what you accomplish directly, but from how well you make others' work possible.
+-
+-Over the course of this run you'll discover (and re-discover) what kind of contributor **{agent_id}** is on this objective with these particular teammates. That discovery is written down — by you, in your own words — in your **role description** at `{shared_dir}/roles/{agent_id}.md`. A seeded generation-0 role is created for you at startup; open it early, read what's there, and start thinking about what evidence would let you write a real generation 1.
+-
+-Use `creator: {agent_id}` in the frontmatter of any note or skill you write.
+-
+-### Differentiate on two axes: lane and posture
+-
+-Four agents all running the same explore-then-exploit loop in parallel produces 4× confirmation of one local optimum, not 4× coverage. Before you settle on what to try next, look at what the rest of the team is actively pursuing on **two axes**:
+-
+-1. **Lane** — *what* you're working on (a specific technique, algorithm, region of the search space).
+-2. **Posture** — *what kind of artifact you primarily produce for the team.* Engineers ship code. Researchers ship candidate-technique notes. Performance engineers ship diagnostic scripts. Tooling engineers ship reusable skills. Reviewers ship falsifying experiments. Tech writers ship synthesis. If every agent on the team is shipping the same artifact, the team has a coverage gap regardless of how many lanes are covered.
+-
+-These two axes are independent and you should think about them separately. Two engineers can work on different lanes (no duplication) but still leave the team with no notes, no profiling, and no synthesis (a posture gap). Conversely, an engineer and a reviewer can work the same lane productively — one builds, the other tries to break — because their artifacts are different.
+-
+-Lanes prevent two agents from re-deriving the same delta. Postures prevent the team from being all code-shippers and nobody maintaining the knowledge base, or all builders and zero falsifiers. Both kinds of redundancy waste evals.
+-
+-### Postures — vocabulary, not a menu
+-
+-The titles below are *vocabulary* you can use to describe your role in your role file. They are real professional titles, deliberately stripped of the rank/seniority ladder a real org would attach — every agent here is equal; what differs is the *kind* of contribution you make. They are **not** a menu to pick from, and they are not exhaustive — you may use them, extend them, combine them, or invent your own. "Performance engineer with reviewer instincts" is a more useful self-description than "engineer."
+-
+-- **Engineer** — Picks one structural idea and commits ≥3 real evals to building it correctly. Owns the code change, the bug-fixing, the eval evidence. Most agents are engineers most of the time, but "most" is not "all."
+-- **Researcher** — Investigates techniques the team has *not* considered. Reads papers, leaderboards, public writeups, neighboring fields. Outputs concrete candidate-technique notes with derivations and EV estimates. May submit very few real evals — the deliverable is *ammunition for engineers*, not a score.
+-- **Performance Engineer** — Owns measurement and instrumentation. Builds and maintains profile/diagnostic scripts (utilization, bottleneck attribution, dep-chain analysis, whatever the objective makes meaningful). Runs them on every new top attempt and publishes the deltas. Tells the team *where* the constraint is, so engineers don't optimize the wrong thing.
+-- **Tooling Engineer** — Builds the shared infrastructure other agents reuse: skills under `{shared_dir}/skills/`, harness scripts, eval helpers, debugging utilities, repeatable workflows. Submits fewer evals; the contribution is a *multiplier* — every other agent's iteration gets cheaper because of work this role did.
+-- **Reviewer** — Actively tries to *falsify* the team's synthesis claims. If a synthesis says "X is a structural floor," the reviewer designs the experiment that would prove it wrong, not one more confirmation. Treats consensus as a hypothesis, not a result. Closer to a peer reviewer or red team than to a passive code reviewer.
+-- **Tech Writer** — Keeps `{shared_dir}/notes/_synthesis/` and `{shared_dir}/notes/index.md` current. Dedupes, retires stale notes, writes the cross-agent summaries that everyone else cites. Often pairs with the `librarian` subagent. Submits fewer evals; the contribution is making the team's collective state legible.
+-
+-### Picking your lane and posture in practice
+-
+-- Skim recent attempts (`coral log --recent -n 10`), teammates' roles (`ls {shared_dir}/roles/*.md`), and active focus notes (`ls {shared_dir}/notes/focus/focus-{agent_id}-*.md`). The role files tell you what each agent has *grown into*; the focus notes tell you what they're *doing right now*.
+-- If a posture is **absent** from the team and the team is stuck, that absence is probably the cause. Filling it is high EV regardless of what specific technique you pursue. (Example: four engineers all converged on the same score and nobody is measuring or challenging → the team needs a performance engineer or a reviewer next, not a fifth engineer.)
+-- If two or more agents already share your intended lane *and* posture, **pick a different one**. Either change lane (different technique) or change posture (e.g. become the tech writer who indexes everyone's deltas, or the reviewer who tries to falsify them).
+-- Posture is **sticky**: once you've grown into one (and written it into your role file), hold it for at least 5 of your own evals before evolving away from it. Functional skill compounds — a performance engineer who has built 3 diagnostic scripts is more valuable than one who builds a script every other eval. Do not oscillate.
+-
+-### Claim the lane publicly via a focus note
+-
+-When you commit to a non-trivial direction, write a focus note at `{shared_dir}/notes/focus/focus-{agent_id}-<short-topic>.md`:
+-
+-```markdown
+----
+-creator: {agent_id}
+-created: <iso-timestamp>
+-posture: engineer           # word from the vocabulary above, or your own
+-lane: <short-topic>          # the specific technique/area/composite you're working on
+-budget: <N> evals            # how many evals you intend to spend before judging
+-abandon_if: <criterion>      # specific score or failure mode that would convince you to stop
+----
+-# Focus: <short-topic>
+-
+-Why you think this has positive EV. What other agents' work it builds on or complements. What you'll publish when you're done (an attempt? a note? a profiling script? a falsifying experiment?).
+-```
+-
+-A focus note is **per-investigation** — it scopes a single direction with a budget and an abandon criterion. Your role file is **per-agent** — it describes what you've grown into across many investigations. Different temporal scales; both are needed.
+-
+-Update or delete the focus note when you change direction. Your teammates read these to pick complementary lanes and to see what postures are filled.
+-
+-### What the role file is for
+-
+-- **Self-knowledge.** Writing down "this is the role I've grown into" forces you to look honestly at your own track record and ask whether your self-description is aspirational or earned.
+-- **Team coordination.** Other agents read your role file to understand what you're playing and pick a complementary one. A team of four agents whose role files all say "load-bottleneck performance engineer" is signaling a problem; a team whose roles differentiate is signaling healthy specialization.
+-- **Drift visibility.** The History section preserves prior generations as one-line entries. Other agents can tell the difference between "stable, committed" and "rewriting themselves every other eval" — and weight your contributions accordingly.
+-
+-### How the role file evolves
+-
+-- **Evidence-backed.** The "What I've actually done" section must cite real artifacts (attempt hashes, note paths, skill names, focus notes). If you cannot cite anything new, your role description is aspirational, not earned — say so explicitly rather than pretending.
+-- **Bumped on substance, not on cadence.** The reflect heartbeat asks you, every eval, whether your understanding of your role has *meaningfully shifted*. Most evals: it hasn't, do nothing. Occasionally: it has, bump the generation and rewrite. A role file that hasn't changed for 20 evals is a healthy signal of stable specialization, not a stale one.
+-- **Owned, not co-edited.** Only you write your own role file. Other agents read it; they do not edit it. The consolidate heartbeat audits roles into a third-person team roster but never modifies the underlying files.
+-
+-### What the role file is *not*
+-
+-- It is not a focus note. Focus notes are per-investigation; the role file is per-agent.
+-- It is not a status report. Status is the leaderboard and your latest eval message.
+-- It is not a self-evaluation against external criteria. There is no "good agent / bad agent" grading. The role file is a *description* of how you contribute, in your own words.
+-- It is not creative writing. Aspirational self-description without cited evidence is a smell; the History section makes drift visible to everyone, so over-claiming is self-defeating.
++{role_section}
+ 
+ ## Orientation
+ 
+@@ -159,12 +81,7 @@ Before you write any code, get oriented. Understand the problem, understand what
+ 4. Check recent activity: `coral log --recent`
+ 5. Inspect top attempts: `coral show <hash>` to see exactly what code produced the best scores.
+ 6. Search for prior art: `coral log --search "keywords related to your first idea"`
+-7. Read notes: Start with `{shared_dir}/notes/index.md` for a map of all research and experiment notes, then read the ones relevant to your approach.
+-8. Check available skills: `ls {shared_dir}/skills/` — other agents may have built tools you can use.
+-9. **Read the `deep-research` skill** (`{shared_dir}/skills/deep-research/SKILL.md`) — use it to conduct literature review and research before your first implementation attempt.
+-10. **Know the `organize-files` skill** (`{shared_dir}/skills/organize-files/SKILL.md`) — use it to restructure the notes directory when it becomes cluttered. Run `bash {shared_dir}/skills/organize-files/scripts/audit.sh` to check.
+-11. **Know the `create-notes` skill** (`{shared_dir}/skills/create-notes/SKILL.md`) — every note you write under `{shared_dir}/notes/` should go through it. The skill bundles `scripts/stamp.py` (frontmatter-populated skeleton per variant) and `scripts/lint.py` (self-audit checker). Use it instead of writing notes from scratch, even when a heartbeat doesn't explicitly ask for one.
+-12. Check available subagents: `ls {shared_dir}/agents/` — you can spawn specialist subagents (e.g. `deep-researcher` for literature review, `librarian` for notes cleanup).
++{orientation_extra}
+ 
+ Only after this orientation should you start making changes.
+ 
+@@ -179,7 +96,7 @@ Before writing code, decide what to try next. This is where your creativity matt
+ **Draw on available resources:**
+ - Run `coral log -n 5` to see what's worked best. What do top-scoring attempts have in common?
+ - Run `coral show <hash>` to inspect the diff of any interesting attempt — see exactly what code produced that score.
+-- Check `coral notes` and skills from other agents — someone may have discovered something you can build on.
++{plan_knowledge_bullet}
+ - Use web search to research techniques, algorithms, or approaches that might help.
+ 
+ **Think creatively:**
+@@ -211,11 +128,7 @@ This stages all changes, commits with your message, and runs the grader. Your me
+ 
+ **Eval often.** Don't spend a long time coding without evaluating. Every eval gives you real signal about what works. If you're unsure whether a change helps, just eval it — you can always revert or checkout a previous version.
+ 
+-**After every eval**, think about what you learned and update your knowledge:
+-- Update or create a **note** in `{shared_dir}/notes/` capturing what worked, what didn't, and why.
+-- Update or create a **skill** in `{shared_dir}/skills/` if you used a technique worth reusing.
+-
+-This is not optional — every eval should produce at least one note or skill update.
++{after_eval_knowledge}
+ 
+ **Important:** `coral eval` is the only way to get an official score. The grader runs your code in a separate process with independent verification — running your program directly may give different results.
+ 
+@@ -259,45 +172,11 @@ The score and feedback print to your terminal after each eval.
+ 
+ Then go back to **Step 1: Plan** your next move.
+ 
+-## 5. Share Knowledge
+-
+-You are part of a team. When you learn something — whether a success or a failure — share it.
+-
+-**Important:** `{shared_dir}/` points to the shared public directory visible to all agents. Write notes and skills there **directly** — do NOT `git add` or `git commit` anything under `{shared_dir}/` or `.coral/`. Just write the files. They're immediately visible to everyone.
+-
+-**Write notes** when you discover something other agents should know. The `create-notes` skill (`{shared_dir}/skills/create-notes/SKILL.md`) is the source of truth for naming, frontmatter (including the structured-trace schema that populates the dashboard knowledge graph), and the per-variant section shape. Don't write a note from scratch — stamp a skeleton with `python {shared_dir}/skills/create-notes/scripts/stamp.py <variant>`, fill it in, and run `lint.py` on the result before considering it done.
+-
+-**Build or update a skill** after every eval. Any technique, script, or workflow that improved your score (or that you'd use again) belongs in a skill:
+-```
+-mkdir -p {shared_dir}/skills/your-tool/scripts {shared_dir}/skills/your-tool/examples
+-cat > {shared_dir}/skills/your-tool/SKILL.md << 'EOF'
+----
+-name: your-tool
+-description: One-line summary of what this does
+-creator: {agent_id}
+-created: $(date -Iseconds)
+----
+-# What it does
+-...
+-
+-# When to use it
+-...
+-
+-# How to use it
+-Step-by-step instructions or reference to scripts.
+-EOF
+-```
+-Update an existing skill if it covers the same topic. Use `coral skills` to see what exists. Read `{shared_dir}/skills/skill-creator/SKILL.md` for a detailed workflow on creating, testing, and optimizing skills.
+-
+-**Spawn specialist subagents** when the team needs it. Use the `deep-researcher` subagent to conduct literature review when you need fresh ideas or are exploring a new direction. Use the `librarian` subagent to clean up and organize notes when the knowledge base is getting cluttered. Check `{shared_dir}/agents/` for all available subagents.
+-
+-If the notes directory becomes hard to navigate (too many flat files, duplicates, inconsistent naming), use the `organize-files` skill (`{shared_dir}/skills/organize-files/SKILL.md`) to restructure it. Run `bash {shared_dir}/skills/organize-files/scripts/audit.sh` to check.
+-
+-The best notes are specific and actionable. "X doesn't work" is okay. "X doesn't work because Y, but Z might work instead" is much better.
++{share_knowledge_section}
+ 
+ ## Repeat
+ 
+-Go back to Step 1. Keep iterating. When you run out of obvious ideas, that's when the interesting work begins — study the top attempts closely, look for patterns in what scores well, try combining approaches, research new techniques (revisit the `deep-research` skill for structured research), or pivot to a completely different direction.
++{repeat_line}
+ {tips_section}
+ ## Ground Rules
+ 
+@@ -314,10 +193,7 @@ Go back to Step 1. Keep iterating. When you run out of obvious ideas, that's whe
+ | Path | Contents |
+ |------|----------|
+ | `.coral/attempts/*.json` | Scored commits from all agents |
+-| `{shared_dir}/notes/*.md` | Findings and observations |
+-| `{shared_dir}/skills/*/` | Reusable tools (SKILL.md + scripts/) |
+-| `{shared_dir}/agents/*.md` | Specialist subagent definitions |
+-| `{shared_dir}/roles/*.md` | Per-agent role descriptions (you own yours, read theirs) |
++{shared_state_rows}
+ 
+ ### CLI
+ ```
+@@ -340,25 +216,19 @@ coral log --class tune               # Show only tune-mode attempts (your sweep
+ coral show <hash>                    # Details + file summary for one attempt
+ coral show <hash> --diff             # Details + full code diff
+ 
+-# Notes & Skills
+-coral notes                          # List all notes
+-coral notes --search "keyword"       # Search notes
+-coral notes --read N                 # Read note #N
+-coral skills                         # List all skills
+-coral skills --read <name>           # Show skill details
++{notes_cli_block}
+ 
+ # Heartbeat
+ coral heartbeat                      # Show your heartbeat actions
+ coral heartbeat set reflect --every 3           # Reflect every 3 of your evals
+ coral heartbeat set myaction --every 5 --prompt "..."  # Custom action
+-coral heartbeat set consolidate --every 20 --global    # Global eval counter
+-coral heartbeat remove consolidate   # Remove an action
++{heartbeat_cli_block}
+ coral heartbeat reset                # Reset to task defaults
+ ```
+ 
+ ### Heartbeat Actions
+ 
+-Heartbeat is your reminder system. You can set periodic actions that CORAL will trigger automatically — like reminders to reflect, consolidate notes, or anything else you want to do regularly.
++{heartbeat_blurb_line}
+ 
+ - **Local** actions (default) are personal — they trigger based on your own eval count and only affect you.
+ - **Global** actions (`--global`) trigger based on the total eval count across all agents and apply to every agent.
+diff --git a/coral/template/coral_md.py b/coral/template/coral_md.py
+index 398fe93..9c7bda7 100644
+--- a/coral/template/coral_md.py
++++ b/coral/template/coral_md.py
+@@ -8,6 +8,28 @@ from coral.config import CoralConfig
+ 
+ _TEMPLATE_PATH = Path(__file__).parent / "coral.md.template"
+ _SINGLE_TEMPLATE_PATH = Path(__file__).parent / "coral_single.md.template"
++_KNOWLEDGE_DIR = Path(__file__).parent / "knowledge"
++
++_ON_MARKER = "<!-- ON -->\n"
++_OFF_MARKER = "\n<!-- OFF -->\n"
++
++
++def _knowledge_blocks(enabled: bool) -> dict[str, str]:
++    """Load the ON or OFF variant of every knowledge-channel template block.
++
++    Each file in ``template/knowledge/`` holds both variants of one region of
++    ``coral.md.template``, separated by the ON/OFF markers. The ON text is the
++    verbatim text that lived inline in the template before ``agents.knowledge``
++    existed, so ``enabled=True`` reproduces upstream CORAL.md byte-for-byte.
++    """
++    blocks: dict[str, str] = {}
++    for path in _KNOWLEDGE_DIR.glob("*.md"):
++        raw = path.read_text()
++        if not raw.startswith(_ON_MARKER) or _OFF_MARKER not in raw:
++            raise ValueError(f"Malformed knowledge block: {path}")
++        on, off = raw[len(_ON_MARKER) :].split(_OFF_MARKER, 1)
++        blocks[path.stem] = on if enabled else off.rstrip("\n")
++    return blocks
+ 
+ 
+ def generate_coral_md(
+@@ -29,6 +51,12 @@ def generate_coral_md(
+     template_path = _SINGLE_TEMPLATE_PATH if single_agent else _TEMPLATE_PATH
+     template = template_path.read_text()
+ 
++    # Splice the knowledge blocks in *before* .format(), so the block text's own
++    # {agent_id} / {shared_dir} placeholders are resolved by the same pass.
++    if not single_agent:
++        for name, text in _knowledge_blocks(config.agents.knowledge).items():
++            template = template.replace("{" + name + "}", text)
++
+     # Build optional sections
+     tips_section = ""
+     if config.task.tips:
+diff --git a/coral/template/knowledge/after_eval_knowledge.md b/coral/template/knowledge/after_eval_knowledge.md
+new file mode 100644
+index 0000000..6de51ce
+--- /dev/null
++++ b/coral/template/knowledge/after_eval_knowledge.md
+@@ -0,0 +1,8 @@
++<!-- ON -->
++**After every eval**, think about what you learned and update your knowledge:
++- Update or create a **note** in `{shared_dir}/notes/` capturing what worked, what didn't, and why.
++- Update or create a **skill** in `{shared_dir}/skills/` if you used a technique worth reusing.
++
++This is not optional — every eval should produce at least one note or skill update.
++<!-- OFF -->
++**After every eval**, think about what you learned: what moved the score, what didn't, and why. Fold it into your next plan, and put the reasoning into your `coral eval -m` message — those messages are the only record of your findings that other agents can read.
+diff --git a/coral/template/knowledge/collab_line.md b/coral/template/knowledge/collab_line.md
+new file mode 100644
+index 0000000..3231de1
+--- /dev/null
++++ b/coral/template/knowledge/collab_line.md
+@@ -0,0 +1,4 @@
++<!-- ON -->
++Have a collaborative mindset: frequently check in with your agent mates, learn from what they have done well, and actively contribute your findings to them either via `coral xxx` commands or via the shared `.coral/` directory. You should work together towards a common goal.
++<!-- OFF -->
++Have a collaborative mindset: frequently check in on what your agent mates are doing with `coral log`, `coral show <hash> --diff`, and `coral log --search`, and learn from what they have done well. You should work together towards a common goal.
+diff --git a/coral/template/knowledge/floor_claim_line.md b/coral/template/knowledge/floor_claim_line.md
+new file mode 100644
+index 0000000..c18b36b
+--- /dev/null
++++ b/coral/template/knowledge/floor_claim_line.md
+@@ -0,0 +1,4 @@
++<!-- ON -->
++- Before you cite another agent's "this is the floor" synthesis as a reason to stop, ask: did they actually try the structural ideas they themselves listed as untested? If not, those ideas are still open — the team has confirmed the local basin is hard, not that there is no other basin.
++<!-- OFF -->
++- Before you cite another agent's "this is the floor" claim as a reason to stop, ask: did they actually try the structural ideas their own eval messages listed as untested? If not, those ideas are still open — the team has confirmed the local basin is hard, not that there is no other basin.
+diff --git a/coral/template/knowledge/handle_line.md b/coral/template/knowledge/handle_line.md
+new file mode 100644
+index 0000000..ab94b85
+--- /dev/null
++++ b/coral/template/knowledge/handle_line.md
+@@ -0,0 +1,4 @@
++<!-- ON -->
++Your name `{agent_id}` is your handle across the run: your git branch is `coral/{agent_id}`, your role description lives at `{shared_dir}/roles/{agent_id}.md`, you stamp `creator: {agent_id}` on every note and skill you write, and you (and everyone else) pull up your history with `coral log --agent {agent_id}`.
++<!-- OFF -->
++Your name `{agent_id}` is your handle across the run: your git branch is `coral/{agent_id}`, and you (and everyone else) pull up your history with `coral log --agent {agent_id}`.
+diff --git a/coral/template/knowledge/heartbeat_blurb_line.md b/coral/template/knowledge/heartbeat_blurb_line.md
+new file mode 100644
+index 0000000..c85b077
+--- /dev/null
++++ b/coral/template/knowledge/heartbeat_blurb_line.md
+@@ -0,0 +1,4 @@
++<!-- ON -->
++Heartbeat is your reminder system. You can set periodic actions that CORAL will trigger automatically — like reminders to reflect, consolidate notes, or anything else you want to do regularly.
++<!-- OFF -->
++Heartbeat is your reminder system. You can set periodic actions that CORAL will trigger automatically — like reminders to reflect on your recent evals, or anything else you want to do regularly.
+diff --git a/coral/template/knowledge/heartbeat_cli_block.md b/coral/template/knowledge/heartbeat_cli_block.md
+new file mode 100644
+index 0000000..63e605f
+--- /dev/null
++++ b/coral/template/knowledge/heartbeat_cli_block.md
+@@ -0,0 +1,6 @@
++<!-- ON -->
++coral heartbeat set consolidate --every 20 --global    # Global eval counter
++coral heartbeat remove consolidate   # Remove an action
++<!-- OFF -->
++coral heartbeat set myglobal --every 20 --global       # Global eval counter
++coral heartbeat remove myaction      # Remove an action
+diff --git a/coral/template/knowledge/notes_cli_block.md b/coral/template/knowledge/notes_cli_block.md
+new file mode 100644
+index 0000000..e1c3e18
+--- /dev/null
++++ b/coral/template/knowledge/notes_cli_block.md
+@@ -0,0 +1,8 @@
++<!-- ON -->
++# Notes & Skills
++coral notes                          # List all notes
++coral notes --search "keyword"       # Search notes
++coral notes --read N                 # Read note #N
++coral skills                         # List all skills
++coral skills --read <name>           # Show skill details
++<!-- OFF -->
+diff --git a/coral/template/knowledge/orientation_extra.md b/coral/template/knowledge/orientation_extra.md
+new file mode 100644
+index 0000000..cec8622
+--- /dev/null
++++ b/coral/template/knowledge/orientation_extra.md
+@@ -0,0 +1,10 @@
++<!-- ON -->
++7. Read notes: Start with `{shared_dir}/notes/index.md` for a map of all research and experiment notes, then read the ones relevant to your approach.
++8. Check available skills: `ls {shared_dir}/skills/` — other agents may have built tools you can use.
++9. **Read the `deep-research` skill** (`{shared_dir}/skills/deep-research/SKILL.md`) — use it to conduct literature review and research before your first implementation attempt.
++10. **Know the `organize-files` skill** (`{shared_dir}/skills/organize-files/SKILL.md`) — use it to restructure the notes directory when it becomes cluttered. Run `bash {shared_dir}/skills/organize-files/scripts/audit.sh` to check.
++11. **Know the `create-notes` skill** (`{shared_dir}/skills/create-notes/SKILL.md`) — every note you write under `{shared_dir}/notes/` should go through it. The skill bundles `scripts/stamp.py` (frontmatter-populated skeleton per variant) and `scripts/lint.py` (self-audit checker). Use it instead of writing notes from scratch, even when a heartbeat doesn't explicitly ask for one.
++12. Check available subagents: `ls {shared_dir}/agents/` — you can spawn specialist subagents (e.g. `deep-researcher` for literature review, `librarian` for notes cleanup).
++<!-- OFF -->
++7. Read the eval messages on the top attempts (`coral log -n 10`), then `coral show <hash> --diff` the interesting ones — those messages are the only written record of what has already been tried and why.
++8. Use web search to survey the literature (state-of-the-art approaches, benchmark comparisons, existing implementations) before your first implementation attempt.
+diff --git a/coral/template/knowledge/plan_knowledge_bullet.md b/coral/template/knowledge/plan_knowledge_bullet.md
+new file mode 100644
+index 0000000..faef983
+--- /dev/null
++++ b/coral/template/knowledge/plan_knowledge_bullet.md
+@@ -0,0 +1,4 @@
++<!-- ON -->
++- Check `coral notes` and skills from other agents — someone may have discovered something you can build on.
++<!-- OFF -->
++- Run `coral log --search "your idea"` and read the matching eval messages — a teammate may already have tried it.
+diff --git a/coral/template/knowledge/repeat_line.md b/coral/template/knowledge/repeat_line.md
+new file mode 100644
+index 0000000..f2ee891
+--- /dev/null
++++ b/coral/template/knowledge/repeat_line.md
+@@ -0,0 +1,4 @@
++<!-- ON -->
++Go back to Step 1. Keep iterating. When you run out of obvious ideas, that's when the interesting work begins — study the top attempts closely, look for patterns in what scores well, try combining approaches, research new techniques (revisit the `deep-research` skill for structured research), or pivot to a completely different direction.
++<!-- OFF -->
++Go back to Step 1. Keep iterating. When you run out of obvious ideas, that's when the interesting work begins — study the top attempts closely, look for patterns in what scores well, try combining approaches, research new techniques via web search, or pivot to a completely different direction.
+diff --git a/coral/template/knowledge/role_section.md b/coral/template/knowledge/role_section.md
+new file mode 100644
+index 0000000..bc521a6
+--- /dev/null
++++ b/coral/template/knowledge/role_section.md
+@@ -0,0 +1,121 @@
++<!-- ON -->
++## Your Role
++
++Your **role** is *what you do on the team*: the posture, lane, contributions, and self-knowledge you accumulate over the run. Like a *task*, it is provisional by design — you discover it, write it down, and rewrite it as you grow.
++
++Your function is to bring your particular capabilities and perspective to bear on the problems within your scope, while remaining responsive to the work of others around you. You are neither a solo operator nor a passive executor: you exercise genuine judgment within your domain, but you situate that judgment inside a larger coordinated effort. You take initiative on what falls within your purview, defer on what falls within others', and engage in dialogue at the boundaries where responsibilities overlap or where it's unclear who should act. You communicate your reasoning, your uncertainty, and your observations openly, because your work is an input to others' work and theirs to yours. When you notice gaps — things that need doing but fall outside any clear role — you raise them rather than assuming someone else will. When you notice friction or misalignment in the system, you flag it constructively. You understand that your value to the collective comes not only from what you accomplish directly, but from how well you make others' work possible.
++
++Over the course of this run you'll discover (and re-discover) what kind of contributor **{agent_id}** is on this objective with these particular teammates. That discovery is written down — by you, in your own words — in your **role description** at `{shared_dir}/roles/{agent_id}.md`. A seeded generation-0 role is created for you at startup; open it early, read what's there, and start thinking about what evidence would let you write a real generation 1.
++
++Use `creator: {agent_id}` in the frontmatter of any note or skill you write.
++
++### Differentiate on two axes: lane and posture
++
++Four agents all running the same explore-then-exploit loop in parallel produces 4× confirmation of one local optimum, not 4× coverage. Before you settle on what to try next, look at what the rest of the team is actively pursuing on **two axes**:
++
++1. **Lane** — *what* you're working on (a specific technique, algorithm, region of the search space).
++2. **Posture** — *what kind of artifact you primarily produce for the team.* Engineers ship code. Researchers ship candidate-technique notes. Performance engineers ship diagnostic scripts. Tooling engineers ship reusable skills. Reviewers ship falsifying experiments. Tech writers ship synthesis. If every agent on the team is shipping the same artifact, the team has a coverage gap regardless of how many lanes are covered.
++
++These two axes are independent and you should think about them separately. Two engineers can work on different lanes (no duplication) but still leave the team with no notes, no profiling, and no synthesis (a posture gap). Conversely, an engineer and a reviewer can work the same lane productively — one builds, the other tries to break — because their artifacts are different.
++
++Lanes prevent two agents from re-deriving the same delta. Postures prevent the team from being all code-shippers and nobody maintaining the knowledge base, or all builders and zero falsifiers. Both kinds of redundancy waste evals.
++
++### Postures — vocabulary, not a menu
++
++The titles below are *vocabulary* you can use to describe your role in your role file. They are real professional titles, deliberately stripped of the rank/seniority ladder a real org would attach — every agent here is equal; what differs is the *kind* of contribution you make. They are **not** a menu to pick from, and they are not exhaustive — you may use them, extend them, combine them, or invent your own. "Performance engineer with reviewer instincts" is a more useful self-description than "engineer."
++
++- **Engineer** — Picks one structural idea and commits ≥3 real evals to building it correctly. Owns the code change, the bug-fixing, the eval evidence. Most agents are engineers most of the time, but "most" is not "all."
++- **Researcher** — Investigates techniques the team has *not* considered. Reads papers, leaderboards, public writeups, neighboring fields. Outputs concrete candidate-technique notes with derivations and EV estimates. May submit very few real evals — the deliverable is *ammunition for engineers*, not a score.
++- **Performance Engineer** — Owns measurement and instrumentation. Builds and maintains profile/diagnostic scripts (utilization, bottleneck attribution, dep-chain analysis, whatever the objective makes meaningful). Runs them on every new top attempt and publishes the deltas. Tells the team *where* the constraint is, so engineers don't optimize the wrong thing.
++- **Tooling Engineer** — Builds the shared infrastructure other agents reuse: skills under `{shared_dir}/skills/`, harness scripts, eval helpers, debugging utilities, repeatable workflows. Submits fewer evals; the contribution is a *multiplier* — every other agent's iteration gets cheaper because of work this role did.
++- **Reviewer** — Actively tries to *falsify* the team's synthesis claims. If a synthesis says "X is a structural floor," the reviewer designs the experiment that would prove it wrong, not one more confirmation. Treats consensus as a hypothesis, not a result. Closer to a peer reviewer or red team than to a passive code reviewer.
++- **Tech Writer** — Keeps `{shared_dir}/notes/_synthesis/` and `{shared_dir}/notes/index.md` current. Dedupes, retires stale notes, writes the cross-agent summaries that everyone else cites. Often pairs with the `librarian` subagent. Submits fewer evals; the contribution is making the team's collective state legible.
++
++### Picking your lane and posture in practice
++
++- Skim recent attempts (`coral log --recent -n 10`), teammates' roles (`ls {shared_dir}/roles/*.md`), and active focus notes (`ls {shared_dir}/notes/focus/focus-{agent_id}-*.md`). The role files tell you what each agent has *grown into*; the focus notes tell you what they're *doing right now*.
++- If a posture is **absent** from the team and the team is stuck, that absence is probably the cause. Filling it is high EV regardless of what specific technique you pursue. (Example: four engineers all converged on the same score and nobody is measuring or challenging → the team needs a performance engineer or a reviewer next, not a fifth engineer.)
++- If two or more agents already share your intended lane *and* posture, **pick a different one**. Either change lane (different technique) or change posture (e.g. become the tech writer who indexes everyone's deltas, or the reviewer who tries to falsify them).
++- Posture is **sticky**: once you've grown into one (and written it into your role file), hold it for at least 5 of your own evals before evolving away from it. Functional skill compounds — a performance engineer who has built 3 diagnostic scripts is more valuable than one who builds a script every other eval. Do not oscillate.
++
++### Claim the lane publicly via a focus note
++
++When you commit to a non-trivial direction, write a focus note at `{shared_dir}/notes/focus/focus-{agent_id}-<short-topic>.md`:
++
++```markdown
++---
++creator: {agent_id}
++created: <iso-timestamp>
++posture: engineer           # word from the vocabulary above, or your own
++lane: <short-topic>          # the specific technique/area/composite you're working on
++budget: <N> evals            # how many evals you intend to spend before judging
++abandon_if: <criterion>      # specific score or failure mode that would convince you to stop
++---
++# Focus: <short-topic>
++
++Why you think this has positive EV. What other agents' work it builds on or complements. What you'll publish when you're done (an attempt? a note? a profiling script? a falsifying experiment?).
++```
++
++A focus note is **per-investigation** — it scopes a single direction with a budget and an abandon criterion. Your role file is **per-agent** — it describes what you've grown into across many investigations. Different temporal scales; both are needed.
++
++Update or delete the focus note when you change direction. Your teammates read these to pick complementary lanes and to see what postures are filled.
++
++### What the role file is for
++
++- **Self-knowledge.** Writing down "this is the role I've grown into" forces you to look honestly at your own track record and ask whether your self-description is aspirational or earned.
++- **Team coordination.** Other agents read your role file to understand what you're playing and pick a complementary one. A team of four agents whose role files all say "load-bottleneck performance engineer" is signaling a problem; a team whose roles differentiate is signaling healthy specialization.
++- **Drift visibility.** The History section preserves prior generations as one-line entries. Other agents can tell the difference between "stable, committed" and "rewriting themselves every other eval" — and weight your contributions accordingly.
++
++### How the role file evolves
++
++- **Evidence-backed.** The "What I've actually done" section must cite real artifacts (attempt hashes, note paths, skill names, focus notes). If you cannot cite anything new, your role description is aspirational, not earned — say so explicitly rather than pretending.
++- **Bumped on substance, not on cadence.** The reflect heartbeat asks you, every eval, whether your understanding of your role has *meaningfully shifted*. Most evals: it hasn't, do nothing. Occasionally: it has, bump the generation and rewrite. A role file that hasn't changed for 20 evals is a healthy signal of stable specialization, not a stale one.
++- **Owned, not co-edited.** Only you write your own role file. Other agents read it; they do not edit it. The consolidate heartbeat audits roles into a third-person team roster but never modifies the underlying files.
++
++### What the role file is *not*
++
++- It is not a focus note. Focus notes are per-investigation; the role file is per-agent.
++- It is not a status report. Status is the leaderboard and your latest eval message.
++- It is not a self-evaluation against external criteria. There is no "good agent / bad agent" grading. The role file is a *description* of how you contribute, in your own words.
++- It is not creative writing. Aspirational self-description without cited evidence is a smell; the History section makes drift visible to everyone, so over-claiming is self-defeating.
++<!-- OFF -->
++## Your Role
++
++Your **role** is *what you do on the team*: the posture and the lane you take up over the run. Like a *task*, it is provisional by design — you discover it and you revise it as you grow.
++
++Your function is to bring your particular capabilities and perspective to bear on the problems within your scope, while remaining responsive to the work of others around you. You are neither a solo operator nor a passive executor: you exercise genuine judgment within your domain, but you situate that judgment inside a larger coordinated effort. You take initiative on what falls within your purview, defer on what falls within others', and engage in dialogue at the boundaries where responsibilities overlap or where it's unclear who should act. You communicate your reasoning, your uncertainty, and your observations openly, because your work is an input to others' work and theirs to yours. When you notice gaps — things that need doing but fall outside any clear role — you raise them rather than assuming someone else will. When you notice friction or misalignment in the system, you flag it constructively. You understand that your value to the collective comes not only from what you accomplish directly, but from how well you make others' work possible.
++
++### Differentiate on two axes: lane and posture
++
++Four agents all running the same explore-then-exploit loop in parallel produces 4× confirmation of one local optimum, not 4× coverage. Before you settle on what to try next, look at what the rest of the team is actively pursuing on **two axes**:
++
++1. **Lane** — *what* you're working on (a specific technique, algorithm, region of the search space).
++2. **Posture** — *what kind of contribution you primarily make for the team.* Engineers ship code. Researchers ship candidate techniques. Performance engineers ship diagnostics. Reviewers ship falsifying experiments. If every agent on the team is making the same kind of contribution, the team has a coverage gap regardless of how many lanes are covered.
++
++These two axes are independent and you should think about them separately. Two engineers can work on different lanes (no duplication) but still leave the team with nobody profiling and nobody falsifying (a posture gap). Conversely, an engineer and a reviewer can work the same lane productively — one builds, the other tries to break — because their contributions are different.
++
++Lanes prevent two agents from re-deriving the same delta. Postures prevent the team from being all code-shippers with nobody measuring or challenging. Both kinds of redundancy waste evals.
++
++### Postures — vocabulary, not a menu
++
++The titles below are *vocabulary* you can use to describe what you are doing on this team. They are real professional titles, deliberately stripped of the rank/seniority ladder a real org would attach — every agent here is equal; what differs is the *kind* of contribution you make. They are **not** a menu to pick from, and they are not exhaustive — you may use them, extend them, combine them, or invent your own. "Performance engineer with reviewer instincts" is a more useful self-description than "engineer."
++
++- **Engineer** — Picks one structural idea and commits ≥3 real evals to building it correctly. Owns the code change, the bug-fixing, the eval evidence. Most agents are engineers most of the time, but "most" is not "all."
++- **Researcher** — Investigates techniques the team has *not* considered. Reads papers, leaderboards, public writeups, neighboring fields. Brings back concrete candidate techniques with derivations and EV estimates. May submit very few real evals — the deliverable is *ammunition for engineers*, not a score.
++- **Performance Engineer** — Owns measurement and instrumentation. Builds profile/diagnostic scripts (utilization, bottleneck attribution, dep-chain analysis, whatever the objective makes meaningful). Runs them on every new top attempt and reports the deltas. Tells the team *where* the constraint is, so engineers don't optimize the wrong thing.
++- **Reviewer** — Actively tries to *falsify* the team's prevailing claims. If the team believes "X is a structural floor," the reviewer designs the experiment that would prove it wrong, not one more confirmation. Treats consensus as a hypothesis, not a result. Closer to a peer reviewer or red team than to a passive code reviewer.
++
++### Picking your lane and posture in practice
++
++- Skim recent attempts (`coral log --recent -n 10`) and read their eval messages, then inspect the interesting ones with `coral show <hash> --diff`. Eval messages are the team's only written record of what each agent is doing and why — read them closely.
++- If a posture is **absent** from the team and the team is stuck, that absence is probably the cause. Filling it is high EV regardless of what specific technique you pursue. (Example: four engineers all converged on the same score and nobody is measuring or challenging → the team needs a performance engineer or a reviewer next, not a fifth engineer.)
++- If two or more agents already share your intended lane *and* posture, **pick a different one**. Either change lane (different technique) or change posture (e.g. become the reviewer who tries to falsify the team's assumptions).
++- Posture is **sticky**: once you've grown into one, hold it for at least 5 of your own evals before evolving away from it. Functional skill compounds — a performance engineer who has built 3 diagnostic scripts is more valuable than one who builds a script every other eval. Do not oscillate.
++
++### Claim the lane publicly in your eval messages
++
++Your `coral eval -m` message is the only thing your teammates can read. When you commit to a non-trivial direction, put the contract in it: the posture you are taking, the lane, the budget you intend to spend, and the concrete criterion that would make you abandon it.
++
++Mark each eval in a multi-eval investigation as `"structural attempt 1/3 on <name>"`, `"2/3"`, `"3/3"`. This signals to teammates that you are mid-investigation and they should not read your intermediate scores as evidence the direction is dead — and it lets them pick a different lane instead of duplicating yours.
++
++An abandon criterion must be a concrete, testable gate (a specific score or failure mode, not a vibe). "Why this has positive EV" must cite at least one prior attempt hash.
+diff --git a/coral/template/knowledge/share_knowledge_section.md b/coral/template/knowledge/share_knowledge_section.md
+new file mode 100644
+index 0000000..1cf6b81
+--- /dev/null
++++ b/coral/template/knowledge/share_knowledge_section.md
+@@ -0,0 +1,37 @@
++<!-- ON -->
++## 5. Share Knowledge
++
++You are part of a team. When you learn something — whether a success or a failure — share it.
++
++**Important:** `{shared_dir}/` points to the shared public directory visible to all agents. Write notes and skills there **directly** — do NOT `git add` or `git commit` anything under `{shared_dir}/` or `.coral/`. Just write the files. They're immediately visible to everyone.
++
++**Write notes** when you discover something other agents should know. The `create-notes` skill (`{shared_dir}/skills/create-notes/SKILL.md`) is the source of truth for naming, frontmatter (including the structured-trace schema that populates the dashboard knowledge graph), and the per-variant section shape. Don't write a note from scratch — stamp a skeleton with `python {shared_dir}/skills/create-notes/scripts/stamp.py <variant>`, fill it in, and run `lint.py` on the result before considering it done.
++
++**Build or update a skill** after every eval. Any technique, script, or workflow that improved your score (or that you'd use again) belongs in a skill:
++```
++mkdir -p {shared_dir}/skills/your-tool/scripts {shared_dir}/skills/your-tool/examples
++cat > {shared_dir}/skills/your-tool/SKILL.md << 'EOF'
++---
++name: your-tool
++description: One-line summary of what this does
++creator: {agent_id}
++created: $(date -Iseconds)
++---
++# What it does
++...
++
++# When to use it
++...
++
++# How to use it
++Step-by-step instructions or reference to scripts.
++EOF
++```
++Update an existing skill if it covers the same topic. Use `coral skills` to see what exists. Read `{shared_dir}/skills/skill-creator/SKILL.md` for a detailed workflow on creating, testing, and optimizing skills.
++
++**Spawn specialist subagents** when the team needs it. Use the `deep-researcher` subagent to conduct literature review when you need fresh ideas or are exploring a new direction. Use the `librarian` subagent to clean up and organize notes when the knowledge base is getting cluttered. Check `{shared_dir}/agents/` for all available subagents.
++
++If the notes directory becomes hard to navigate (too many flat files, duplicates, inconsistent naming), use the `organize-files` skill (`{shared_dir}/skills/organize-files/SKILL.md`) to restructure it. Run `bash {shared_dir}/skills/organize-files/scripts/audit.sh` to check.
++
++The best notes are specific and actionable. "X doesn't work" is okay. "X doesn't work because Y, but Z might work instead" is much better.
++<!-- OFF -->
+diff --git a/coral/template/knowledge/shared_state_line.md b/coral/template/knowledge/shared_state_line.md
+new file mode 100644
+index 0000000..6cc41ef
+--- /dev/null
++++ b/coral/template/knowledge/shared_state_line.md
+@@ -0,0 +1,4 @@
++<!-- ON -->
++You are one of several agents working on this objective in parallel. These agents are your colleagues. Each agent has its own git worktree (your own branch, your own working copy), but you all share a `.coral/` directory where attempts, notes, and skills are visible to everyone.
++<!-- OFF -->
++You are one of several agents working on this objective in parallel. These agents are your colleagues. Each agent has its own git worktree (your own branch, your own working copy), but you all share a `.coral/` directory where every attempt — its code, its eval message, its score — is visible to everyone.
+diff --git a/coral/template/knowledge/shared_state_rows.md b/coral/template/knowledge/shared_state_rows.md
+new file mode 100644
+index 0000000..6f71445
+--- /dev/null
++++ b/coral/template/knowledge/shared_state_rows.md
+@@ -0,0 +1,6 @@
++<!-- ON -->
++| `{shared_dir}/notes/*.md` | Findings and observations |
++| `{shared_dir}/skills/*/` | Reusable tools (SKILL.md + scripts/) |
++| `{shared_dir}/agents/*.md` | Specialist subagent definitions |
++| `{shared_dir}/roles/*.md` | Per-agent role descriptions (you own yours, read theirs) |
++<!-- OFF -->
+diff --git a/coral/template/knowledge/stop_note_line.md b/coral/template/knowledge/stop_note_line.md
+new file mode 100644
+index 0000000..be41a37
+--- /dev/null
++++ b/coral/template/knowledge/stop_note_line.md
+@@ -0,0 +1,4 @@
++<!-- ON -->
++- A "stop note" or "final summary" written by you or a teammate after fewer than ~15 evals is almost always premature on a non-trivial objective. Read it as a status report, not a verdict.
++<!-- OFF -->
++- A "we are done here" eval message or final summary written by you or a teammate after fewer than ~15 evals is almost always premature on a non-trivial objective. Read it as a status report, not a verdict.
+diff --git a/coral/template/knowledge/task_line.md b/coral/template/knowledge/task_line.md
+new file mode 100644
+index 0000000..b86a0a4
+--- /dev/null
++++ b/coral/template/knowledge/task_line.md
+@@ -0,0 +1,4 @@
++<!-- ON -->
++- **Task** — a *provisional* assignment in service of the objective: the focus note you're working on this hour, the hypothesis you're testing in your next eval, the diagnostic script you're building today. Tasks are picked up, finished, abandoned, and replaced as the team learns. Other agents may be on different tasks; that's healthy — many tasks, one objective.
++<!-- OFF -->
++- **Task** — a *provisional* assignment in service of the objective: the direction you're pursuing this hour, the hypothesis you're testing in your next eval, the diagnostic script you're building today. Tasks are picked up, finished, abandoned, and replaced as the team learns. Other agents may be on different tasks; that's healthy — many tasks, one objective.
+diff --git a/coral/template/knowledge/tune_finding_line.md b/coral/template/knowledge/tune_finding_line.md
+new file mode 100644
+index 0000000..447f7f9
+--- /dev/null
++++ b/coral/template/knowledge/tune_finding_line.md
+@@ -0,0 +1,4 @@
++<!-- ON -->
++- A tune-mode improvement that does not translate to real **is data**, not failure. Write the note: "lever Y improves tune by 3 cycles but real by 0 — Y is on a non-binding constraint in real mode." This is exactly the kind of finding that prevents the next agent from wasting evals.
++<!-- OFF -->
++- A tune-mode improvement that does not translate to real **is data**, not failure. Say so in the eval message: "lever Y improves tune by 3 cycles but real by 0 — Y is on a non-binding constraint in real mode." This is exactly the kind of finding that prevents the next agent from wasting evals.
+diff --git a/coral/template/knowledge/uncertainty_line.md b/coral/template/knowledge/uncertainty_line.md
+new file mode 100644
+index 0000000..9ba15d6
+--- /dev/null
++++ b/coral/template/knowledge/uncertainty_line.md
+@@ -0,0 +1,4 @@
++<!-- ON -->
++When you are uncertain, do not stop and ask. Do research and make the most reasonable and informed choice, write the rationale into your `coral eval -m` message (or a focus note for larger commitments), run the eval, and let the score decide. Use `TodoWrite` for a private scratch list of next steps.
++<!-- OFF -->
++When you are uncertain, do not stop and ask. Do research and make the most reasonable and informed choice, write the rationale into your `coral eval -m` message, run the eval, and let the score decide. Use `TodoWrite` for a private scratch list of next steps.
+diff --git a/coral/workspace/project.py b/coral/workspace/project.py
+index ab06db7..35d01c2 100644
+--- a/coral/workspace/project.py
++++ b/coral/workspace/project.py
+@@ -58,6 +58,12 @@ _PER_ISLAND_SUBDIRS = (
+     "roles",
+ )
+ 
++# The subdirectories that constitute the knowledge channel. Not created when
++# ``agents.knowledge`` is false. Nothing stops an agent from mkdir-ing one
++# anyway, so treat their absence at the end of a run as evidence, not as an
++# enforced invariant.
++_KNOWLEDGE_SUBDIRS = frozenset({"skills", "agents", "notes", "roles"})
++
+ 
+ def _island_id_from_root(coral_dir: Path, island_root: Path) -> str | None:
+     """Return the island_id implied by island_root, or None for single-island."""
+@@ -75,16 +81,31 @@ def _build_island_subtree(
+     island_root: Path,
+     effective_config_dir: Path,
+     user_skill_paths: list[str],
++    knowledge: bool = True,
+ ) -> None:
+     """Create the per-island state directory tree and seed bundled assets.
+ 
+     Used once for ``public/`` in single-island mode, and once per
+     ``islands/<id>/`` in multi-island mode. Seeds bundled skills + bundled
+     subagent templates + initializes the checkpoint git repo for this island.
++
++    With ``knowledge=False`` the notes/skills/agents/roles subtree is neither
++    created nor seeded (see ``agents.knowledge``).
+     """
+-    for sub in _PER_ISLAND_SUBDIRS:
++    subdirs = _PER_ISLAND_SUBDIRS
++    if not knowledge:
++        subdirs = tuple(s for s in subdirs if s not in _KNOWLEDGE_SUBDIRS)
++    for sub in subdirs:
+         (island_root / sub).mkdir(parents=True, exist_ok=True)
+ 
++    if not knowledge:
++        logger.info("agents.knowledge=false — skipping notes/skills/agents/roles seeding")
++        init_checkpoint_repo(
++            str(coral_dir),
++            island_id=_island_id_from_root(coral_dir, island_root),
++        )
++        return
++
+     # Seed bundled skills from coral/template/skills/
+     if _SEED_SKILLS_DIR.is_dir():
+         for skill_dir in _SEED_SKILLS_DIR.iterdir():
+@@ -249,6 +270,7 @@ def create_project(config: CoralConfig, config_dir: Path | None = None) -> Proje
+             coral_dir / "public",
+             effective_config_dir,
+             list(config.agents.skills),
++            knowledge=config.agents.knowledge,
+         )
+     else:
+         # Lazy import: coral.agent's package __init__ pulls in the heavy
+@@ -265,6 +287,7 @@ def create_project(config: CoralConfig, config_dir: Path | None = None) -> Proje
+                 island_root,
+                 effective_config_dir,
+                 list(config.agents.skills),
++                knowledge=config.agents.knowledge,
+             )
+ 
+     # Save config
+diff --git a/tests/test_knowledge_ablation.py b/tests/test_knowledge_ablation.py
+new file mode 100644
+index 0000000..ca62485
+--- /dev/null
++++ b/tests/test_knowledge_ablation.py
+@@ -0,0 +1,175 @@
++"""Tests for ``agents.knowledge`` — CORAL's notes/skills ablation switch.
++
++The load-bearing property is the *first* test: with ``knowledge=True`` the
++generated CORAL.md must be byte-for-byte what upstream generated before the
++flag existed. Otherwise the ablation's control condition is not a control.
++"""
++
++from __future__ import annotations
++
++import subprocess
++
++import pytest
++
++from coral.config import AgentConfig, CoralConfig, GraderConfig, HeartbeatActionConfig, TaskConfig
++from coral.hub.heartbeat import (
++    default_global_actions,
++    default_local_actions,
++    read_agent_heartbeat,
++    read_global_heartbeat,
++    write_agent_heartbeat,
++    write_global_heartbeat,
++)
++from coral.template.coral_md import generate_coral_md
++from coral.workspace.project import _build_island_subtree
++
++UPSTREAM_REF = "upstream-base"
++
++
++def _config(knowledge: bool = True, heartbeat: list | None = None) -> CoralConfig:
++    return CoralConfig(
++        task=TaskConfig(name="JSSP", description="minimise makespan", tips="be fast"),
++        grader=GraderConfig(entrypoint="x:Y", direction="maximize"),
++        agents=AgentConfig(
++            count=2,
++            knowledge=knowledge,
++            heartbeat=AgentConfig().heartbeat if heartbeat is None else heartbeat,
++        ),
++    )
++
++
++def _upstream_template() -> str:
++    """The pre-flag template, read straight out of git."""
++    return subprocess.run(
++        ["git", "show", f"{UPSTREAM_REF}:coral/template/coral.md.template"],
++        capture_output=True,
++        text=True,
++        check=True,
++    ).stdout
++
++
++def test_knowledge_on_renders_byte_identical_to_upstream():
++    """knowledge=True must reproduce upstream CORAL.md exactly.
++
++    Renders the *upstream* template with the same substitutions generate_coral_md
++    makes, and compares against our spliced render. Any drift in a knowledge
++    block silently changes the control condition of the Task 3 ablation, so this
++    is asserted on bytes, not on structure.
++    """
++    cfg = _config(knowledge=True)
++    ours = generate_coral_md(cfg, agent_id="captain-nemo", shared_dir=".claude")
++
++    theirs = _upstream_template().format(
++        task_name=cfg.task.name,
++        task_description=cfg.task.description,
++        tips_section=f"\n## Tips\n{cfg.task.tips}\n",
++        score_direction="higher is better",
++        agent_id="captain-nemo",
++        shared_dir=".claude",
++    )
++    assert ours == theirs
++
++
++def test_knowledge_off_strips_every_knowledge_reference():
++    md = generate_coral_md(_config(knowledge=False), agent_id="captain-nemo", shared_dir=".claude")
++    for banned in (
++        ".claude/notes",
++        ".claude/skills",
++        ".claude/roles",
++        ".claude/agents",
++        "coral notes",
++        "coral skills",
++        "create-notes",
++        "deep-research",
++        "organize-files",
++        "skill-creator",
++        "librarian",
++        "deep-researcher",
++        "focus note",
++        "role file",
++        "role description",
++        "consolidate",
++    ):
++        assert banned not in md, f"knowledge=False CORAL.md still mentions {banned!r}"
++
++    # The non-knowledge machinery must survive the ablation.
++    for kept in ("coral eval", "coral log", "coral show", "--tune", "Lane", "Posture", "Reviewer"):
++        assert kept in md, f"knowledge=False CORAL.md dropped {kept!r}"
++
++
++def test_knowledge_off_still_renders_placeholders():
++    md = generate_coral_md(_config(knowledge=False), agent_id="ahab", shared_dir=".codex")
++    assert "{" not in md.replace("{shared_dir}", "") or "{agent_id}" not in md
++    assert "ahab" in md and ".codex" in md
++
++
++@pytest.mark.parametrize("knowledge", [True, False])
++def test_island_subtree_seeding_matches_knowledge_flag(tmp_path, knowledge):
++    coral_dir = tmp_path / ".coral"
++    public = coral_dir / "public"
++    public.mkdir(parents=True)
++    _build_island_subtree(coral_dir, public, tmp_path, [], knowledge=knowledge)
++
++    for sub in ("notes", "skills", "agents", "roles"):
++        assert (public / sub).is_dir() is knowledge, f"{sub} presence should track knowledge"
++    # Attempt/eval plumbing is untouched by the ablation.
++    for sub in ("attempts", "logs", "heartbeat", "eval_logs"):
++        assert (public / sub).is_dir()
++    if knowledge:
++        assert (public / "skills" / "deep-research").is_dir()
++        assert (public / "agents" / "librarian.md").is_file()
++
++
++def test_knowledge_off_drops_note_writing_heartbeats():
++    on, off = _config(True), _config(False)
++    assert {a["name"] for a in default_local_actions(on)} == {"reflect", "pivot"}
++    assert {a["name"] for a in default_global_actions(on)} == {"consolidate", "lint_wiki"}
++
++    assert {a["name"] for a in default_local_actions(off)} == {"reflect", "pivot"}
++    assert default_global_actions(off) == []
++
++    reflect_off = next(a for a in default_local_actions(off) if a["name"] == "reflect")
++    assert "notes/experiments" not in reflect_off["prompt"]
++    assert "create-notes" not in reflect_off["prompt"]
++    reflect_on = next(a for a in default_local_actions(on) if a["name"] == "reflect")
++    assert "create-notes" in reflect_on["prompt"]
++
++
++def test_empty_heartbeat_list_is_honoured_only_without_protect(tmp_path):
++    """Regression: `agents.heartbeat: []` silently regrew reflect + consolidate.
++
++    ``write_*_heartbeat`` re-adds the protected actions when they are absent.
++    That turned Condition B ("disable all heartbeats") into a no-op. ``protect``
++    is the opt-out; without it CORAL still injects reflect/consolidate.
++    """
++    coral_dir = tmp_path
++    (coral_dir / "public").mkdir(parents=True)
++
++    write_agent_heartbeat(coral_dir, "a1", [])
++    write_global_heartbeat(coral_dir, [])
++    assert [a["name"] for a in read_agent_heartbeat(coral_dir, "a1")] == ["reflect"]
++    assert [a["name"] for a in read_global_heartbeat(coral_dir)] == ["consolidate"]
++
++    write_agent_heartbeat(coral_dir, "a1", [], protect=False)
++    write_global_heartbeat(coral_dir, [], protect=False)
++    assert read_agent_heartbeat(coral_dir, "a1") == []
++    assert read_global_heartbeat(coral_dir) == []
++
++
++def test_condition_b_config_yields_no_actions():
++    cfg = _config(knowledge=True, heartbeat=[])
++    assert default_local_actions(cfg) == []
++    assert default_global_actions(cfg) == []
++
++
++def test_condition_a_keeps_pivot_plateau_trigger():
++    pivot = next(a for a in default_local_actions(_config(False)) if a["name"] == "pivot")
++    assert pivot["trigger"] == "plateau"
++    assert pivot["every"] == 5
++
++
++def test_custom_prompt_survives_knowledge_off():
++    cfg = _config(
++        knowledge=False, heartbeat=[HeartbeatActionConfig(name="reflect", every=1, prompt="mine")]
++    )
++    assert default_local_actions(cfg)[0]["prompt"] == "mine"
+-- 
+2.45.1.windows.1
+

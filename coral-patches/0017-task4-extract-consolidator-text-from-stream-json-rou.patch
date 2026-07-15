@@ -1,0 +1,165 @@
+From 2013620a0dca04853105b62af1108bae8ccffbf1 Mon Sep 17 00:00:00 2001
+From: Steve <steventhanhtuan@gmail.com>
+Date: Wed, 15 Jul 2026 00:01:01 +0700
+Subject: [PATCH 17/17] task4: extract consolidator text from stream-json,
+ routed aliases break -p text mode
+
+Live runs showed claude -p returning an empty result for the
+deepseek-v4-flash alias even though the assistant emitted text: the
+openrouter-backed response interleaves thinking/redacted_thinking
+blocks in an order that leaves the CLI's plain-text result empty.
+default_llm_call now requests stream-json and concatenates assistant
+text blocks itself, falling back to the result field. Reproduced
+against the live router before and after; unit tests cover the exact
+observed event ordering.
+
+Note: fix authored directly by the orchestrator under deadline after
+live-run diagnosis; verified by targeted tests, ruff, and a live probe.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ coral/hub/consolidation.py            | 63 +++++++++++++++++++++++----
+ tests/test_gate_consolidation_core.py | 41 +++++++++++++++++
+ 2 files changed, 95 insertions(+), 9 deletions(-)
+
+diff --git a/coral/hub/consolidation.py b/coral/hub/consolidation.py
+index af19c4e..cab1ad3 100644
+--- a/coral/hub/consolidation.py
++++ b/coral/hub/consolidation.py
+@@ -87,20 +87,64 @@ _CACHE_FILENAME = "consolidations.json"
+ # --------------------------------------------------------------------------- #
+ 
+ 
++def _extract_text_from_stream(stdout: str) -> str:
++    """Concatenate assistant text blocks from ``--output-format stream-json``.
++
++    Some model routers (observed with openrouter-backed aliases) interleave
++    ``thinking``/``redacted_thinking`` blocks in an order that leaves the
++    CLI's final ``result`` field empty even though the assistant did emit
++    text. Collecting every ``text`` block from the assistant events is robust
++    to that; the ``result`` event is used only as a fallback.
++    """
++    texts: list[str] = []
++    fallback = ""
++    for line in stdout.splitlines():
++        try:
++            event = json.loads(line)
++        except (ValueError, TypeError):
++            continue
++        if not isinstance(event, dict):
++            continue
++        if event.get("type") == "assistant":
++            content = (event.get("message") or {}).get("content") or []
++            if isinstance(content, list):
++                for block in content:
++                    if isinstance(block, dict) and block.get("type") == "text":
++                        texts.append(str(block.get("text") or ""))
++        elif event.get("type") == "result":
++            fallback = str(event.get("result") or "")
++    joined = "\n".join(t for t in texts if t.strip())
++    return joined if joined.strip() else fallback
++
++
+ def default_llm_call(prompt: str, *, model: str, timeout: int) -> str:
+-    """Run one blocking ``claude -p`` call and return its stdout.
++    """Run one blocking ``claude -p`` call and return the assistant's text.
+ 
+     The only I/O primitive in this module that isn't pure. Tests must never
+     call this directly (they inject a fake ``llm_call`` instead) — monkeypatch
+     it to raise if it needs asserting-against.
+ 
+-    Raises ``RuntimeError`` on a non-zero exit or empty stdout. A
+-    ``subprocess.TimeoutExpired`` is deliberately not caught here — it
+-    propagates to the caller (:func:`run_consolidation_pass` catches it as
+-    part of its broad ``except Exception`` around the ``llm_call`` call).
++    Uses ``--output-format stream-json`` and extracts the assistant text
++    blocks itself (see :func:`_extract_text_from_stream` for why the CLI's
++    plain-text output cannot be trusted with routed model aliases).
++
++    Raises ``RuntimeError`` on a non-zero exit or when no assistant text can
++    be extracted. A ``subprocess.TimeoutExpired`` is deliberately not caught
++    here — it propagates to the caller (:func:`run_consolidation_pass`
++    catches it as part of its broad ``except Exception`` around the
++    ``llm_call`` call).
+     """
+     result = subprocess.run(
+-        ["claude", "-p", prompt, "--model", model],
++        [
++            "claude",
++            "-p",
++            prompt,
++            "--model",
++            model,
++            "--output-format",
++            "stream-json",
++            "--verbose",
++        ],
+         capture_output=True,
+         text=True,
+         timeout=timeout,
+@@ -110,9 +154,10 @@ def default_llm_call(prompt: str, *, model: str, timeout: int) -> str:
+         raise RuntimeError(
+             f"consolidator LLM call exited {result.returncode}: {result.stderr.strip()}"
+         )
+-    if not result.stdout.strip():
+-        raise RuntimeError("consolidator LLM call returned empty stdout")
+-    return result.stdout
++    text = _extract_text_from_stream(result.stdout)
++    if not text.strip():
++        raise RuntimeError("consolidator LLM call returned no assistant text")
++    return text
+ 
+ 
+ # --------------------------------------------------------------------------- #
+diff --git a/tests/test_gate_consolidation_core.py b/tests/test_gate_consolidation_core.py
+index 6c53a5a..e646a73 100644
+--- a/tests/test_gate_consolidation_core.py
++++ b/tests/test_gate_consolidation_core.py
+@@ -841,3 +841,44 @@ def test_orchestrator_member_read_text_oserror_skips_group(tmp_path, monkeypatch
+     assert load_consolidation_cache(public_root) == {}
+     assert a.exists()
+     assert b.exists()
++
++
++# --------------------------------------------------------------------------- #
++# _extract_text_from_stream (the routed-alias empty-result workaround)        #
++# --------------------------------------------------------------------------- #
++
++from coral.hub import consolidation  # noqa: E402
++
++
++def test_extract_text_from_stream_collects_text_despite_empty_result():
++    """Routed aliases can emit text + thinking blocks yet an empty result field."""
++    stream = "\n".join(
++        [
++            '{"type": "system", "subtype": "init"}',
++            '{"type": "assistant", "message": {"content": '
++            '[{"type": "text", "text": "TITLE: merged"}]}}',
++            '{"type": "assistant", "message": {"content": '
++            '[{"type": "thinking", "thinking": "..."}]}}',
++            '{"type": "assistant", "message": {"content": '
++            '[{"type": "redacted_thinking", "data": "xyz"}]}}',
++            '{"type": "result", "subtype": "success", "result": ""}',
++            "not json at all",
++        ]
++    )
++    assert consolidation._extract_text_from_stream(stream) == "TITLE: merged"
++
++
++def test_extract_text_from_stream_falls_back_to_result_field():
++    stream = "\n".join(
++        [
++            '{"type": "assistant", "message": {"content": '
++            '[{"type": "thinking", "thinking": "..."}]}}',
++            '{"type": "result", "subtype": "success", "result": "BODY only"}',
++        ]
++    )
++    assert consolidation._extract_text_from_stream(stream) == "BODY only"
++
++
++def test_extract_text_from_stream_empty_when_nothing_usable():
++    assert consolidation._extract_text_from_stream("") == ""
++    assert consolidation._extract_text_from_stream('{"type": "result"}') == ""
+-- 
+2.45.1.windows.1
+

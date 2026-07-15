@@ -1,0 +1,85 @@
+From 74aa74109667981f848a633f74c4cad67da4b4e8 Mon Sep 17 00:00:00 2001
+From: Steve <steventhanhtuan@gmail.com>
+Date: Tue, 14 Jul 2026 13:26:41 +0700
+Subject: [PATCH 04/17] Stop auto-creating notes/skills dirs on read paths
+ (Condition A follow-up)
+
+Read paths now tolerate a missing directory instead of creating it as a
+side effect; write paths create it explicitly.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ coral/_version.py   |  4 ++--
+ coral/hub/notes.py  | 11 +++++++----
+ coral/hub/skills.py | 12 +++++++++---
+ 3 files changed, 18 insertions(+), 9 deletions(-)
+
+diff --git a/coral/_version.py b/coral/_version.py
+index 109af9c..58bf104 100644
+--- a/coral/_version.py
++++ b/coral/_version.py
+@@ -18,7 +18,7 @@ version_tuple: tuple[int | str, ...]
+ commit_id: str | None
+ __commit_id__: str | None
+ 
+-__version__ = version = '0.7.5.dev4+g343f3e9ea'
+-__version_tuple__ = version_tuple = (0, 7, 5, 'dev4', 'g343f3e9ea')
++__version__ = version = '0.7.7.dev5+gb6a23a371.d20260714'
++__version_tuple__ = version_tuple = (0, 7, 7, 'dev5', 'gb6a23a371.d20260714')
+ 
+ __commit_id__ = commit_id = None
+diff --git a/coral/hub/notes.py b/coral/hub/notes.py
+index 504e432..ea6168f 100644
+--- a/coral/hub/notes.py
++++ b/coral/hub/notes.py
+@@ -83,10 +83,13 @@ def _jsonsafe(value: Any) -> Any:
+ 
+ 
+ def _notes_dir(coral_dir: str | Path, island_id: str | int | None = None) -> Path:
+-    """Return the path to the notes directory, ensuring it exists."""
+-    p = island_root(coral_dir, island_id) / "notes"
+-    p.mkdir(parents=True, exist_ok=True)
+-    return p
++    """Return the path to the notes directory.
++
++    Does NOT create the directory. Callers that read must handle a missing
++    directory gracefully; callers that write are responsible for creating it
++    first (``mkdir -p``, ``p.mkdir(parents=True, exist_ok=True)``, etc.).
++    """
++    return island_root(coral_dir, island_id) / "notes"
+ 
+ 
+ _SYSTEM_NOTE_FILENAMES = {"notes.md", "index.md"}
+diff --git a/coral/hub/skills.py b/coral/hub/skills.py
+index 2d45ae9..a6394a4 100644
+--- a/coral/hub/skills.py
++++ b/coral/hub/skills.py
+@@ -12,9 +12,13 @@ from coral.hub._island import island_root
+ 
+ 
+ def _skills_dir(coral_dir: str | Path, island_id: str | int | None = None) -> Path:
+-    d = island_root(coral_dir, island_id) / "skills"
+-    d.mkdir(parents=True, exist_ok=True)
+-    return d
++    """Return the path to the skills directory.
++
++    Does NOT create the directory. Callers that read must handle a missing
++    directory gracefully; callers that write are responsible for creating it
++    first (``mkdir -p``, ``d.mkdir(parents=True, exist_ok=True)``, etc.).
++    """
++    return island_root(coral_dir, island_id) / "skills"
+ 
+ 
+ def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
+@@ -151,6 +155,8 @@ def skills_by(
+     """
+     skills_dir = _skills_dir(coral_dir, island_id)
+     matched: list[Path] = []
++    if not skills_dir.is_dir():
++        return matched
+     for sk_dir in sorted(skills_dir.iterdir()):
+         if not sk_dir.is_dir():
+             continue
+-- 
+2.45.1.windows.1
+

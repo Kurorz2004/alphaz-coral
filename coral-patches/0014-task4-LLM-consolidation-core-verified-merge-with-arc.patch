@@ -1,0 +1,1425 @@
+From 0ecc815e022ebb09b129e39124cdc2f72fc2414c Mon Sep 17 00:00:00 2001
+From: Steve <steventhanhtuan@gmail.com>
+Date: Tue, 14 Jul 2026 22:19:18 +0700
+Subject: [PATCH 14/17] task4: LLM consolidation core, verified merge with
+ archive-first commit protocol
+
+coral/hub/consolidation.py: one-shot claude -p caller (injectable for
+tests), TITLE/ATTEMPTS/BODY output contract with a strict parser,
+content-derived group ids, atomic consolidations.json cache recording
+both successes and failures (a failed member set never re-spends an
+LLM call). run_consolidation_pass archives members first, publishes
+the consolidated note as the atomic commit point, best-effort rolls
+back on partial archive failure, wraps each group so nothing escapes,
+and only ever publishes a note that passed mechanical verification of
+every cited attempt score. Empty-evidence groups never consolidate.
+
+Reviewed; one blocking issue (unguarded archive loop losing cache and
+half-archiving) fixed with regression tests. 30 core tests green.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ coral/hub/consolidation.py            | 601 ++++++++++++++++++++
+ tests/test_gate_consolidation_core.py | 782 ++++++++++++++++++++++++++
+ 2 files changed, 1383 insertions(+)
+ create mode 100644 coral/hub/consolidation.py
+ create mode 100644 tests/test_gate_consolidation_core.py
+
+diff --git a/coral/hub/consolidation.py b/coral/hub/consolidation.py
+new file mode 100644
+index 0000000..0e315ca
+--- /dev/null
++++ b/coral/hub/consolidation.py
+@@ -0,0 +1,601 @@
++"""LLM note consolidation: merge a group of duplicate/overlapping notes into
++one higher-quality note before the publication gate serves them.
++
++Two layers:
++
++  - Primitives (pure, no I/O beyond what's explicitly passed in): prompt
++    construction, output parsing, group-id derivation, and the on-disk cache
++    of past consolidation attempts.
++  - :func:`run_consolidation_pass` — the orchestrator. For every eligible
++    :class:`~coral.hub.publication.Group` it decides whether an LLM call is
++    warranted, calls it (via an injected ``llm_call``, never
++    :func:`default_llm_call` directly — tests must never invoke a real LLM),
++    validates the result against the attempt store, and — only on success —
++    atomically publishes a consolidated note and archives the originals.
++
++Feature flag: this module is only ever driven when ``agents.
++gate_consolidator_model`` is set (see ``coral.config.AgentConfig``); nothing
++here reads that config value itself, matching ``coral.hub.publication``'s
++convention of leaving the "should this run" decision to the caller.
++
++Settle interplay: the on-disk cache (see :func:`load_consolidation_cache`)
++is keyed by :func:`group_id_for`, a hash of the group's member content
++hashes. A cache hit — of *either* status, "consolidated" or "failed" — skips
++the LLM call entirely, so a settled pass never re-spends a call on a group
++it already resolved. Successfully consolidating a group also *archives* its
++member notes out of ``shared_notes_dir`` (see step 7 below), which removes
++the group from existence for the next ``group_notes()`` call — so the
++follow-up publication pass simply finds no such group anymore; the cache
++entry becomes moot rather than needing to be consulted again.
++
++Known v1 edge (accepted): if an agent has an editable *view* copy of a note
++that later gets archived (because its group was successfully consolidated),
++that view copy is orphaned — pruning it from the view is not this module's
++job. If the agent later edits that stale copy, the next harvest pass sees
++new content with no corresponding shared file and treats it as a fresh
++draft, resurrecting the note under its old name. This is accepted: it's the
++same failure mode as any other harvest-vs-external-mutation race elsewhere
++in the publication gate, and correcting it would require the harvest/view
++machinery (out of scope here) to know about archival.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import logging
++import os
++import re
++import subprocess
++import tempfile
++from collections.abc import Callable, Iterable
++from dataclasses import dataclass
++from datetime import UTC, datetime
++from pathlib import Path
++from typing import Any
++
++import yaml
++
++from coral.hub.notes import _parse_frontmatter
++from coral.hub.publication import (
++    _MANIFEST_DIR,
++    Group,
++    _cited_attempt_keys,
++    _resolve_attempt_hash,
++    _sha256_file,
++    _tag_set,
++    _write_if_changed,
++    verify_note,
++)
++from coral.workspace.repo import _clean_env
++
++logger = logging.getLogger(__name__)
++
++# Author identity stamped on every consolidated note. Also what
++# ``verify_note``'s multi-attempt path expects as ``creator`` (that path
++# skips the creator == attempt.agent_id check specifically because a
++# framework-authored aggregate like this one legitimately spans agents).
++CONSOLIDATOR_CREATOR = "coral-consolidator"
++
++# Where the consolidation cache lives, relative to public_root -- the same
++# ``.publication/`` directory publication.py's per-agent manifests use.
++_CACHE_FILENAME = "consolidations.json"
++
++
++# --------------------------------------------------------------------------- #
++# LLM call (never invoked in tests)                                           #
++# --------------------------------------------------------------------------- #
++
++
++def default_llm_call(prompt: str, *, model: str, timeout: int) -> str:
++    """Run one blocking ``claude -p`` call and return its stdout.
++
++    The only I/O primitive in this module that isn't pure. Tests must never
++    call this directly (they inject a fake ``llm_call`` instead) — monkeypatch
++    it to raise if it needs asserting-against.
++
++    Raises ``RuntimeError`` on a non-zero exit or empty stdout. A
++    ``subprocess.TimeoutExpired`` is deliberately not caught here — it
++    propagates to the caller (:func:`run_consolidation_pass` catches it as
++    part of its broad ``except Exception`` around the ``llm_call`` call).
++    """
++    result = subprocess.run(
++        ["claude", "-p", prompt, "--model", model],
++        capture_output=True,
++        text=True,
++        timeout=timeout,
++        env=_clean_env(),
++    )
++    if result.returncode != 0:
++        raise RuntimeError(
++            f"consolidator LLM call exited {result.returncode}: {result.stderr.strip()}"
++        )
++    if not result.stdout.strip():
++        raise RuntimeError("consolidator LLM call returned empty stdout")
++    return result.stdout
++
++
++# --------------------------------------------------------------------------- #
++# Prompt construction                                                         #
++# --------------------------------------------------------------------------- #
++
++
++@dataclass(frozen=True)
++class ConsolidationMember:
++    """One note going into a consolidation prompt.
++
++    ``hashes``/``tags`` are this member's OWN cited-attempt-hashes / tags
++    (not the group's union) -- each member is presented individually so the
++    LLM can see exactly what each source note claims.
++    """
++
++    relpath: str
++    hashes: frozenset[str]
++    tags: frozenset[str]
++    text: str
++
++
++_PROMPT_INSTRUCTIONS = """\
++You are consolidating duplicate research notes from an autonomous coding
++agent team. The notes below all describe overlapping findings and should be
++merged into ONE higher-quality note.
++
++Rules (follow exactly):
++- Merge the notes into a single synthesis. Do not silently drop any finding.
++- Cite EVERY attempt hash listed across ALL notes below -- never omit one,
++  and never invent a hash that isn't listed.
++- Quote each cited attempt's score EXACTLY as given in the notes below --
++  do not round, recompute, average, or otherwise alter it.
++- Respond with EXACTLY this format and nothing else -- no text before it,
++  no text after it, no extra commentary:
++
++TITLE: <one line>
++ATTEMPTS:
++- <hash>: <score>
++BODY:
++<markdown synthesis>
++"""
++
++
++def build_consolidation_prompt(members: list[ConsolidationMember]) -> str:
++    """Build the LLM prompt to merge ``members`` into one note.
++
++    Contains every member's relpath, cited hashes, and tags verbatim (so the
++    LLM has the raw material to satisfy the "cite every hash" / "quote every
++    score exactly" rules), plus the fixed output contract.
++    """
++    parts = [_PROMPT_INSTRUCTIONS, f"\n{len(members)} notes to merge:\n"]
++    for i, member in enumerate(members, start=1):
++        hashes = ", ".join(sorted(member.hashes)) or "(none)"
++        tags = ", ".join(sorted(member.tags)) or "(none)"
++        parts.append(
++            f"\n--- Note {i}: {member.relpath} ---\n"
++            f"Cited attempt hashes: {hashes}\n"
++            f"Tags: {tags}\n"
++            f"Full text:\n{member.text}\n"
++        )
++    return "".join(parts)
++
++
++# --------------------------------------------------------------------------- #
++# Output parsing                                                              #
++# --------------------------------------------------------------------------- #
++
++_FENCE_RE = re.compile(r"^```[A-Za-z0-9_-]*\n(.*)\n```$", re.DOTALL)
++_TITLE_RE = re.compile(r"^TITLE:[ \t]*(.*)$", re.MULTILINE)
++_ATTEMPTS_RE = re.compile(r"^ATTEMPTS:[ \t]*$", re.MULTILINE)
++_BODY_RE = re.compile(r"^BODY:[ \t]*$", re.MULTILINE)
++
++
++def parse_consolidation_output(text: str) -> tuple[str, list[tuple[str, float]], str] | None:
++    """Parse the LLM's response against the ``TITLE:``/``ATTEMPTS:``/``BODY:``
++    contract from :data:`_PROMPT_INSTRUCTIONS`.
++
++    Returns ``(title, [(hash, score), ...], body)`` on success, or ``None`` on
++    ANY structural violation: a missing marker, markers out of order, an
++    empty title, zero parsed attempts, a non-numeric score, or an empty body.
++    Tolerates leading/trailing whitespace and a surrounding markdown code
++    fence around the whole response. Strips a leading ``---`` frontmatter
++    fence from the body if the LLM injected one (it must not — the caller
++    supplies its own frontmatter).
++    """
++    if not text:
++        return None
++    stripped = text.strip()
++    if not stripped:
++        return None
++
++    fence_match = _FENCE_RE.match(stripped)
++    if fence_match:
++        stripped = fence_match.group(1).strip()
++        if not stripped:
++            return None
++
++    title_match = _TITLE_RE.search(stripped)
++    attempts_match = _ATTEMPTS_RE.search(stripped)
++    body_match = _BODY_RE.search(stripped)
++    if not (title_match and attempts_match and body_match):
++        return None
++    if not (title_match.start() < attempts_match.start() < body_match.start()):
++        return None
++
++    title = title_match.group(1).strip()
++    if not title:
++        return None
++
++    attempts_block = stripped[attempts_match.end() : body_match.start()]
++    attempts: list[tuple[str, float]] = []
++    for line in attempts_block.splitlines():
++        line = line.strip()
++        if not line:
++            continue
++        if not line.startswith("-"):
++            continue
++        line = line[1:].strip()
++        if ":" not in line:
++            return None
++        hash_part, _, score_part = line.partition(":")
++        hash_part = hash_part.strip()
++        score_part = score_part.strip()
++        if not hash_part:
++            return None
++        try:
++            score = float(score_part)
++        except ValueError:
++            return None
++        attempts.append((hash_part, score))
++
++    if not attempts:
++        return None
++
++    body = stripped[body_match.end() :].strip("\n")
++    body_lines = body.split("\n")
++    if body_lines and body_lines[0].strip() == "---":
++        for i in range(1, len(body_lines)):
++            if body_lines[i].strip() == "---":
++                body_lines = body_lines[i + 1 :]
++                break
++        body = "\n".join(body_lines)
++    body = body.strip()
++    if not body:
++        return None
++
++    return title, attempts, body
++
++
++# --------------------------------------------------------------------------- #
++# Group id + cache                                                            #
++# --------------------------------------------------------------------------- #
++
++
++def group_id_for(member_content_hashes: Iterable[str]) -> str:
++    """Deterministic, order-independent id for a group of member content hashes."""
++    joined = "\n".join(sorted(member_content_hashes))
++    return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:16]
++
++
++def _cache_path(public_root: str | Path) -> Path:
++    return Path(public_root) / _MANIFEST_DIR / _CACHE_FILENAME
++
++
++def load_consolidation_cache(public_root: str | Path) -> dict[str, dict[str, Any]]:
++    """Load the consolidation cache (``group_id -> record``). Missing/corrupt -> ``{}``."""
++    path = _cache_path(public_root)
++    if not path.exists():
++        return {}
++    try:
++        data = json.loads(path.read_text())
++    except (OSError, json.JSONDecodeError):
++        return {}
++    if not isinstance(data, dict):
++        return {}
++    return data
++
++
++def save_consolidation_cache(public_root: str | Path, cache: dict[str, dict[str, Any]]) -> None:
++    """Save the consolidation cache atomically. No-op if content is unchanged
++    (see ``publication._write_if_changed``)."""
++    path = _cache_path(public_root)
++    payload = json.dumps(cache, indent=2, sort_keys=True) + "\n"
++    _write_if_changed(path, payload.encode("utf-8"))
++
++
++# --------------------------------------------------------------------------- #
++# Orchestrator                                                                #
++# --------------------------------------------------------------------------- #
++
++
++def _resolve_or_raw(coral_dir: str | Path, raw: Any, island_id: str | int | None) -> str | None:
++    """Resolve a cited hash to its full commit hash, else fall back to the raw
++    string -- same resolve-or-raw behavior ``publication._cited_attempt_keys``
++    uses internally, needed here to compare an LLM-parsed hash against the
++    expected set built from that function."""
++    raw = str(raw).strip() if raw else ""
++    if not raw:
++        return None
++    resolved = _resolve_attempt_hash(coral_dir, raw, island_id)
++    return resolved if resolved is not None else raw
++
++
++def _render_frontmatter(
++    *,
++    created_iso: str,
++    tags: list[str],
++    consolidates: list[str],
++    attempts: list[tuple[str, float]],
++) -> str:
++    """Render the candidate note's frontmatter block (without the body)."""
++    payload = {
++        "creator": CONSOLIDATOR_CREATOR,
++        "created": created_iso,
++        "tags": tags,
++        "consolidates": consolidates,
++        "evidence": {"attempts": [{"attempt": h, "score": s} for h, s in attempts]},
++    }
++    dumped = yaml.safe_dump(payload, sort_keys=False, default_flow_style=False).strip("\n")
++    return f"---\n{dumped}\n---\n"
++
++
++def run_consolidation_pass(
++    shared_notes_dir: str | Path,
++    coral_dir: str | Path,
++    groups: list[Group],
++    *,
++    llm_call: Callable[[str], str],
++    public_root: str | Path,
++    island_id: str | int | None = None,
++    now: datetime | None = None,
++) -> bool:
++    """Attempt to consolidate every eligible group of >= 2 notes via one LLM
++    call each. Never raises: every per-group failure -- expected (cache hit,
++    no evidence, malformed LLM output, an archive move that couldn't
++    complete, ...) or unexpected (a bug, a stray exception somewhere in
++    steps 1-7) -- is caught, logged via the module logger, and treated as
++    that group simply failing; the pass always finishes and always persists
++    whatever the cache accumulated, including any earlier group's result.
++
++    Per group:
++
++    1. Compute each member's content sha256 and derive ``group_id`` (see
++       :func:`group_id_for`). A cache hit (any status) skips the group
++       entirely -- no LLM call, nothing recorded.
++    2. Compute the expected attempt-hash set: the union of every member's
++       resolved cited attempts (:func:`publication._cited_attempt_keys` over
++       each member's parsed frontmatter). An empty expected set means no
++       member makes a checkable claim -- the group is skipped with NOTHING
++       recorded (not even a cache entry), so it's reconsidered every pass
++       until it has real evidence to consolidate.
++    3. Build the prompt (:func:`build_consolidation_prompt`) and call
++       ``llm_call(prompt)``. Any exception (including a timeout) is caught
++       and treated as a failure.
++    4. Parse the response (:func:`parse_consolidation_output`); ``None`` is a
++       failure.
++    5. Resolve every parsed hash the same way the expected set was built; the
++       resolved set must equal the expected set exactly, or it's a failure
++       (the LLM cited something it wasn't given, or dropped something it
++       was).
++    6. Render candidate frontmatter + body to a temp file inside
++       ``shared_notes_dir`` and run ``publication.verify_note`` on it. Not
++       verified -> failure: temp file deleted, nothing archived, nothing
++       published.
++    7. Verified -> ARCHIVE FIRST, THEN PUBLISH, so the single atomic
++       ``os.replace`` that makes the consolidated note visible is the LAST
++       thing that can fail, and it's the group's commit point: every
++       original member is atomically moved (``os.replace``, never copied)
++       into ``<public_root>/note_archive/<group_id>/`` first; only once
++       every member has been archived does the temp note become
++       ``consolidated-<group_id>.md`` in ``shared_notes_dir``. If any member
++       fails to archive (vanished mid-pass, cross-device dir, a locked
++       file, ...), archiving stops immediately, everything already archived
++       THIS group is moved back into ``shared_notes_dir`` on a best-effort
++       basis (each move attempted in its own try/except -- a rollback
++       failure is logged, never raised), the temp note is deleted, and the
++       group is recorded as failed. A group therefore never ends up
++       half-archived with its consolidated note already published, and
++       never gets published while a member is still missing.
++    8. Failures record ``status: "failed"`` in the cache (still logged via
++       the module logger) so a broken group isn't retried every pass either
++       -- but member notes and the group itself are left completely
++       untouched, so a human/agent fix to the underlying notes naturally
++       produces a new group_id (different content hash) and gets retried
++       fresh.
++
++    Every group's entire processing (steps 1-7) is wrapped in its own
++    try/except, so one group's unexpected exception is logged and treated
++    as a failed group rather than aborting the loop -- it can never lose an
++    earlier group's already-recorded cache entry.
++
++    The cache is loaded once up front and persisted once after the loop,
++    inside a ``finally`` (see :func:`save_consolidation_cache` -- atomic,
++    and a no-op if content didn't change), so it is saved even if something
++    outside the per-group guard misbehaves. Returns ``True`` iff at least
++    one group was newly consolidated during this call.
++
++    See the module docstring for the settle interplay (why a cache hit plus
++    archival together make repeated passes safe) and the accepted v1 edge
++    around an agent's stale edited view copy of an archived note.
++    """
++    shared_notes_dir = Path(shared_notes_dir)
++    public_root = Path(public_root)
++    now = now or datetime.now(UTC)
++    now_iso = now.isoformat()
++
++    cache = load_consolidation_cache(public_root)
++    any_consolidated = False
++
++    try:
++        for group in groups:
++            try:
++                members_paths = [group.representative, *group.see_also]
++                if len(members_paths) < 2:
++                    continue
++
++                content_hashes: dict[Path, str] = {}
++                readable = True
++                for member_path in members_paths:
++                    digest = _sha256_file(member_path)
++                    if digest is None:
++                        logger.warning(
++                            "consolidation: could not hash %s, skipping group", member_path
++                        )
++                        readable = False
++                        break
++                    content_hashes[member_path] = digest
++                if not readable:
++                    continue
++
++                group_id = group_id_for(content_hashes.values())
++                if group_id in cache:
++                    continue  # cache hit (any status) -- never re-spend an LLM call
++
++                parsed_members: list[ConsolidationMember] = []
++                expected_hashes: set[str] = set()
++                try:
++                    for member_path in members_paths:
++                        text = member_path.read_text()
++                        meta, _ = _parse_frontmatter(text)
++                        member_hashes = _cited_attempt_keys(meta, coral_dir, island_id)
++                        expected_hashes |= set(member_hashes)
++                        parsed_members.append(
++                            ConsolidationMember(
++                                relpath=member_path.relative_to(shared_notes_dir).as_posix(),
++                                hashes=member_hashes,
++                                tags=frozenset(_tag_set(meta)),
++                                text=text,
++                            )
++                        )
++                except OSError as exc:
++                    logger.warning(
++                        "consolidation: could not read members of group %s: %s", group_id, exc
++                    )
++                    continue
++
++                if not expected_hashes:
++                    # No member makes a checkable claim -- nothing to
++                    # consolidate, nothing recorded (reconsidered every
++                    # pass, see docstring).
++                    continue
++
++                member_relpaths = sorted(m.relpath for m in parsed_members)
++
++                def _fail(reason: str) -> None:
++                    logger.warning("consolidation: group %s failed: %s", group_id, reason)
++                    cache[group_id] = {
++                        "status": "failed",
++                        "member_hashes": sorted(content_hashes.values()),
++                        "member_relpaths": member_relpaths,
++                        "note": None,
++                        "at": now_iso,
++                    }
++
++                prompt = build_consolidation_prompt(parsed_members)
++                try:
++                    raw_output = llm_call(prompt)
++                except Exception as exc:  # noqa: BLE001 -- any LLM-call failure is a mundane failure path
++                    _fail(f"llm_call raised {exc!r}")
++                    continue
++
++                parsed = parse_consolidation_output(raw_output)
++                if parsed is None:
++                    _fail("could not parse LLM output")
++                    continue
++                title, parsed_attempts, body = parsed
++
++                resolved = {
++                    resolved_hash
++                    for h, _score in parsed_attempts
++                    if (resolved_hash := _resolve_or_raw(coral_dir, h, island_id)) is not None
++                }
++                if resolved != expected_hashes:
++                    _fail(
++                        f"cited hash set {sorted(resolved)} != expected {sorted(expected_hashes)}"
++                    )
++                    continue
++
++                tags = sorted({t for m in parsed_members for t in m.tags})
++                frontmatter = _render_frontmatter(
++                    created_iso=now_iso,
++                    tags=tags,
++                    consolidates=member_relpaths,
++                    attempts=parsed_attempts,
++                )
++                content = f"{frontmatter}\n# {title}\n\n{body}\n"
++
++                fd, tmp_path_str = tempfile.mkstemp(
++                    prefix=f".consolidated-{group_id}.", suffix=".md.tmp", dir=shared_notes_dir
++                )
++                tmp_path = Path(tmp_path_str)
++                try:
++                    with os.fdopen(fd, "w") as f:
++                        f.write(content)
++                        f.flush()
++                        os.fsync(f.fileno())
++
++                    verdict = verify_note(tmp_path, coral_dir, island_id)
++                except Exception as exc:  # noqa: BLE001 -- never let a group failure propagate
++                    _fail(f"unexpected error authoring candidate note: {exc!r}")
++                    tmp_path.unlink(missing_ok=True)
++                    continue
++
++                if verdict.verified is not True:
++                    _fail(f"candidate note did not verify: {verdict.reason}")
++                    tmp_path.unlink(missing_ok=True)
++                    continue
++
++                # Archive-first-then-publish (see docstring step 7): move
++                # every member into note_archive/<group_id>/ BEFORE
++                # publishing the consolidated note. A failure partway
++                # through is rolled back on a best-effort basis and never
++                # propagates.
++                archive_dir = public_root / "note_archive" / group_id
++                archived: list[Path] = []
++                archive_error: OSError | None = None
++                try:
++                    archive_dir.mkdir(parents=True, exist_ok=True)
++                    for member_path in members_paths:
++                        os.replace(member_path, archive_dir / member_path.name)
++                        archived.append(member_path)
++                except OSError as exc:
++                    archive_error = exc
++
++                if archive_error is not None:
++                    logger.warning(
++                        "consolidation: group %s failed to archive a member: %r",
++                        group_id,
++                        archive_error,
++                    )
++                    for original_path in archived:
++                        try:
++                            os.replace(archive_dir / original_path.name, original_path)
++                        except OSError as rollback_exc:
++                            logger.warning(
++                                "consolidation: group %s rollback failed for %s: %r",
++                                group_id,
++                                original_path,
++                                rollback_exc,
++                            )
++                    tmp_path.unlink(missing_ok=True)
++                    _fail(f"archiving members failed: {archive_error!r}")
++                    continue
++
++                final_path = shared_notes_dir / f"consolidated-{group_id}.md"
++                os.replace(tmp_path, final_path)
++
++                cache[group_id] = {
++                    "status": "consolidated",
++                    "member_hashes": sorted(content_hashes.values()),
++                    "member_relpaths": member_relpaths,
++                    "note": final_path.relative_to(shared_notes_dir).as_posix(),
++                    "at": now_iso,
++                }
++                any_consolidated = True
++            except Exception as exc:  # noqa: BLE001 -- one group's bug must never abort the pass
++                logger.warning(
++                    "consolidation: group (representative=%s) raised unexpectedly: %r",
++                    group.representative,
++                    exc,
++                )
++    finally:
++        save_consolidation_cache(public_root, cache)
++
++    return any_consolidated
+diff --git a/tests/test_gate_consolidation_core.py b/tests/test_gate_consolidation_core.py
+new file mode 100644
+index 0000000..76781d9
+--- /dev/null
++++ b/tests/test_gate_consolidation_core.py
+@@ -0,0 +1,782 @@
++"""Tests for the LLM note consolidation core: primitives (prompt/parse/
++group-id/cache) and the :func:`run_consolidation_pass` orchestrator in
++``coral.hub.consolidation``.
++
++A real LLM is never invoked here -- every orchestrator test injects a plain
++lambda/closure as ``llm_call``, and the autouse ``_forbid_real_llm_call``
++fixture monkeypatches :func:`coral.hub.consolidation.default_llm_call` to
++raise, so any accidental code path reaching for the real thing fails loudly.
++
++Fixture helpers (``_make_attempt`` / ``_write_note_file`` / ``_note_and_meta``
++/ ``_public_dirs``) mirror ``tests/test_gate_consolidation.py`` (itself
++mirroring ``tests/test_publication_gate.py``) so the suites read the same
++way; kept local since this file must not depend on their internals shifting.
++"""
++
++from __future__ import annotations
++
++import os
++from datetime import UTC, datetime
++from pathlib import Path
++
++import pytest
++
++from coral.hub.attempts import write_attempt
++from coral.hub.consolidation import (
++    CONSOLIDATOR_CREATOR,
++    ConsolidationMember,
++    build_consolidation_prompt,
++    group_id_for,
++    load_consolidation_cache,
++    parse_consolidation_output,
++    run_consolidation_pass,
++    save_consolidation_cache,
++)
++from coral.hub.notes import _parse_frontmatter
++from coral.hub.publication import Group, _sha256_file
++from coral.types import Attempt
++
++# --------------------------------------------------------------------------- #
++# Fixture helpers (mirrors tests/test_gate_consolidation.py)                  #
++# --------------------------------------------------------------------------- #
++
++_FULL_HASH = "7b1e4d001122334455667788990011223344aabb"
++_SHORT_HASH = _FULL_HASH[:12]
++_FULL_HASH_2 = "9c2f5e112233445566778899001122334455bbcc"
++_SHORT_HASH_2 = _FULL_HASH_2[:12]
++
++
++def _make_attempt(
++    commit: str,
++    agent: str = "island-0-agent-2",
++    score: float | None = 0.42,
++    metadata: dict | None = None,
++) -> Attempt:
++    return Attempt(
++        commit_hash=commit,
++        agent_id=agent,
++        title="a change",
++        score=score,
++        status="improved" if score is not None else "pending",
++        parent_hash=None,
++        timestamp="2026-03-14T17:00:00-00:00",
++        metadata=metadata or {},
++    )
++
++
++def _write_note(path: Path, text: str) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(text)
++
++
++def _write_note_file(path: Path, frontmatter: str, body: str = "# Title\nBody text.\n") -> Path:
++    _write_note(path, f"---\n{frontmatter}\n---\n\n{body}")
++    return path
++
++
++def _note_and_meta(path: Path) -> tuple[Path, dict]:
++    meta, _ = _parse_frontmatter(path.read_text())
++    return path, meta
++
++
++def _public_dirs(tmp_path: Path) -> tuple[Path, Path]:
++    public_root = tmp_path / "public"
++    shared_notes_dir = public_root / "notes"
++    shared_notes_dir.mkdir(parents=True)
++    return public_root, shared_notes_dir
++
++
++@pytest.fixture(autouse=True)
++def _forbid_real_llm_call(monkeypatch):
++    """Safety net: nothing in this suite may ever reach the real LLM call."""
++
++    def _boom(*args, **kwargs):
++        raise AssertionError("default_llm_call must never be invoked by tests")
++
++    monkeypatch.setattr("coral.hub.consolidation.default_llm_call", _boom)
++
++
++# --------------------------------------------------------------------------- #
++# parse_consolidation_output()                                                #
++# --------------------------------------------------------------------------- #
++
++
++def test_parse_happy_path():
++    text = (
++        "TITLE: Merged finding on tiling\n"
++        "ATTEMPTS:\n"
++        f"- {_SHORT_HASH}: 0.42\n"
++        f"- {_SHORT_HASH_2}: 0.55\n"
++        "BODY:\n"
++        "Combined synthesis of both notes.\n"
++    )
++    parsed = parse_consolidation_output(text)
++    assert parsed is not None
++    title, attempts, body = parsed
++    assert title == "Merged finding on tiling"
++    assert attempts == [(_SHORT_HASH, 0.42), (_SHORT_HASH_2, 0.55)]
++    assert body == "Combined synthesis of both notes."
++
++
++def test_parse_missing_title_marker_is_none():
++    text = "ATTEMPTS:\n- h: 0.1\nBODY:\nSome body.\n"
++    assert parse_consolidation_output(text) is None
++
++
++def test_parse_missing_attempts_marker_is_none():
++    text = "TITLE: X\nBODY:\nSome body.\n"
++    assert parse_consolidation_output(text) is None
++
++
++def test_parse_missing_body_marker_is_none():
++    text = "TITLE: X\nATTEMPTS:\n- h: 0.1\n"
++    assert parse_consolidation_output(text) is None
++
++
++def test_parse_empty_title_is_none():
++    text = "TITLE:   \nATTEMPTS:\n- h: 0.1\nBODY:\nSome body.\n"
++    assert parse_consolidation_output(text) is None
++
++
++def test_parse_zero_attempts_is_none():
++    text = "TITLE: X\nATTEMPTS:\nBODY:\nSome body.\n"
++    assert parse_consolidation_output(text) is None
++
++
++def test_parse_non_numeric_score_is_none():
++    text = "TITLE: X\nATTEMPTS:\n- h: not-a-number\nBODY:\nSome body.\n"
++    assert parse_consolidation_output(text) is None
++
++
++def test_parse_empty_body_is_none():
++    text = "TITLE: X\nATTEMPTS:\n- h: 0.1\nBODY:\n   \n"
++    assert parse_consolidation_output(text) is None
++
++
++def test_parse_code_fenced_output_tolerated():
++    text = (
++        "```markdown\n"
++        "TITLE: Fenced\n"
++        "ATTEMPTS:\n"
++        "- h1: 0.9\n"
++        "BODY:\n"
++        "Fenced body text.\n"
++        "```"
++    )
++    parsed = parse_consolidation_output(text)
++    assert parsed is not None
++    title, attempts, body = parsed
++    assert title == "Fenced"
++    assert attempts == [("h1", 0.9)]
++    assert body == "Fenced body text."
++
++
++def test_parse_leading_frontmatter_fence_stripped_from_body():
++    text = (
++        "TITLE: X\n"
++        "ATTEMPTS:\n"
++        "- h: 0.1\n"
++        "BODY:\n"
++        "---\n"
++        "creator: rogue\n"
++        "---\n"
++        "Actual synthesis content.\n"
++    )
++    parsed = parse_consolidation_output(text)
++    assert parsed is not None
++    _, _, body = parsed
++    assert body == "Actual synthesis content."
++    assert "creator" not in body
++
++
++def test_parse_tolerates_leading_trailing_whitespace():
++    text = "\n\n  TITLE: X\nATTEMPTS:\n- h: 0.1\nBODY:\nBody.\n\n\n  "
++    parsed = parse_consolidation_output(text)
++    assert parsed is not None
++    title, attempts, body = parsed
++    assert title == "X"
++    assert attempts == [("h", 0.1)]
++    assert body == "Body."
++
++
++def test_parse_empty_string_is_none():
++    assert parse_consolidation_output("") is None
++    assert parse_consolidation_output("   \n  ") is None
++
++
++# --------------------------------------------------------------------------- #
++# build_consolidation_prompt()                                                #
++# --------------------------------------------------------------------------- #
++
++
++def test_prompt_contains_every_member_relpath_hash_tag_and_contract_markers():
++    members = [
++        ConsolidationMember(
++            relpath="a.md",
++            hashes=frozenset({"hash1"}),
++            tags=frozenset({"tiling"}),
++            text="# A\nBody A.",
++        ),
++        ConsolidationMember(
++            relpath="sub/b.md",
++            hashes=frozenset({"hash2", "hash3"}),
++            tags=frozenset({"tiling", "matmul"}),
++            text="# B\nBody B.",
++        ),
++    ]
++
++    prompt = build_consolidation_prompt(members)
++
++    for expected in ("a.md", "sub/b.md", "hash1", "hash2", "hash3", "tiling", "matmul"):
++        assert expected in prompt
++    assert "TITLE:" in prompt
++    assert "ATTEMPTS:" in prompt
++    assert "BODY:" in prompt
++
++
++# --------------------------------------------------------------------------- #
++# group_id_for()                                                              #
++# --------------------------------------------------------------------------- #
++
++
++def test_group_id_for_deterministic_and_order_independent():
++    a = group_id_for(["h1", "h2", "h3"])
++    b = group_id_for(["h3", "h1", "h2"])
++    assert a == b
++    assert len(a) == 16
++
++
++def test_group_id_for_differs_for_different_members():
++    assert group_id_for(["h1", "h2"]) != group_id_for(["h1", "h3"])
++
++
++# --------------------------------------------------------------------------- #
++# load/save_consolidation_cache()                                             #
++# --------------------------------------------------------------------------- #
++
++
++def test_cache_round_trip(tmp_path):
++    public_root = tmp_path / "public"
++    cache = {
++        "abc123": {
++            "status": "consolidated",
++            "member_hashes": ["h1"],
++            "member_relpaths": ["a.md"],
++            "note": "consolidated-abc123.md",
++            "at": "2026-01-01T00:00:00+00:00",
++        }
++    }
++
++    save_consolidation_cache(public_root, cache)
++    loaded = load_consolidation_cache(public_root)
++
++    assert loaded == cache
++
++
++def test_cache_load_missing_returns_empty(tmp_path):
++    assert load_consolidation_cache(tmp_path / "public") == {}
++
++
++def test_cache_save_is_atomic_no_tmp_files_left(tmp_path):
++    public_root = tmp_path / "public"
++    save_consolidation_cache(
++        public_root,
++        {"a": {"status": "failed", "member_hashes": [], "member_relpaths": [], "note": None, "at": "x"}},
++    )
++
++    cache_dir = public_root / ".publication"
++    assert list(cache_dir.glob("*.tmp")) == []
++    assert (cache_dir / "consolidations.json").exists()
++
++
++def test_cache_skip_write_when_unchanged(tmp_path):
++    public_root = tmp_path / "public"
++    cache = {"a": {"status": "failed", "member_hashes": [], "member_relpaths": [], "note": None, "at": "x"}}
++    save_consolidation_cache(public_root, cache)
++    path = public_root / ".publication" / "consolidations.json"
++    mtime_before = path.stat().st_mtime_ns
++
++    save_consolidation_cache(public_root, dict(cache))  # same content, fresh dict object
++
++    mtime_after = path.stat().st_mtime_ns
++    assert mtime_before == mtime_after
++
++
++# --------------------------------------------------------------------------- #
++# run_consolidation_pass()                                                    #
++# --------------------------------------------------------------------------- #
++
++
++def test_orchestrator_happy_path_consolidates_and_archives(tmp_path):
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH, agent="island-0-agent-1", score=0.42))
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH_2, agent="island-0-agent-2", score=0.55))
++    public_root, shared_notes_dir = _public_dirs(tmp_path)
++
++    a = _write_note_file(
++        shared_notes_dir / "a.md",
++        f"creator: island-0-agent-1\ncreated: 2026-03-10T00:00:00-00:00\nevidence:\n  attempt: {_SHORT_HASH}\n",
++        body="# A\nFinding A.\n",
++    )
++    b = _write_note_file(
++        shared_notes_dir / "b.md",
++        f"creator: island-0-agent-2\ncreated: 2026-03-11T00:00:00-00:00\nevidence:\n  attempt: {_SHORT_HASH_2}\n",
++        body="# B\nFinding B.\n",
++    )
++    group = Group(representative=b, see_also=[a], recency=datetime(2026, 3, 11, tzinfo=UTC))
++
++    llm_output = (
++        "TITLE: Combined finding\n"
++        "ATTEMPTS:\n"
++        f"- {_FULL_HASH}: 0.42\n"
++        f"- {_FULL_HASH_2}: 0.55\n"
++        "BODY:\n"
++        "Both notes agree the change improves score.\n"
++    )
++    calls: list[str] = []
++
++    def fake_llm(prompt: str) -> str:
++        calls.append(prompt)
++        return llm_output
++
++    result = run_consolidation_pass(
++        shared_notes_dir, tmp_path, [group], llm_call=fake_llm, public_root=public_root
++    )
++
++    assert result is True
++    assert len(calls) == 1
++
++    consolidated_files = list(shared_notes_dir.glob("consolidated-*.md"))
++    assert len(consolidated_files) == 1
++    note_text = consolidated_files[0].read_text()
++    meta, body_text = _parse_frontmatter(note_text)
++    assert meta["creator"] == CONSOLIDATOR_CREATOR
++    assert sorted(meta["consolidates"]) == ["a.md", "b.md"]
++    assert "Combined finding" in note_text
++    assert "Both notes agree the change improves score." in body_text
++
++    assert not a.exists()
++    assert not b.exists()
++
++    archive_dirs = list((public_root / "note_archive").iterdir())
++    assert len(archive_dirs) == 1
++    archived_files = sorted(p.name for p in archive_dirs[0].iterdir())
++    assert archived_files == ["a.md", "b.md"]
++
++    cache = load_consolidation_cache(public_root)
++    assert len(cache) == 1
++    entry = next(iter(cache.values()))
++    assert entry["status"] == "consolidated"
++    assert entry["note"] == consolidated_files[0].name
++
++
++def test_orchestrator_wrong_score_records_failure_and_leaves_originals(tmp_path):
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH, agent="island-0-agent-1", score=0.42))
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH_2, agent="island-0-agent-2", score=0.55))
++    public_root, shared_notes_dir = _public_dirs(tmp_path)
++
++    a = _write_note_file(
++        shared_notes_dir / "a.md",
++        f"creator: island-0-agent-1\nevidence:\n  attempt: {_SHORT_HASH}\n",
++        body="# A\nFinding A.\n",
++    )
++    b = _write_note_file(
++        shared_notes_dir / "b.md",
++        f"creator: island-0-agent-2\nevidence:\n  attempt: {_SHORT_HASH_2}\n",
++        body="# B\nFinding B.\n",
++    )
++    group = Group(representative=b, see_also=[a], recency=datetime.now(UTC))
++
++    llm_output = (
++        "TITLE: Combined finding\n"
++        "ATTEMPTS:\n"
++        f"- {_FULL_HASH}: 0.42\n"
++        f"- {_FULL_HASH_2}: 0.99\n"  # wrong -- real score is 0.55
++        "BODY:\n"
++        "Body text.\n"
++    )
++
++    result = run_consolidation_pass(
++        shared_notes_dir, tmp_path, [group], llm_call=lambda p: llm_output, public_root=public_root
++    )
++
++    assert result is False
++    assert a.exists()
++    assert b.exists()
++    assert list(shared_notes_dir.glob("consolidated-*.md")) == []
++
++    cache = load_consolidation_cache(public_root)
++    assert len(cache) == 1
++    entry = next(iter(cache.values()))
++    assert entry["status"] == "failed"
++    assert entry["note"] is None
++
++
++def test_orchestrator_llm_exception_records_failure(tmp_path):
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH, agent="island-0-agent-1", score=0.42))
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH_2, agent="island-0-agent-2", score=0.55))
++    public_root, shared_notes_dir = _public_dirs(tmp_path)
++
++    a = _write_note_file(
++        shared_notes_dir / "a.md",
++        f"creator: island-0-agent-1\nevidence:\n  attempt: {_SHORT_HASH}\n",
++        body="# A\nFinding A.\n",
++    )
++    b = _write_note_file(
++        shared_notes_dir / "b.md",
++        f"creator: island-0-agent-2\nevidence:\n  attempt: {_SHORT_HASH_2}\n",
++        body="# B\nFinding B.\n",
++    )
++    group = Group(representative=b, see_also=[a], recency=datetime.now(UTC))
++
++    def boom(prompt: str) -> str:
++        raise RuntimeError("LLM unavailable")
++
++    result = run_consolidation_pass(
++        shared_notes_dir, tmp_path, [group], llm_call=boom, public_root=public_root
++    )
++
++    assert result is False
++    assert a.exists()
++    assert b.exists()
++    cache = load_consolidation_cache(public_root)
++    assert next(iter(cache.values()))["status"] == "failed"
++
++
++def test_orchestrator_parse_failure_records_failure(tmp_path):
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH, agent="island-0-agent-1", score=0.42))
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH_2, agent="island-0-agent-2", score=0.55))
++    public_root, shared_notes_dir = _public_dirs(tmp_path)
++
++    a = _write_note_file(
++        shared_notes_dir / "a.md",
++        f"creator: island-0-agent-1\nevidence:\n  attempt: {_SHORT_HASH}\n",
++        body="# A\nFinding A.\n",
++    )
++    b = _write_note_file(
++        shared_notes_dir / "b.md",
++        f"creator: island-0-agent-2\nevidence:\n  attempt: {_SHORT_HASH_2}\n",
++        body="# B\nFinding B.\n",
++    )
++    group = Group(representative=b, see_also=[a], recency=datetime.now(UTC))
++
++    result = run_consolidation_pass(
++        shared_notes_dir,
++        tmp_path,
++        [group],
++        llm_call=lambda p: "this is not the contract at all",
++        public_root=public_root,
++    )
++
++    assert result is False
++    assert a.exists()
++    assert b.exists()
++    cache = load_consolidation_cache(public_root)
++    assert next(iter(cache.values()))["status"] == "failed"
++
++
++def test_orchestrator_missing_cited_hash_records_failure(tmp_path):
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH, agent="island-0-agent-1", score=0.42))
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH_2, agent="island-0-agent-2", score=0.55))
++    public_root, shared_notes_dir = _public_dirs(tmp_path)
++
++    a = _write_note_file(
++        shared_notes_dir / "a.md",
++        f"creator: island-0-agent-1\nevidence:\n  attempt: {_SHORT_HASH}\n",
++        body="# A\nFinding A.\n",
++    )
++    b = _write_note_file(
++        shared_notes_dir / "b.md",
++        f"creator: island-0-agent-2\nevidence:\n  attempt: {_SHORT_HASH_2}\n",
++        body="# B\nFinding B.\n",
++    )
++    group = Group(representative=b, see_also=[a], recency=datetime.now(UTC))
++
++    # Only cites one of the two expected hashes -- missing the other.
++    llm_output = f"TITLE: X\nATTEMPTS:\n- {_FULL_HASH}: 0.42\nBODY:\nBody.\n"
++
++    result = run_consolidation_pass(
++        shared_notes_dir, tmp_path, [group], llm_call=lambda p: llm_output, public_root=public_root
++    )
++
++    assert result is False
++    assert a.exists()
++    assert b.exists()
++    assert list(shared_notes_dir.glob("consolidated-*.md")) == []
++    cache = load_consolidation_cache(public_root)
++    assert next(iter(cache.values()))["status"] == "failed"
++
++
++def test_orchestrator_extra_cited_hash_records_failure(tmp_path):
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH, agent="island-0-agent-1", score=0.42))
++    public_root, shared_notes_dir = _public_dirs(tmp_path)
++
++    # Both members cite the SAME single hash -- expected set is size 1.
++    a = _write_note_file(
++        shared_notes_dir / "a.md",
++        f"creator: island-0-agent-1\nevidence:\n  attempt: {_SHORT_HASH}\n",
++        body="# A\nFinding A.\n",
++    )
++    b = _write_note_file(
++        shared_notes_dir / "b.md",
++        f"creator: island-0-agent-1\nevidence:\n  attempt: {_SHORT_HASH}\n",
++        body="# B\nFinding B.\n",
++    )
++    group = Group(representative=b, see_also=[a], recency=datetime.now(UTC))
++
++    # Cites the expected hash PLUS an extra one nobody asked for.
++    llm_output = (
++        f"TITLE: X\nATTEMPTS:\n- {_FULL_HASH}: 0.42\n- {_FULL_HASH_2}: 0.99\nBODY:\nBody.\n"
++    )
++
++    result = run_consolidation_pass(
++        shared_notes_dir, tmp_path, [group], llm_call=lambda p: llm_output, public_root=public_root
++    )
++
++    assert result is False
++    assert a.exists()
++    assert b.exists()
++    cache = load_consolidation_cache(public_root)
++    assert next(iter(cache.values()))["status"] == "failed"
++
++
++def test_orchestrator_cache_hit_skips_llm_call(tmp_path):
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH, agent="island-0-agent-1", score=0.42))
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH_2, agent="island-0-agent-2", score=0.55))
++    public_root, shared_notes_dir = _public_dirs(tmp_path)
++
++    a = _write_note_file(
++        shared_notes_dir / "a.md",
++        f"creator: island-0-agent-1\nevidence:\n  attempt: {_SHORT_HASH}\n",
++        body="# A\nFinding A.\n",
++    )
++    b = _write_note_file(
++        shared_notes_dir / "b.md",
++        f"creator: island-0-agent-2\nevidence:\n  attempt: {_SHORT_HASH_2}\n",
++        body="# B\nFinding B.\n",
++    )
++    group = Group(representative=b, see_also=[a], recency=datetime.now(UTC))
++
++    content_hashes = [_sha256_file(a), _sha256_file(b)]
++    group_id = group_id_for(content_hashes)
++    save_consolidation_cache(
++        public_root,
++        {
++            group_id: {
++                "status": "consolidated",
++                "member_hashes": sorted(content_hashes),
++                "member_relpaths": ["a.md", "b.md"],
++                "note": "consolidated-already-done.md",
++                "at": "2026-01-01T00:00:00+00:00",
++            }
++        },
++    )
++
++    calls: list[str] = []
++
++    def fake_llm(prompt: str) -> str:
++        calls.append(prompt)
++        return "should not be used"
++
++    result = run_consolidation_pass(
++        shared_notes_dir, tmp_path, [group], llm_call=fake_llm, public_root=public_root
++    )
++
++    assert calls == []
++    assert result is False  # nothing NEWLY consolidated this call
++    # Cache-hit groups are skipped entirely -- originals untouched.
++    assert a.exists()
++    assert b.exists()
++
++
++def test_orchestrator_empty_expected_set_skipped_without_cache_entry(tmp_path):
++    public_root, shared_notes_dir = _public_dirs(tmp_path)
++
++    # Neither note cites any evidence -- nothing checkable to consolidate.
++    a = _write_note_file(shared_notes_dir / "a.md", "creator: agent-1\ntags: [x]\n", body="# A\nBody.\n")
++    b = _write_note_file(shared_notes_dir / "b.md", "creator: agent-2\ntags: [x]\n", body="# B\nBody.\n")
++    group = Group(representative=b, see_also=[a], recency=datetime.now(UTC))
++
++    calls: list[str] = []
++
++    def fake_llm(prompt: str) -> str:
++        calls.append(prompt)
++        return "unused"
++
++    result = run_consolidation_pass(
++        shared_notes_dir, tmp_path, [group], llm_call=fake_llm, public_root=public_root
++    )
++
++    assert result is False
++    assert calls == []
++    assert load_consolidation_cache(public_root) == {}
++    assert a.exists()
++    assert b.exists()
++
++
++def test_orchestrator_archive_failure_rolls_back_and_preserves_other_group_cache(tmp_path, monkeypatch):
++    # Two members' worth of attempts, shared by both groups below.
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH, agent="island-0-agent-1", score=0.42))
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH_2, agent="island-0-agent-2", score=0.55))
++    public_root, shared_notes_dir = _public_dirs(tmp_path)
++
++    # Group 1: consolidates cleanly and is processed FIRST.
++    ok_a = _write_note_file(
++        shared_notes_dir / "ok_a.md",
++        f"creator: island-0-agent-1\nevidence:\n  attempt: {_SHORT_HASH}\n",
++        body="# OK A\nFinding A.\n",
++    )
++    ok_b = _write_note_file(
++        shared_notes_dir / "ok_b.md",
++        f"creator: island-0-agent-2\nevidence:\n  attempt: {_SHORT_HASH_2}\n",
++        body="# OK B\nFinding B.\n",
++    )
++    ok_group = Group(representative=ok_b, see_also=[ok_a], recency=datetime.now(UTC))
++    ok_llm_output = (
++        "TITLE: OK combined\n"
++        "ATTEMPTS:\n"
++        f"- {_FULL_HASH}: 0.42\n"
++        f"- {_FULL_HASH_2}: 0.55\n"
++        "BODY:\n"
++        "Both notes agree.\n"
++    )
++
++    # Group 2: same shape, processed SECOND -- its archive step fails on its
++    # second member.
++    bad_a = _write_note_file(
++        shared_notes_dir / "bad_a.md",
++        f"creator: island-0-agent-1\nevidence:\n  attempt: {_SHORT_HASH}\n",
++        body="# BAD A\nFinding A2.\n",
++    )
++    bad_b = _write_note_file(
++        shared_notes_dir / "bad_b.md",
++        f"creator: island-0-agent-2\nevidence:\n  attempt: {_SHORT_HASH_2}\n",
++        body="# BAD B\nFinding B2.\n",
++    )
++    bad_group = Group(representative=bad_a, see_also=[bad_b], recency=datetime.now(UTC))
++    bad_llm_output = (
++        "TITLE: BAD combined\n"
++        "ATTEMPTS:\n"
++        f"- {_FULL_HASH}: 0.42\n"
++        f"- {_FULL_HASH_2}: 0.55\n"
++        "BODY:\n"
++        "Both notes agree.\n"
++    )
++
++    def fake_llm(prompt: str) -> str:
++        if "bad_a.md" in prompt or "bad_b.md" in prompt:
++            return bad_llm_output
++        return ok_llm_output
++
++    real_replace = os.replace
++
++    def failing_replace(src, dst, *args, **kwargs):
++        # Fail moving bad_b.md into note_archive/ specifically -- the
++        # SECOND member of bad_group (representative=bad_a is archived
++        # first, then bad_b fails). Every other os.replace call (including
++        # bad_a's own archive move, the rollback move back, the OK group's
++        # archive/publish, and the final cache write) goes through for real.
++        if Path(src).name == "bad_b.md" and "note_archive" in str(dst):
++            raise OSError("simulated cross-device failure")
++        return real_replace(src, dst, *args, **kwargs)
++
++    monkeypatch.setattr(os, "replace", failing_replace)
++
++    result = run_consolidation_pass(
++        shared_notes_dir,
++        tmp_path,
++        [ok_group, bad_group],
++        llm_call=fake_llm,
++        public_root=public_root,
++    )
++
++    # Does not raise (implicit -- reaching here at all proves it) and DOES
++    # report a consolidation happened, because ok_group succeeded.
++    assert result is True
++
++    # bad_group: rolled back -- both originals back in shared_notes_dir,
++    # nothing published, nothing left in note_archive for this group.
++    assert bad_a.exists()
++    assert bad_b.exists()
++    consolidated_files = {p.name for p in shared_notes_dir.glob("consolidated-*.md")}
++    assert len(consolidated_files) == 1  # only ok_group's
++
++    cache = load_consolidation_cache(public_root)
++    assert len(cache) == 2
++
++    statuses = {entry["status"] for entry in cache.values()}
++    assert statuses == {"consolidated", "failed"}
++    failed_entries = [e for e in cache.values() if e["status"] == "failed"]
++    assert failed_entries[0]["member_relpaths"] == ["bad_a.md", "bad_b.md"]
++    assert failed_entries[0]["note"] is None
++
++    # ok_group's cache entry -- processed BEFORE the failing group -- is
++    # still present and correct after the whole call.
++    consolidated_entries = [e for e in cache.values() if e["status"] == "consolidated"]
++    assert consolidated_entries[0]["member_relpaths"] == ["ok_a.md", "ok_b.md"]
++    assert consolidated_entries[0]["note"] in consolidated_files
++
++
++def test_orchestrator_unreadable_member_skips_group_silently(tmp_path, monkeypatch):
++    public_root, shared_notes_dir = _public_dirs(tmp_path)
++    a = _write_note_file(shared_notes_dir / "a.md", "creator: agent-1\n", body="# A\nBody.\n")
++    b = _write_note_file(shared_notes_dir / "b.md", "creator: agent-2\n", body="# B\nBody.\n")
++    group = Group(representative=b, see_also=[a], recency=datetime.now(UTC))
++
++    monkeypatch.setattr("coral.hub.consolidation._sha256_file", lambda path: None)
++
++    calls: list[str] = []
++
++    def fake_llm(prompt: str) -> str:
++        calls.append(prompt)
++        return "unused"
++
++    result = run_consolidation_pass(
++        shared_notes_dir, tmp_path, [group], llm_call=fake_llm, public_root=public_root
++    )
++
++    assert result is False
++    assert calls == []
++    assert load_consolidation_cache(public_root) == {}
++    assert a.exists()
++    assert b.exists()
++
++
++def test_orchestrator_member_read_text_oserror_skips_group(tmp_path, monkeypatch):
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH, score=0.42))
++    public_root, shared_notes_dir = _public_dirs(tmp_path)
++    a = _write_note_file(
++        shared_notes_dir / "a.md",
++        f"creator: agent-1\nevidence:\n  attempt: {_SHORT_HASH}\n",
++        body="# A\nFinding A.\n",
++    )
++    b = _write_note_file(
++        shared_notes_dir / "b.md",
++        f"creator: agent-1\nevidence:\n  attempt: {_SHORT_HASH}\n",
++        body="# B\nFinding B.\n",
++    )
++    group = Group(representative=b, see_also=[a], recency=datetime.now(UTC))
++
++    real_read_text = Path.read_text
++
++    def fake_read_text(self, *args, **kwargs):
++        if self == b:
++            raise OSError("simulated unreadable member")
++        return real_read_text(self, *args, **kwargs)
++
++    monkeypatch.setattr(Path, "read_text", fake_read_text)
++
++    calls: list[str] = []
++
++    def fake_llm(prompt: str) -> str:
++        calls.append(prompt)
++        return "unused"
++
++    result = run_consolidation_pass(
++        shared_notes_dir, tmp_path, [group], llm_call=fake_llm, public_root=public_root
++    )
++
++    assert result is False
++    assert calls == []
++    assert load_consolidation_cache(public_root) == {}
++    assert a.exists()
++    assert b.exists()
+-- 
+2.45.1.windows.1
+

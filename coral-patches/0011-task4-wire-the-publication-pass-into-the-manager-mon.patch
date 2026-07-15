@@ -1,0 +1,1124 @@
+From 9fe17ae1cab4eba519d9b5825bd504278e3a0bbf Mon Sep 17 00:00:00 2001
+From: Steve <steventhanhtuan@gmail.com>
+Date: Tue, 14 Jul 2026 19:02:38 +0700
+Subject: [PATCH 11/17] task4: wire the publication pass into the manager
+ monitor loop
+
+_run_publication_pass runs each tick after the migration cycle, guarded
+by publication_gate+knowledge, single-island scope, and an mtime+count
+signature so idle ticks cost one stat walk. The pass orchestrates
+publication.py: harvest drafts per agent, verify and stamp shared
+notes, group and rank once, regenerate each agent's views. Errors are
+logged, never fatal to the loop.
+
+Three review-found defects fixed along the way, each with a locked
+regression test:
+- the stored signature is the pre-pass one, so a mid-pass agent write
+  is harvested next tick instead of being masked forever;
+- harvest and view generation now share notes' user-note definition,
+  and worktree seeding symlinks consolidate-owned housekeeping files
+  (_connections.md, _open-questions.md, notes.md, raw/) so aggregates
+  keep vanilla shared-write semantics instead of last-writer-wins;
+- harvest records reconciled hashes into the manifest (persisted before
+  the mirror), so a freshly stamped note settles after one follow-up
+  tick instead of hot-looping the pass every tick.
+
+700 passed, ruff clean.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ coral/agent/manager.py         | 190 ++++++++++++++
+ coral/hub/publication.py       | 161 +++++++++---
+ coral/workspace/worktree.py    |  92 ++++++-
+ tests/test_publication_gate.py | 458 +++++++++++++++++++++++++++++++++
+ 4 files changed, 861 insertions(+), 40 deletions(-)
+
+diff --git a/coral/agent/manager.py b/coral/agent/manager.py
+index 40d5685..b2d7632 100644
+--- a/coral/agent/manager.py
++++ b/coral/agent/manager.py
+@@ -67,6 +67,19 @@ from coral.hub.heartbeat import (
+     write_agent_heartbeat,
+     write_global_heartbeat,
+ )
++from coral.hub.notes import _iter_user_note_files, _parse_frontmatter
++from coral.hub.publication import (
++    Verdict,
++    generate_notes_view,
++    generate_skills_view,
++    group_notes,
++    harvest_drafts,
++    load_manifest,
++    rank_groups,
++    save_manifest,
++    stamp_verdicts,
++    verify_note,
++)
+ from coral.hub.steering import ContinueFromAction, mark_applied, read_pending
+ from coral.template.coral_md import generate_coral_md
+ from coral.types import BUDGET_CLASS_REAL, Attempt, get_budget_class
+@@ -91,6 +104,29 @@ from coral.workspace import (
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _dir_mtime_signature(directory: Path) -> tuple[float, int]:
++    """(max mtime, file count) for every file under ``directory``, recursively.
++
++    Cheap, order-independent proxy for "did anything change" — used by
++    :meth:`AgentManager._publication_pass_signature`. A missing directory
++    signs as ``(0.0, 0)``, distinct from any populated directory's
++    signature (file count >= 1 once anything exists).
++    """
++    if not directory.is_dir():
++        return (0.0, 0)
++    max_mtime = 0.0
++    count = 0
++    for path in directory.rglob("*"):
++        if not path.is_file():
++            continue
++        count += 1
++        try:
++            max_mtime = max(max_mtime, path.stat().st_mtime)
++        except OSError:
++            continue
++    return (max_mtime, count)
++
++
+ class AgentManager:
+     """Manage the lifecycle of multiple CORAL agents."""
+ 
+@@ -181,6 +217,10 @@ class AgentManager:
+         # Each entry: (candidate, reason). Deferred batches retry until they
+         # apply or go stale; paused agents can stay paused for arbitrarily long.
+         self._deferred_candidates: list[tuple[MigrationCandidate, str]] = []
++        # Publication gate (agents.publication_gate). Cheap change-detection
++        # signature from the last completed _run_publication_pass() tick (see
++        # that method) so an unchanged shared/view state is skipped cheaply.
++        self._last_publication_signature: tuple[tuple[float, int], ...] | None = None
+ 
+     def _runtime_for(self, agent_id: str) -> AgentRuntime:
+         """Return the runtime instance for an agent_id, creating one on demand.
+@@ -588,6 +628,7 @@ class AgentManager:
+             shared_dir_name,
+             island_id=island_id,
+             knowledge=self.config.agents.knowledge,
++            publication_gate=self.config.agents.publication_gate,
+         )
+ 
+         # Register agent with gateway if active (before settings so we have the key)
+@@ -1759,6 +1800,149 @@ class AgentManager:
+         )
+         return "\n".join(lines)
+ 
++    # ------------------------------------------------------------------
++    # Publication gate
++    # ------------------------------------------------------------------
++    def _publication_pass_signature(self) -> tuple[tuple[float, int], ...]:
++        """Cheap (max mtime, file count) fingerprint of everything a
++        publication pass reads/writes: the shared notes/attempts dirs plus
++        every live agent's served notes/skills view. Used by
++        :meth:`_run_publication_pass` to skip a tick when nothing moved
++        since the last pass — a full pass parses every note's frontmatter,
++        so this is much cheaper to compute every 5s than the pass itself.
++
++        TODO: the attempts dir signature walks every attempt file in the
++        store (``_dir_mtime_signature`` is a full ``rglob``), so this scan's
++        cost grows with the attempts store's size over a long run. Fine at
++        current scale; revisit (e.g. track a max-mtime cache instead of a
++        fresh walk) if that ever shows up in profiling.
++        """
++        if self.paths is None:
++            return ()
++        state_root = island_root(self.paths.coral_dir, None)
++        dirs = [state_root / "notes", state_root / "attempts"]
++        for handle in self.handles:
++            shared_dir = handle.worktree_path / self._runtime_for(handle.agent_id).shared_dir_name
++            dirs.append(shared_dir / "notes")
++            dirs.append(shared_dir / "skills")
++        return tuple(_dir_mtime_signature(d) for d in dirs)
++
++    def _run_publication_pass(self) -> None:
++        """One publication-gate tick: harvest -> verify/stamp -> group/rank
++        -> regenerate views (see ``coral.hub.publication``'s module
++        docstring for why that order is required).
++
++        No-op unless ``agents.publication_gate`` and ``agents.knowledge``
++        are both on. v1 is single-island only (``islands.count > 1`` skips
++        with a debug log — the harvested notes/skills channel is seeded as
++        real per-worktree directories, and ``repoint_shared_state`` already
++        refuses to repoint a gated real dir across islands). Cheap
++        change-detection (:meth:`_publication_pass_signature`) skips a tick
++        when nothing moved since the last one. The pass body never raises:
++        an exception is logged and the loop continues, so one bad note (or
++        a transient disk hiccup) never takes the monitor loop down with it.
++
++        The stored baseline is the PRE-pass signature — the guard-time
++        signature that triggered this run — not one recomputed after the
++        pass body finishes. Recomputing post-pass would fold this pass's
++        own writes (index.md, stamped frontmatter, ...) into the baseline,
++        permanently masking any agent write that happened to land during
++        the pass window: it would look identical to framework output and
++        never get re-harvested. Storing the pre-pass signature instead
++        means this pass's own writes make the *next* tick's signature
++        differ from the stored baseline, so exactly one extra follow-up
++        pass runs right after any active pass. That follow-up is cheap —
++        harvest and view writes are sha-gated no-ops, stamping is
++        idempotent — and then the signature stabilizes. A genuine mid-pass
++        agent write now differs from the stored (pre-pass) baseline too,
++        so it's harvested on that very next tick instead of being masked.
++        """
++        if not (self.config.agents.publication_gate and self.config.agents.knowledge):
++            return
++        if self.config.islands.count > 1:
++            logger.debug(
++                "Publication gate: multi-island runs are not supported yet "
++                "(v1 is single-island only) -- skipping"
++            )
++            return
++        if self.paths is None:
++            return
++
++        signature = self._publication_pass_signature()
++        if signature == self._last_publication_signature:
++            return
++
++        try:
++            self._do_publication_pass()
++        except Exception as e:
++            logger.exception(f"Publication gate pass failed: {e}")
++        finally:
++            # Store the PRE-pass signature (captured above, before the pass
++            # ran) -- never recompute here. See the docstring for why.
++            self._last_publication_signature = signature
++
++    def _do_publication_pass(self) -> None:
++        """Publication-gate pass body (single island): harvest every live
++        agent's note drafts into shared state, verify + stamp their
++        evidence, group/rank once, then regenerate every live agent's
++        served notes/skills view. Skills have no verify/group/rank step, so
++        :func:`generate_skills_view` harvests and mirrors them in one call
++        (see its docstring) — no separate ``harvest_skills`` call here.
++        """
++        if self.paths is None:
++            raise RuntimeError("run paths are not initialized; start_all() has not run")
++        coral_dir = self.paths.coral_dir
++        public_root = island_root(coral_dir, None)
++        shared_notes_dir = public_root / "notes"
++        shared_skills_dir = public_root / "skills"
++
++        # "live" here means currently-assigned handles (self.handles), not
++        # "process is alive" -- a dead-but-not-yet-reaped agent's view is
++        # still harvested/regenerated this pass.
++        live_agents = [
++            (handle.agent_id, handle.worktree_path, self._runtime_for(handle.agent_id).shared_dir_name)
++            for handle in self.handles
++        ]
++
++        # 1. Harvest agent-authored note drafts into shared state, for every
++        #    live agent, before anything regenerates a view from it.
++        #    harvest_drafts() mutates `manifest` in place with what it just
++        #    reconciled; persist that immediately so step 4's
++        #    generate_notes_view() (a separate call, its own load_manifest())
++        #    sees it -- see coral.hub.publication's module docstring
++        #    (pass-order note) and _harvest_from_view()'s docstring for why
++        #    skipping this turns every stamped note into a permanent false
++        #    "unsynced draft" that gets re-harvested (wiping the stamp) and
++        #    re-stamped every tick forever (Bug 3).
++        for agent_id, worktree_path, shared_dir_name in live_agents:
++            view_notes_dir = worktree_path / shared_dir_name / "notes"
++            manifest = load_manifest(public_root, agent_id, kind="notes")
++            harvest_drafts(view_notes_dir, shared_notes_dir, manifest)
++            save_manifest(public_root, agent_id, manifest, kind="notes")
++
++        # 2. Verify + stamp every shared note's evidence against the attempt
++        #    store, now that this pass's drafts are folded in.
++        note_paths = _iter_user_note_files(shared_notes_dir)
++        notes: list[tuple[Path, dict[str, Any]]] = []
++        verdicts: dict[Path, Verdict] = {}
++        for note_path in note_paths:
++            meta, _ = _parse_frontmatter(note_path.read_text())
++            notes.append((note_path, meta))
++            verdicts[note_path] = verify_note(note_path, coral_dir)
++        stamp_verdicts(shared_notes_dir, verdicts)
++
++        # 3. Group + rank once over the now-harvested, now-stamped notes.
++        groups = group_notes(notes, verdicts, coral_dir=coral_dir)
++        ranked_groups = rank_groups(groups, verdicts)
++
++        # 4. Regenerate every live agent's served view from shared state.
++        for agent_id, worktree_path, shared_dir_name in live_agents:
++            view_dir = worktree_path / shared_dir_name
++            generate_notes_view(
++                view_dir / "notes", shared_notes_dir, public_root, agent_id, verdicts, ranked_groups
++            )
++            generate_skills_view(view_dir / "skills", shared_skills_dir, public_root, agent_id)
++
+     # ------------------------------------------------------------------
+     # Migration
+     # ------------------------------------------------------------------
+@@ -2468,6 +2652,12 @@ class AgentManager:
+             # config off): should_run() short-circuits without scanning disk.
+             self._maybe_run_migration_cycle()
+ 
++            # Publication gate. Cheap when disabled (gate/knowledge off,
++            # multi-island, or nothing changed since the last pass): each
++            # guard short-circuits before touching disk beyond the mtime
++            # signature scan.
++            self._run_publication_pass()
++
+             # Check for dead agents (max-turns exit, crash, etc.)
+             for i, handle in enumerate(self.handles):
+                 if not handle.alive and self._running:
+diff --git a/coral/hub/publication.py b/coral/hub/publication.py
+index 0ac1bdf..da86c18 100644
+--- a/coral/hub/publication.py
++++ b/coral/hub/publication.py
+@@ -31,6 +31,8 @@ from typing import Any, Literal
+ from coral.hub.attempts import _attempts_dir, read_attempt
+ from coral.hub.notes import (
+     UNATTRIBUTED_CREATOR,
++    _is_user_note,
++    _iter_user_note_files,
+     _parse_frontmatter,
+     _parse_note_file,
+     _sort_key,
+@@ -430,12 +432,25 @@ def render_index(ranked_groups: list[Group], verdicts: dict[Path, Verdict], base
+ # stamps, then regenerates each view. A per-agent manifest records what the
+ # framework last wrote so agent writes are never clobbered.
+ #
++# The notes side of this only ever touches USER notes (``coral.hub.notes.
++# _is_user_note``): housekeeping/system entries -- ``notes.md``, any
++# ``_``-prefixed aggregate file (e.g. ``_connections.md``,
++# ``_open-questions.md``), and anything under a top-level ``raw/`` dir --
++# are never harvested, never mirrored into a view, and never pruned/stamped.
++# Under the gate those files are seeded as per-file symlinks into shared
++# state at worktree setup time (``coral.workspace.worktree.
++# setup_shared_state``), so every agent's copy already *is* the one shared
++# file -- exactly the old whole-directory-symlink semantics for that
++# subset, sidestepping the last-writer-wins collision a harvested real copy
++# would otherwise cause.
++#
+ # Pass order (every call site follows this, and the functions below are
+ # designed so calling them in this order is the natural thing to do):
+ #
+ #   1. harvest_drafts() / harvest_skills() - fold agent writes sitting in the
+ #      view into shared state, using the manifest from the *previous* pass to
+-#      tell an agent draft from a framework-written file.
++#      tell an agent draft from a framework-written file. PERSIST the result
++#      (see below) before step 4.
+ #   2. stamp_verdicts()                    - verify_note() + write verdicts
+ #      into the now-current shared notes.
+ #   3. group_notes() / rank_groups()       - cluster + order the (now
+@@ -448,6 +463,29 @@ def render_index(ranked_groups: list[Group], verdicts: dict[Path, Verdict], base
+ # as ground truth and overwrites the view from it, so any agent edit still
+ # sitting only in the view would be lost if harvest hadn't already folded it
+ # into shared state first.
++#
++# Manifest handoff between steps 1 and 4 (Bug 3 fix): harvest_drafts() /
++# harvest_skills() mutate the ``manifest`` dict they're given IN PLACE,
++# recording the hash of every file they just reconciled with shared state
++# (copied, or found already identical there) -- see _harvest_from_view()'s
++# docstring. Step 4's regenerate (via _mirror_into_view()) needs to see
++# that exact hash as its "previous pass" baseline to recognize the view
++# copy as framework-owned-and-unmodified and safely overwrite it with the
++# (possibly just-stamped, step 2) target content. But _mirror_into_view()
++# always does its OWN load_manifest() call rather than accepting a
++# pre-loaded dict -- so if steps 1 and 4 are two different calls (as the
++# notes side is: harvest_drafts() in AgentManager._do_publication_pass()'s
++# step 1, generate_notes_view() in its step 4) or even just two calls
++# inside the same function (as generate_skills_view() below), the harvest
++# step's in-memory mutation MUST be persisted via save_manifest() before
++# the regenerate step's load_manifest() call runs, or it's invisible.
++# Every call site that harvests must therefore call save_manifest() right
++# after harvest, before regenerate: AgentManager._do_publication_pass()
++# does so explicitly between its steps 1 and 4; generate_skills_view()
++# does so internally between its own harvest and mirror calls. Skipping
++# this turns every stamped note into a permanent false "still an unsynced
++# agent draft", which gets re-harvested (silently wiping the stamp) and
++# re-stamped every single tick forever -- the pass never settles.
+ 
+ _MANIFEST_DIR = ".publication"
+ 
+@@ -606,6 +644,34 @@ def _harvest_from_view(
+     to what's in ``shared_dir`` is a no-op — this is what makes harvesting
+     a view that started as a plain copy of shared state a no-op too.
+ 
++    Mutates ``manifest`` IN PLACE (Bug 3 fix): every file inspected here
++    that ends up content-reconciled with ``shared_dir`` this call — both a
++    file actually copied AND a file skipped because ``shared_dir`` already
++    holds identical (post-transform) content — gets ``manifest[rel]`` set
++    to ``current_hash``, the sha256 of the view file's raw, PRE-transform,
++    current on-disk bytes. That's the exact value a same-pass
++    :func:`_mirror_into_view` call needs as ``prev_hash`` to recognize this
++    file as framework-owned-and-unmodified-since-harvest and legitimately
++    overwrite it with the (possibly just-stamped) target content. Without
++    this, the view copy would look like it diverged from every candidate
++    hash (data changed underneath it between harvest and mirror, from this
++    same pass's stamping) and would be left alone forever — and the next
++    pass's harvest, still seeing no manifest entry, would re-harvest the
++    untouched, now-stale view copy right back over shared state, silently
++    wiping whatever verify/stamp just wrote and looping forever. A file
++    skipped because it already matched ``manifest`` (framework-owned,
++    genuinely unmodified) is left alone — its entry is already correct.
++    An unreadable file (``current_hash is None``) is skipped without being
++    recorded.
++
++    This mutation is only visible to callers holding a reference to the
++    same ``manifest`` object in memory. A caller whose next read of this
++    agent's manifest goes through a *separate* :func:`load_manifest` call
++    (rather than reusing this same dict) must persist the mutation first
++    via :func:`save_manifest` — see :func:`generate_skills_view` and
++    ``AgentManager._do_publication_pass`` for the two call sites that do,
++    and the module docstring's pass-order note above for why.
++
+     Returns the view-relative POSIX paths actually written.
+     """
+     view_dir = Path(view_dir)
+@@ -617,8 +683,10 @@ def _harvest_from_view(
+     for path in sorted(p for p in view_dir.rglob(glob) if p.is_file() and not exclude(p)):
+         rel = path.relative_to(view_dir).as_posix()
+         current_hash = _sha256_file(path)
+-        if current_hash is None or manifest.get(rel) == current_hash:
+-            continue  # framework-owned and unmodified, or unreadable
++        if current_hash is None:
++            continue  # unreadable
++        if manifest.get(rel) == current_hash:
++            continue  # framework-owned and unmodified -- manifest entry already correct
+ 
+         try:
+             data = path.read_bytes()
+@@ -628,9 +696,11 @@ def _harvest_from_view(
+             data = transform(data)
+         dest = shared_dir / rel
+         if dest.exists() and _sha256_file(dest) == _sha256_bytes(data):
+-            continue  # already identical in shared -> no-op
++            manifest[rel] = current_hash  # already identical in shared -> reconciled, no write needed
++            continue
+ 
+         _atomic_write_bytes(dest, data)
++        manifest[rel] = current_hash
+         harvested.append(rel)
+ 
+     return harvested
+@@ -641,21 +711,35 @@ def harvest_drafts(
+ ) -> list[str]:
+     """Copy agent-authored/modified notes from the view into shared state.
+ 
+-    :func:`_harvest_from_view` wrapper: ``*.md`` only, ``index.md`` always
+-    excluded (it's generated — see :func:`render_index`), and the
+-    framework-appended see-also stub stripped from a draft's content
++    :func:`_harvest_from_view` wrapper: ``*.md`` only, and only *user* notes
++    (:func:`coral.hub.notes._is_user_note`, evaluated relative to
++    ``view_dir`` since the view mirrors ``shared_notes_dir``'s structure
++    file-for-file) -- this excludes ``index.md`` (generated, see
++    :func:`render_index`) along with every other housekeeping entry
++    (``notes.md``, ``_``-prefixed aggregates, top-level ``raw/``). Those are
++    seeded as per-file symlinks into shared state at worktree setup time
++    (``coral.workspace.worktree.setup_shared_state``), so an agent's edit to
++    one is already a write to the shared file directly -- harvesting it here
++    too would collide two agents' real copies via last-writer-wins. The
++    framework-appended see-also stub is stripped from a draft's content
+     before it's compared/written (see :func:`strip_see_also_stub`).
++
++    Mutates ``manifest`` in place with every reconciled file's hash -- see
++    :func:`_harvest_from_view`'s docstring for the exact contract and why
++    it matters. The caller (``AgentManager._do_publication_pass``) persists
++    it via :func:`save_manifest` right after this call.
+     """
+ 
+     def _strip(data: bytes) -> bytes:
+         return strip_see_also_stub(data.decode("utf-8")).encode("utf-8")
+ 
++    view_dir = Path(view_dir)
+     return _harvest_from_view(
+         view_dir,
+         shared_notes_dir,
+         manifest,
+         glob="*.md",
+-        exclude=lambda p: p.name == "index.md",
++        exclude=lambda p: not _is_user_note(p, view_dir),
+         transform=_strip,
+     )
+ 
+@@ -839,14 +923,21 @@ def generate_notes_view(
+     note above); ``verdicts``/``ranked_groups`` are their output, and
+     ``shared_notes_dir`` is treated as ground truth.
+ 
+-    Assembles a verbatim-copy content map of every ``*.md`` under
+-    ``shared_notes_dir`` — except a group representative, which gets the
+-    see-also stub appended (see :func:`strip_see_also_stub`), linking its
+-    group's other members by path relative to ``view_dir`` — and passes
+-    the generated ``index.md`` (:func:`render_index`, in ``ranked_groups``
+-    order — call :func:`rank_groups` first) through as
+-    :func:`_mirror_into_view`'s ``unconditional`` entry. See that
+-    function's docstring for the write/guard/prune/manifest contract.
++    Assembles a verbatim-copy content map of every *user note*
++    (:func:`coral.hub.notes._is_user_note`, via :func:`_iter_user_note_files`)
++    under ``shared_notes_dir`` — except a group representative, which gets
++    the see-also stub appended (see :func:`strip_see_also_stub`), linking
++    its group's other members by path relative to ``view_dir`` — plus the
++    generated ``index.md`` (:func:`render_index`, in ``ranked_groups``
++    order — call :func:`rank_groups` first), passed through as
++    :func:`_mirror_into_view`'s ``unconditional`` entry. Housekeeping
++    entries (``notes.md``, ``_``-prefixed aggregates, top-level ``raw/``)
++    are excluded from this mirrored set entirely — never written here,
++    never pruned, never see-also-stubbed. They're served instead via the
++    per-file symlinks into shared state that ``coral.workspace.worktree.
++    setup_shared_state`` seeds at worktree setup time, so every agent's
++    view already *is* the one shared file for those. See that function's
++    docstring for the write/guard/prune/manifest contract.
+     """
+     view_dir = Path(view_dir)
+     shared_notes_dir = Path(shared_notes_dir)
+@@ -876,19 +967,16 @@ def generate_notes_view(
+             rep_links[rep_rel] = links
+ 
+     files: dict[str, bytes] = {}
+-    if shared_notes_dir.is_dir():
+-        for src in sorted(shared_notes_dir.rglob("*.md")):
+-            if not src.is_file():
+-                continue
+-            rel = src.relative_to(shared_notes_dir).as_posix()
+-            try:
+-                content = src.read_text()
+-            except OSError:
+-                continue
+-            links = rep_links.get(rel)
+-            if links:
+-                content = _append_see_also_stub(content, links)
+-            files[rel] = content.encode("utf-8")
++    for src in _iter_user_note_files(shared_notes_dir):
++        rel = src.relative_to(shared_notes_dir).as_posix()
++        try:
++            content = src.read_text()
++        except OSError:
++            continue
++        links = rep_links.get(rel)
++        if links:
++            content = _append_see_also_stub(content, links)
++        files[rel] = content.encode("utf-8")
+ 
+     # base_dir=shared_notes_dir (not view_dir): the view mirrors
+     # shared_notes_dir's relative structure file-for-file, so the two
+@@ -909,6 +997,12 @@ def harvest_skills(
+     :func:`_harvest_from_view` wrapper: every file, recursively, no
+     exclusion or transform — neither ``index.md`` nor the see-also stub
+     concept applies to skills.
++
++    Mutates ``manifest`` in place with every reconciled file's hash -- see
++    :func:`_harvest_from_view`'s docstring for the exact contract and why
++    it matters. :func:`generate_skills_view` (the only caller) persists it
++    via :func:`save_manifest` right after this call, before its own
++    :func:`_mirror_into_view` call reloads it.
+     """
+     return _harvest_from_view(view_skills_dir, shared_skills_dir, manifest, glob="*")
+ 
+@@ -927,6 +1021,14 @@ def generate_skills_view(
+     back into ``view_skills_dir`` verbatim (every file, no ``unconditional``
+     entry).
+ 
++    ``harvest_skills`` mutates its ``manifest`` dict in place with what it
++    reconciled (see its docstring / Bug 3 fix), but ``_mirror_into_view``
++    reloads the manifest itself via its own :func:`load_manifest` call
++    rather than reusing this in-memory dict -- so the mutation is persisted
++    via :func:`save_manifest` here, between the two calls, or it would be
++    invisible to the mirror step and this pass's harvested/reconciled files
++    would look unsynced forever (see the module docstring's pass-order note).
++
+     Returns the view-relative POSIX paths harvested into shared state.
+     """
+     view_skills_dir = Path(view_skills_dir)
+@@ -936,6 +1038,7 @@ def generate_skills_view(
+ 
+     manifest = load_manifest(public_root, agent_id, kind="skills")
+     harvested = harvest_skills(view_skills_dir, shared_skills_dir, manifest)
++    save_manifest(public_root, agent_id, manifest, kind="skills")
+ 
+     files: dict[str, bytes] = {}
+     for src in sorted(p for p in shared_skills_dir.rglob("*") if p.is_file()):
+diff --git a/coral/workspace/worktree.py b/coral/workspace/worktree.py
+index 5a2fb91..c2f9476 100644
+--- a/coral/workspace/worktree.py
++++ b/coral/workspace/worktree.py
+@@ -190,16 +190,31 @@ def setup_shared_state(
+ 
+     With ``publication_gate=True`` (and ``knowledge=True``), ``notes/`` and
+     ``skills/`` are *not* symlinked. Instead each is created as a real
+-    directory in the worktree, seeded with a verbatim recursive copy of the
+-    current shared-state content. This mirrors the first-run migration
+-    semantics of ``coral.hub.publication``: the agent's view starts
+-    byte-identical to shared state, so the first harvest pass sees no diff
+-    and is a no-op. Every other ``_SHARED_STATE_ITEMS`` entry is still
+-    symlinked exactly as when the gate is off — this is v1 of the gate,
+-    scoped to the notes/skills channel only. When ``publication_gate=False``
+-    (the default), behavior is byte-identical to pre-gate code: this is the
+-    experiment's control arm. ``knowledge=False`` always wins over the gate
+-    (no notes/skills of either kind get created at all).
++    directory in the worktree, seeded from the current shared-state content
++    (see :func:`_seed_gated_notes_dir` for ``notes/``'s per-file split;
++    ``skills/`` has no housekeeping-file concept, so it's a verbatim
++    ``shutil.copytree``). This mirrors the first-run migration semantics of
++    ``coral.hub.publication``: the agent's view starts content-identical to
++    shared state, so the first harvest pass sees no diff and is a no-op.
++    ``notes/`` seeding is per-entry: ordinary user notes
++    (``coral.hub.notes._is_user_note``) are seeded as real file copies (the
++    agent's draft copy, harvested/regenerated each publication pass), while
++    housekeeping entries present at setup time — ``notes.md``, any
++    ``_``-prefixed aggregate file, and a top-level ``raw/`` dir — are seeded
++    as per-file (or per-dir, for ``raw/``) symlinks into shared state
++    instead, preserving vanilla shared-write semantics for those
++    consolidate-owned aggregates: every agent's ``_connections.md`` is the
++    literal same shared file, exactly as under the old whole-directory
++    symlink. Known limitation (gate v1): a *new* housekeeping file an agent
++    creates after this setup call has no shared counterpart yet to symlink
++    to, so it stays local to that agent rather than becoming shared —
++    vanilla (non-gated) mode would have shared it immediately. Every other
++    ``_SHARED_STATE_ITEMS`` entry is still symlinked exactly as when the
++    gate is off — this is v1 of the gate, scoped to the notes/skills
++    channel only. When ``publication_gate=False`` (the default), behavior
++    is byte-identical to pre-gate code: this is the experiment's control
++    arm. ``knowledge=False`` always wins over the gate (no notes/skills of
++    either kind get created at all).
+ 
+     Self-heal: if a prior run (gate off, or an earlier pass before the gate
+     turned on) left ``notes/``/``skills/`` as a symlink and the gate is now
+@@ -248,7 +263,13 @@ def setup_shared_state(
+                 dst.unlink()
+             if not dst.exists():
+                 src.mkdir(parents=True, exist_ok=True)
+-                shutil.copytree(src, dst)
++                if item == "notes":
++                    # Per-entry split: user notes copied, housekeeping
++                    # entries symlinked -- see _seed_gated_notes_dir.
++                    _seed_gated_notes_dir(src, dst)
++                else:
++                    # skills/ has no housekeeping-file concept -- verbatim.
++                    shutil.copytree(src, dst)
+             # else: already a real directory (this worktree was already
+             # gated) -- never touch it again, it may hold agent drafts not
+             # yet harvested.
+@@ -326,6 +347,55 @@ _SHARED_STATE_ITEMS: tuple[str, ...] = (
+ _PUBLICATION_GATE_ITEMS: frozenset[str] = frozenset({"notes", "skills"})
+ 
+ 
++def _seed_gated_notes_dir(src: Path, dst: Path) -> None:
++    """Seed a gated agent's ``notes/`` view (``publication_gate=True``) from shared state.
++
++    Called once, when ``dst`` doesn't exist yet (see the call site in
++    :func:`setup_shared_state`) -- ``src`` is the shared-state notes dir for
++    this island, already guaranteed to exist.
++
++    Per top-level entry in ``src``:
++
++    - A **user note** (``coral.hub.notes._is_user_note`` -- an ordinary
++      note file, or any subdirectory other than ``raw/``) is copied as a
++      real file/dir: the agent's local draft copy, harvested into shared
++      state and the view regenerated from it on each publication pass (see
++      ``coral.hub.publication``).
++    - A **housekeeping** entry (``notes.md``, any ``_``-prefixed aggregate
++      file, or the top-level ``raw/`` dir) is instead symlinked, per-entry,
++      straight into shared state -- so every agent keeps writing the SAME
++      shared file for these consolidate-owned aggregates, exactly the old
++      whole-directory-symlink semantics for that subset. This matters
++      because the publication pass never harvests housekeeping entries (see
++      ``coral.hub.publication.harvest_drafts``): a real per-agent copy would
++      silently diverge and collide via last-writer-wins the moment two
++      agents both touched it.
++
++    Known limitation (gate v1): a housekeeping file an agent creates
++    *after* this call (e.g. a brand-new ``_new-aggregate.md``) has no
++    shared counterpart yet to symlink to, so it stays a real, agent-local
++    file rather than becoming shared -- vanilla (non-gated) mode would have
++    shared it immediately, since ``notes/`` there is one directory symlink
++    covering any new file.
++    """
++    from coral.hub.notes import _is_user_note
++
++    dst.mkdir(parents=True, exist_ok=True)
++    for entry in sorted(src.iterdir()):
++        target = dst / entry.name
++        if _is_user_note(entry, src):
++            if entry.is_dir():
++                shutil.copytree(entry, target)
++            else:
++                shutil.copy2(entry, target)
++            continue
++        try:
++            rel = os.path.relpath(entry.resolve(), dst.resolve())
++            target.symlink_to(rel)
++        except (ValueError, OSError):
++            target.symlink_to(entry.resolve())
++
++
+ def repoint_shared_state(
+     worktree_path: Path,
+     coral_dir: Path,
+diff --git a/tests/test_publication_gate.py b/tests/test_publication_gate.py
+index 5770d0a..62acf19 100644
+--- a/tests/test_publication_gate.py
++++ b/tests/test_publication_gate.py
+@@ -1519,3 +1519,461 @@ def test_publication_gate_on_rerun_preserves_existing_real_dir_and_drafts(tmp_pa
+     assert notes_dir.is_dir() and not notes_dir.is_symlink()
+     assert draft.read_text() == "agent draft, not yet harvested\n"
+     assert (notes_dir / "note.md").read_text() == (public / "notes" / "note.md").read_text()
++
++
++# --------------------------------------------------------------------------- #
++# Bug 2 regression: housekeeping entries seed as per-file symlinks, not      #
++# real per-agent copies (harvest never ingests them -- see notes._is_user_note)#
++# --------------------------------------------------------------------------- #
++
++
++def test_publication_gate_seeds_housekeeping_entries_as_symlinks_user_notes_as_copies(tmp_path):
++    """``notes.md``, any ``_``-prefixed aggregate, and a top-level ``raw/``
++    dir are consolidate-owned housekeeping the publication pass never
++    harvests (``coral.hub.notes._is_user_note``) -- they must seed as
++    per-entry symlinks into shared state, not real per-agent copies that
++    would silently diverge and collide via last-writer-wins. Ordinary user
++    notes still seed as real copies."""
++    coral_dir = tmp_path / ".coral"
++    public = coral_dir / "public"
++    _seed_state_root(public)
++    (public / "notes" / "_connections.md").write_text("# Connections\nshared aggregate\n")
++    (public / "notes" / "notes.md").write_text("legacy single-file notes\n")
++    (public / "notes" / "raw").mkdir()
++    (public / "notes" / "raw" / "capture.md").write_text("raw capture\n")
++    worktree = tmp_path / "worktree"
++    worktree.mkdir()
++
++    setup_shared_state(worktree, coral_dir, ".claude", knowledge=True, publication_gate=True)
++
++    notes_dir = worktree / ".claude" / "notes"
++    assert notes_dir.is_dir() and not notes_dir.is_symlink()
++
++    # User note: real copy.
++    assert (notes_dir / "note.md").is_file() and not (notes_dir / "note.md").is_symlink()
++
++    # Housekeeping: per-entry symlinks straight into shared state.
++    assert (notes_dir / "_connections.md").is_symlink()
++    assert (notes_dir / "_connections.md").resolve() == (public / "notes" / "_connections.md").resolve()
++    assert (notes_dir / "notes.md").is_symlink()
++    assert (notes_dir / "notes.md").resolve() == (public / "notes" / "notes.md").resolve()
++    assert (notes_dir / "raw").is_symlink()
++    assert (notes_dir / "raw").resolve() == (public / "notes" / "raw").resolve()
++
++
++# --------------------------------------------------------------------------- #
++# Task 9 — manager wiring (AgentManager._run_publication_pass)                #
++# --------------------------------------------------------------------------- #
++
++
++def _make_manager(
++    tmp_path: Path,
++    *,
++    publication_gate: bool,
++    knowledge: bool = True,
++    islands_count: int = 1,
++):
++    """A real ``AgentManager`` (mirrors test_manager_reliability.py's
++    ``test_monitor_loop_stall_watchdog_does_not_crash_multi_island`` pattern)
++    with 2 agents, but no live subprocess -- ``paths``/``handles`` are set
++    directly rather than going through ``start_all()``."""
++    from coral.agent.manager import AgentManager
++    from coral.workspace.project import ProjectPaths
++
++    cfg = CoralConfig.from_dict(
++        {
++            "task": {"name": "t", "description": "d"},
++            "agents": {
++                "count": 2,
++                "timeout": 1,
++                "publication_gate": publication_gate,
++                "knowledge": knowledge,
++            },
++            "islands": {"count": islands_count},
++        }
++    )
++    mgr = AgentManager(cfg)
++    coral_dir = tmp_path / ".coral"
++    mgr.paths = ProjectPaths(
++        results_dir=tmp_path,
++        task_dir=tmp_path,
++        run_dir=tmp_path,
++        coral_dir=coral_dir,
++        agents_dir=tmp_path / "agents",
++        repo_dir=tmp_path / "repo",
++    )
++    return mgr, coral_dir
++
++
++def _make_handle(agent_id: str, worktree_path: Path, log_path: Path):
++    from coral.agent.runtime import AgentHandle
++
++    worktree_path.mkdir(parents=True, exist_ok=True)
++    return AgentHandle(agent_id=agent_id, process=None, worktree_path=worktree_path, log_path=log_path)
++
++
++def test_run_publication_pass_gate_on_harvests_verifies_and_regenerates_views(tmp_path):
++    """End-to-end wiring: a real scored attempt plus a note citing it, sitting
++    as an agent-authored draft in one agent's served view, gets harvested
++    into shared state, verified + stamped, and both agents' regenerated
++    views carry the ranked note plus a generated index."""
++    mgr, coral_dir = _make_manager(tmp_path, publication_gate=True)
++    agent1_id, agent2_id = (s.agent_id for s in mgr.specs)
++
++    (coral_dir / "public" / "notes").mkdir(parents=True)
++    (coral_dir / "public" / "attempts").mkdir(parents=True)
++
++    commit_hash = "a" * 40
++    write_attempt(
++        coral_dir,
++        Attempt(
++            commit_hash=commit_hash,
++            agent_id=agent1_id,
++            title="did a thing",
++            score=0.42,
++            status="improved",
++            parent_hash=None,
++            timestamp="2026-03-14T17:00:00-00:00",
++        ),
++    )
++
++    agent1_worktree = tmp_path / "agents" / agent1_id
++    agent2_worktree = tmp_path / "agents" / agent2_id
++    mgr.handles = [
++        _make_handle(agent1_id, agent1_worktree, tmp_path / "a1.log"),
++        _make_handle(agent2_id, agent2_worktree, tmp_path / "a2.log"),
++    ]
++    for wt in (agent1_worktree, agent2_worktree):
++        (wt / ".claude" / "notes").mkdir(parents=True)
++        (wt / ".claude" / "skills").mkdir(parents=True)
++
++    note_path = agent1_worktree / ".claude" / "notes" / "finding.md"
++    note_path.write_text(
++        "---\n"
++        f"creator: {agent1_id}\n"
++        "evidence:\n"
++        f"  attempt: {commit_hash[:12]}\n"
++        '  score: "0.4200"\n'
++        "---\n\n# Finding\nA shared finding.\n"
++    )
++
++    mgr._run_publication_pass()
++
++    shared_note = coral_dir / "public" / "notes" / "finding.md"
++    assert shared_note.is_file()
++    assert "coral_verified: true" in shared_note.read_text()
++
++    for wt in (agent1_worktree, agent2_worktree):
++        index_text = (wt / ".claude" / "notes" / "index.md").read_text()
++        assert "Finding" in index_text
++        assert "verified/high" in index_text
++
++
++def test_run_publication_pass_gate_off_is_a_full_noop(tmp_path):
++    """Gate off: the very first guard returns before touching disk at all --
++    no ``.coral/public/`` gets created, and the agent's view is untouched."""
++    mgr, coral_dir = _make_manager(tmp_path, publication_gate=False)
++    agent1_id = mgr.specs[0].agent_id
++    worktree = tmp_path / "agents" / agent1_id
++    mgr.handles = [_make_handle(agent1_id, worktree, tmp_path / "a1.log")]
++    (worktree / ".claude" / "notes").mkdir(parents=True)
++    (worktree / ".claude" / "skills").mkdir(parents=True)
++
++    mgr._run_publication_pass()
++
++    assert not (coral_dir / "public").exists()
++    assert list((worktree / ".claude" / "notes").iterdir()) == []
++    assert list((worktree / ".claude" / "skills").iterdir()) == []
++
++
++def test_run_publication_pass_stabilizes_after_one_follow_up_pass(tmp_path, monkeypatch):
++    """Change-detection stores the PRE-pass signature (the guard-time
++    signature that triggered the run), not one recomputed after the pass
++    body finishes (see _run_publication_pass's docstring / Bug 1 fix). A
++    consequence: a pass's own writes (index.md, manifests, ...) make the
++    very next tick's signature differ from that stored baseline, so exactly
++    one follow-up pass runs right after any active pass. Once that
++    follow-up's writes stop changing anything, the signature stabilizes and
++    a third call short-circuits without re-entering the pass body.
++
++    This covers the empty-notes case; see
++    ``test_run_publication_pass_settles_after_one_follow_up_with_a_real_note``
++    for the same settling behavior with a real user note in play (which also
++    exercises the Bug 3 harvest-manifest-reconciliation fix -- without it,
++    a real note never settles at all)."""
++    mgr, coral_dir = _make_manager(tmp_path, publication_gate=True)
++    agent1_id = mgr.specs[0].agent_id
++    worktree = tmp_path / "agents" / agent1_id
++    mgr.handles = [_make_handle(agent1_id, worktree, tmp_path / "a1.log")]
++    (coral_dir / "public" / "notes").mkdir(parents=True)
++    (coral_dir / "public" / "attempts").mkdir(parents=True)
++    (worktree / ".claude" / "notes").mkdir(parents=True)
++    (worktree / ".claude" / "skills").mkdir(parents=True)
++
++    mgr._run_publication_pass()  # first call: runs the real (empty) pass
++    signature_after_first_call = mgr._last_publication_signature
++    assert signature_after_first_call is not None
++
++    calls: list[int] = []
++    monkeypatch.setattr(mgr, "_do_publication_pass", lambda: calls.append(1))
++
++    mgr._run_publication_pass()  # second call: the first pass's own writes
++    # (e.g. the view's generated index.md) changed the signature -> the
++    # guard does NOT short-circuit; exactly one follow-up pass runs.
++    assert calls == [1]
++    signature_after_second_call = mgr._last_publication_signature
++    assert signature_after_second_call != signature_after_first_call
++
++    mgr._run_publication_pass()  # third call: the (stubbed, no-op) follow-up
++    # changed nothing on disk -> now it genuinely short-circuits.
++    assert calls == [1]
++    assert mgr._last_publication_signature == signature_after_second_call
++
++
++def test_run_publication_pass_settles_after_one_follow_up_with_a_real_note(tmp_path, monkeypatch):
++    """Bug 3 regression (reviewer-reproduced hot loop, 14+ consecutive
++    passes): once a real user note exists, harvest must record what it
++    reconciled (:func:`coral.hub.publication._harvest_from_view`'s
++    in-place manifest mutation, persisted via ``save_manifest`` before the
++    same pass's regenerate step) or the freshly-stamped shared copy looks
++    like a still-unsynced draft forever -- re-harvested every tick (wiping
++    the stamp), re-stamped, mtimes advance, the pre-pass signature never
++    stabilizes, and the full pass body runs on every monitor tick forever.
++
++    With the fix: one active pass, exactly one cheap follow-up, then stable
++    forever -- the stamp is never wiped or re-timestamped, the note lands
++    in the agent's manifest, and the agent's own view ends up holding the
++    stamped copy (not the pristine draft)."""
++    mgr, coral_dir = _make_manager(tmp_path, publication_gate=True)
++    agent1_id = mgr.specs[0].agent_id
++    worktree = tmp_path / "agents" / agent1_id
++    mgr.handles = [_make_handle(agent1_id, worktree, tmp_path / "a1.log")]
++    (coral_dir / "public" / "notes").mkdir(parents=True)
++    (coral_dir / "public" / "attempts").mkdir(parents=True)
++    (worktree / ".claude" / "notes").mkdir(parents=True)
++    (worktree / ".claude" / "skills").mkdir(parents=True)
++
++    view_note = worktree / ".claude" / "notes" / "finding.md"
++    view_note.write_text("---\ncreator: agent-1\n---\n\n# Finding\nA real, agent-authored note.\n")
++
++    calls: list[int] = []
++    real_do_pass = mgr._do_publication_pass
++
++    def _counting_do_pass():
++        calls.append(1)
++        real_do_pass()
++
++    monkeypatch.setattr(mgr, "_do_publication_pass", _counting_do_pass)
++
++    for _ in range(5):
++        mgr._run_publication_pass()
++
++    # (a) exactly one active pass + one follow-up -- every tick after that
++    # short-circuits at the signature guard, forever (not a hot loop).
++    assert len(calls) == 2
++
++    shared_note = coral_dir / "public" / "notes" / "finding.md"
++    meta_after_settle, _ = _parse_frontmatter(shared_note.read_text())
++    assert "coral_checked_at" in meta_after_settle
++    checked_at_after_settle = meta_after_settle["coral_checked_at"]
++
++    for _ in range(3):  # a few more ticks: must stay perfectly stable
++        mgr._run_publication_pass()
++    assert len(calls) == 2  # still no additional pass body invocations
++
++    # (b) the stamp is never wiped or re-timestamped by a later tick.
++    meta_still, _ = _parse_frontmatter(shared_note.read_text())
++    assert meta_still["coral_checked_at"] == checked_at_after_settle
++
++    # (c) the note landed in the agent's manifest.
++    manifest = load_manifest(coral_dir / "public", agent1_id, kind="notes")
++    assert "finding.md" in manifest
++
++    # (d) the agent's own view copy ends up holding the stamped version,
++    # not the pristine pre-stamp draft.
++    view_text = view_note.read_text()
++    assert "coral_checked_at" in view_text
++    assert "coral_confidence" in view_text
++
++
++def test_mid_pass_agent_write_is_harvested_on_the_next_tick(tmp_path, monkeypatch):
++    """Bug 1 regression: an agent write that lands during the pass window --
++    after this tick's guard signature was captured, but before the pass
++    body finishes -- must not be folded into the stored (pre-pass)
++    baseline. It's invisible to *this* tick's harvest (which already ran
++    before the write landed), but it must not be masked forever: because
++    the stored baseline is the PRE-pass signature, the next tick's disk
++    state differs from it and the write is harvested then."""
++    mgr, coral_dir = _make_manager(tmp_path, publication_gate=True)
++    agent1_id = mgr.specs[0].agent_id
++    worktree = tmp_path / "agents" / agent1_id
++    mgr.handles = [_make_handle(agent1_id, worktree, tmp_path / "a1.log")]
++    (coral_dir / "public" / "notes").mkdir(parents=True)
++    (coral_dir / "public" / "attempts").mkdir(parents=True)
++    (worktree / ".claude" / "notes").mkdir(parents=True)
++    (worktree / ".claude" / "skills").mkdir(parents=True)
++
++    mid_pass_note = worktree / ".claude" / "notes" / "mid-pass.md"
++    real_generate_notes_view = generate_notes_view
++
++    def _write_mid_pass_note_at_end(*args, **kwargs):
++        result = real_generate_notes_view(*args, **kwargs)
++        mid_pass_note.write_text(
++            "---\ncreator: agent-1\n---\n\n# Mid-pass\nWritten during the pass body.\n"
++        )
++        return result
++
++    monkeypatch.setattr("coral.agent.manager.generate_notes_view", _write_mid_pass_note_at_end)
++
++    mgr._run_publication_pass()  # tick 1: writes mid_pass_note at the END of the pass body
++
++    shared_mid_pass_note = coral_dir / "public" / "notes" / "mid-pass.md"
++    assert mid_pass_note.exists()
++    # Not harvested THIS tick -- it landed after this tick's harvest step ran.
++    assert not shared_mid_pass_note.exists()
++
++    monkeypatch.undo()  # restore the real generate_notes_view for tick 2
++
++    mgr._run_publication_pass()  # tick 2 must not be short-circuited/masked
++
++    assert shared_mid_pass_note.is_file()
++    assert "Written during the pass body" in shared_mid_pass_note.read_text()
++
++
++def test_run_publication_pass_swallows_exceptions(tmp_path, monkeypatch, caplog):
++    """An exception raised deep in the pass body (here: view regeneration)
++    must be logged, never propagate out of _run_publication_pass."""
++    mgr, coral_dir = _make_manager(tmp_path, publication_gate=True)
++    agent1_id = mgr.specs[0].agent_id
++    worktree = tmp_path / "agents" / agent1_id
++    mgr.handles = [_make_handle(agent1_id, worktree, tmp_path / "a1.log")]
++    (coral_dir / "public" / "notes").mkdir(parents=True)
++    (coral_dir / "public" / "attempts").mkdir(parents=True)
++    (worktree / ".claude" / "notes").mkdir(parents=True)
++    (worktree / ".claude" / "skills").mkdir(parents=True)
++
++    def _boom(*args, **kwargs):
++        raise RuntimeError("boom")
++
++    monkeypatch.setattr("coral.agent.manager.generate_notes_view", _boom)
++
++    with caplog.at_level(logging.ERROR):
++        mgr._run_publication_pass()  # must not raise
++
++    assert any("Publication gate pass failed" in record.message for record in caplog.records)
++
++
++# --------------------------------------------------------------------------- #
++# Bug 2 regression: full-pass end-to-end -- housekeeping stays a shared      #
++# symlink and is never harvested, stamped, or pruned                        #
++# --------------------------------------------------------------------------- #
++
++
++def test_housekeeping_symlink_shared_across_agents_and_untouched_by_pass(tmp_path):
++    """A housekeeping aggregate (e.g. ``_connections.md``) is seeded as a
++    per-file symlink into shared state for every agent -- so an edit
++    through one agent's view is immediately visible through another
++    agent's view (same shared file, no pass required), and a full
++    publication pass leaves it completely alone afterwards: not harvested,
++    not stamped, not pruned, still a symlink in both views."""
++    mgr, coral_dir = _make_manager(tmp_path, publication_gate=True)
++    agent1_id, agent2_id = (s.agent_id for s in mgr.specs)
++
++    public = coral_dir / "public"
++    (public / "notes").mkdir(parents=True)
++    (public / "attempts").mkdir(parents=True)
++    (public / "skills").mkdir(parents=True)
++    (public / "notes" / "_connections.md").write_text("# Connections\ninitial\n")
++
++    agent1_worktree = tmp_path / "agents" / agent1_id
++    agent2_worktree = tmp_path / "agents" / agent2_id
++    for wt in (agent1_worktree, agent2_worktree):
++        wt.mkdir(parents=True)
++        setup_shared_state(wt, coral_dir, ".claude", knowledge=True, publication_gate=True)
++
++    mgr.handles = [
++        _make_handle(agent1_id, agent1_worktree, tmp_path / "a1.log"),
++        _make_handle(agent2_id, agent2_worktree, tmp_path / "a2.log"),
++    ]
++
++    agent1_connections = agent1_worktree / ".claude" / "notes" / "_connections.md"
++    agent2_connections = agent2_worktree / ".claude" / "notes" / "_connections.md"
++    assert agent1_connections.is_symlink()
++    assert agent2_connections.is_symlink()
++
++    # Agent 1 appends through its own view.
++    with agent1_connections.open("a") as f:
++        f.write("agent-1's addition\n")
++
++    # Same shared file -- agent 2's view sees the edit immediately, no pass
++    # required, and the shared copy carries it too.
++    assert agent2_connections.read_text() == agent1_connections.read_text()
++    assert (public / "notes" / "_connections.md").read_text() == agent1_connections.read_text()
++    assert "agent-1's addition" in agent2_connections.read_text()
++
++    mgr._run_publication_pass()
++
++    # Untouched by the pass: no coral_* stamp fields, not in either agent's
++    # notes manifest, still a symlink in both views.
++    final_content = (public / "notes" / "_connections.md").read_text()
++    assert "coral_verified" not in final_content
++    assert "coral_confidence" not in final_content
++    assert "coral_checked_at" not in final_content
++    assert agent1_connections.is_symlink()
++    assert agent2_connections.is_symlink()
++
++    manifest1 = load_manifest(public, agent1_id, kind="notes")
++    manifest2 = load_manifest(public, agent2_id, kind="notes")
++    assert "_connections.md" not in manifest1
++    assert "_connections.md" not in manifest2
++
++
++def test_raw_dir_and_notes_md_never_manifested_stamped_or_pruned(tmp_path):
++    """A top-level ``raw/`` dir and the legacy ``notes.md`` file are
++    consolidate-owned housekeeping, not user notes -- neither ever lands in
++    a view manifest, gets stamped, or gets pruned by a publication pass.
++    Both stay symlinks, consistent with the seeding rule, across a full
++    pass that also processes a genuine user note normally."""
++    mgr, coral_dir = _make_manager(tmp_path, publication_gate=True)
++    agent1_id = mgr.specs[0].agent_id
++
++    public = coral_dir / "public"
++    (public / "notes").mkdir(parents=True)
++    (public / "attempts").mkdir(parents=True)
++    (public / "skills").mkdir(parents=True)
++    (public / "notes" / "notes.md").write_text("legacy single-file notes\n")
++    (public / "notes" / "raw").mkdir()
++    (public / "notes" / "raw" / "capture.md").write_text("raw capture, never a user note\n")
++    (public / "notes" / "user-note.md").write_text(
++        "---\ncreator: agent-1\n---\n\n# Finding\nA real user note.\n"
++    )
++
++    agent1_worktree = tmp_path / "agents" / agent1_id
++    agent1_worktree.mkdir(parents=True)
++    setup_shared_state(agent1_worktree, coral_dir, ".claude", knowledge=True, publication_gate=True)
++
++    mgr.handles = [_make_handle(agent1_id, agent1_worktree, tmp_path / "a1.log")]
++
++    view_notes_dir = agent1_worktree / ".claude" / "notes"
++    assert (view_notes_dir / "notes.md").is_symlink()
++    assert (view_notes_dir / "raw").is_symlink()
++    assert (view_notes_dir / "raw").resolve() == (public / "notes" / "raw").resolve()
++    assert (view_notes_dir / "user-note.md").is_file()
++    assert not (view_notes_dir / "user-note.md").is_symlink()
++
++    mgr._run_publication_pass()
++
++    manifest = load_manifest(public, agent1_id, kind="notes")
++    assert "notes.md" not in manifest
++    assert "raw" not in manifest
++    assert not any(k.startswith("raw/") for k in manifest)
++
++    # Still symlinks after the pass -- never rewritten or pruned.
++    assert (view_notes_dir / "notes.md").is_symlink()
++    assert (view_notes_dir / "raw").is_symlink()
++    assert (public / "notes" / "notes.md").read_text() == "legacy single-file notes\n"
++    assert (public / "notes" / "raw" / "capture.md").read_text() == "raw capture, never a user note\n"
++
++    # Sanity check the pass actually ran and processed the real user note.
++    index_text = (view_notes_dir / "index.md").read_text()
++    assert "Finding" in index_text
+-- 
+2.45.1.windows.1
+

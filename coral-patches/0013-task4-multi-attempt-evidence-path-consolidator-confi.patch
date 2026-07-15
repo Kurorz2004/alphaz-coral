@@ -1,0 +1,630 @@
+From 8e8ac0e6937e1b3eff1b8af0a898de6eae527916 Mon Sep 17 00:00:00 2001
+From: Steve <steventhanhtuan@gmail.com>
+Date: Tue, 14 Jul 2026 21:51:13 +0700
+Subject: [PATCH 13/17] task4: multi-attempt evidence path + consolidator
+ config fields
+
+verify_note gains an additive path for evidence.attempts lists (used by
+framework-authored consolidated notes): every cited attempt must be a
+real scored one and every quoted score must match the store; creator
+matching is skipped for aggregates; a proven mismatch beats an
+unresolvable entry regardless of order. group_notes Rule 1 now unions
+on attempt-set intersection so a new duplicate groups with a note that
+cites a superset. Single-attempt behavior byte-identical.
+
+agents.gate_consolidator_model (None = off) and
+agents.gate_consolidator_timeout added next to publication_gate.
+
+Reviewed single-pass, approved. 716 passed, 73 gate tests unmodified.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ coral/config.py                  |   9 +
+ coral/hub/publication.py         | 164 ++++++++++++--
+ tests/test_gate_consolidation.py | 357 +++++++++++++++++++++++++++++++
+ 3 files changed, 513 insertions(+), 17 deletions(-)
+ create mode 100644 tests/test_gate_consolidation.py
+
+diff --git a/coral/config.py b/coral/config.py
+index 6ecf93a..3700586 100644
+--- a/coral/config.py
++++ b/coral/config.py
+@@ -271,6 +271,15 @@ class AgentConfig:
+     # plain symlinks, nothing is checked or stamped. Only meaningful when
+     # ``agents.knowledge`` is True; a False knowledge channel has no notes to gate.
+     publication_gate: bool = False
++    # LLM note consolidator: an alias for a one-shot LLM call the publication
++    # gate uses to merge/summarize a group of notes into a single higher-
++    # quality note before serving. None (default) is feature OFF — no LLM
++    # call is ever made. Only meaningful when publication_gate is True (there
++    # would be nothing to consolidate into a served view otherwise).
++    gate_consolidator_model: str | None = None
++    # Bounded per-call timeout (seconds) for the consolidator LLM call, so a
++    # slow/hung call can't stall the publication pass indefinitely.
++    gate_consolidator_timeout: int = 120
+     stagger_seconds: int = 0  # delay between spawning each agent (rate-limit backpressure)
+ 
+     # Reliability: crash-burst circuit breaker.
+diff --git a/coral/hub/publication.py b/coral/hub/publication.py
+index da86c18..d88bf8a 100644
+--- a/coral/hub/publication.py
++++ b/coral/hub/publication.py
+@@ -123,6 +123,29 @@ def verify_note(
+        (confidence "low", reason says so) rather than a falsification — an
+        honestly-refuted note is still verified, just lower-confidence.
+        Otherwise -> True/high.
++
++    Multi-attempt path (``evidence.attempts`` is a LIST instead of a single
++    ``evidence.attempt``, e.g. a framework-authored consolidated note that
++    spans several agents' attempts): each entry is a dict like ``{attempt:
++    <hash>, score: <num-or-str>}``. Every entry must resolve (same prefix
++    resolution as the single-attempt path) to exactly one attempt that is
++    real-budget and scored; an entry's ``score``, when present, must match
++    that attempt's score within ``_SCORE_TOLERANCE`` — an entry without a
++    ``score`` key passes vacuously once its hash resolves (it's citing the
++    attempt without making a numeric claim about it, nothing to check). The
++    ``creator`` == attempt.agent_id check is SKIPPED entirely in this path —
++    a framework aggregate legitimately spans agents, so creator can't be
++    checked against any single attempt's agent_id. Verdict: any entry with a
++    definite score mismatch -> False/low (checked as entries are scanned, so
++    it wins even if a different entry is also unresolvable — a proven-wrong
++    number is a stronger signal than "can't check this one"); else, if any
++    entry is unresolvable/ambiguous/missing/unscored/not-real-budget ->
++    unverifiable/medium; empty list -> unverifiable/medium ("no evidence
++    cited"), same as the no-``evidence.attempt`` case. Otherwise all entries
++    check out -> True/high, subject to the same self-declared-``refuted``
++    demotion as the single-attempt path (a consolidated note is framework-
++    authored and isn't expected to self-declare refuted, but the same rule
++    is applied uniformly in case it ever does).
+     """
+     note_path = Path(note_path)
+     try:
+@@ -136,6 +159,11 @@ def verify_note(
+ 
+     evidence = meta.get("evidence")
+     evidence = evidence if isinstance(evidence, dict) else {}
++
++    attempts_list = evidence.get("attempts")
++    if isinstance(attempts_list, list):
++        return _verify_note_multi_attempt(attempts_list, meta, coral_dir, island_id)
++
+     attempt_ref = evidence.get("attempt")
+     if not attempt_ref:
+         return _unverifiable("no evidence cited")
+@@ -186,6 +214,76 @@ def verify_note(
+     return Verdict(verified=True, confidence="high", reason="evidence matches attempt")
+ 
+ 
++def _verify_note_multi_attempt(
++    attempts_list: list[Any],
++    meta: dict[str, Any],
++    coral_dir: str | Path,
++    island_id: str | int | None,
++) -> Verdict:
++    """The ``evidence.attempts`` (list) path of :func:`verify_note` — see its
++    docstring's "Multi-attempt path" section for the full predicate.
++    """
++    if not attempts_list:
++        return _unverifiable("no evidence cited")
++
++    any_unresolvable = False
++    for entry in attempts_list:
++        if not isinstance(entry, dict):
++            any_unresolvable = True
++            continue
++        raw = entry.get("attempt")
++        raw = str(raw).strip() if raw else ""
++        if not raw:
++            any_unresolvable = True
++            continue
++
++        commit_hash = _resolve_attempt_hash(coral_dir, raw, island_id)
++        if commit_hash is None:
++            any_unresolvable = True
++            continue
++
++        attempt = read_attempt(coral_dir, commit_hash, island_id=island_id)
++        if attempt is None or attempt.score is None or attempt.budget_class != BUDGET_CLASS_REAL:
++            any_unresolvable = True
++            continue
++
++        if "score" in entry:
++            raw_score = entry["score"]
++            try:
++                claimed = float(raw_score)
++            except (TypeError, ValueError):
++                return Verdict(
++                    verified=False,
++                    confidence="low",
++                    reason=f"evidence.attempts entry {raw!r} score={raw_score!r} is not a number",
++                )
++            if abs(claimed - attempt.score) > _SCORE_TOLERANCE:
++                return Verdict(
++                    verified=False,
++                    confidence="low",
++                    reason=(
++                        f"evidence.attempts entry {raw!r} score={claimed} does not match "
++                        f"attempt score {attempt.score}"
++                    ),
++                )
++
++    if any_unresolvable:
++        return _unverifiable(
++            "one or more evidence.attempts entries is absent, unscored, unresolvable/ambiguous, "
++            "or not real budget"
++        )
++
++    status = str(meta.get("status", "") or "").strip().lower()
++    if status == "refuted":
++        return Verdict(
++            verified=True,
++            confidence="low",
++            reason="evidence matches attempts; note self-declared refuted",
++        )
++
++    return Verdict(verified=True, confidence="high", reason="evidence matches attempts")
++
++
+ # --------------------------------------------------------------------------- #
+ # Grouping (anti-redundancy) + ranking + index rendering                      #
+ # --------------------------------------------------------------------------- #
+@@ -222,21 +320,47 @@ def _tag_set(meta: dict[str, Any]) -> set[str]:
+     return set()
+ 
+ 
+-def _cited_attempt_key(
++def _cited_attempt_keys(
+     meta: dict[str, Any], coral_dir: str | Path | None, island_id: str | int | None
+-) -> str | None:
+-    """The value Rule 1 compares: the resolved full hash, else the raw citation."""
++) -> frozenset[str]:
++    """The set Rule 1 compares under set intersection: the single
++    ``evidence.attempt`` (if any) unioned with every ``evidence.attempts[].attempt``
++    (if the list evidence shape is used) — each resolved to the full commit
++    hash when possible, else falling back to the raw cited string (same
++    resolve-or-raw-string behavior as before, just unioned over every
++    citation the note carries instead of a single value). A note citing a
++    single attempt still yields a size-1 set — the special case that keeps
++    Rule 1 grouping behavior unchanged for existing (single-attempt) notes.
++    """
+     evidence = meta.get("evidence")
+     evidence = evidence if isinstance(evidence, dict) else {}
+-    raw = evidence.get("attempt")
+-    raw = str(raw).strip() if raw else ""
+-    if not raw:
+-        return None
+-    if coral_dir is not None:
+-        resolved = _resolve_attempt_hash(coral_dir, raw, island_id)
+-        if resolved is not None:
+-            return resolved
+-    return raw
++
++    def _resolve_or_raw(raw: Any) -> str | None:
++        raw = str(raw).strip() if raw else ""
++        if not raw:
++            return None
++        if coral_dir is not None:
++            resolved = _resolve_attempt_hash(coral_dir, raw, island_id)
++            if resolved is not None:
++                return resolved
++        return raw
++
++    keys: set[str] = set()
++
++    single = _resolve_or_raw(evidence.get("attempt"))
++    if single is not None:
++        keys.add(single)
++
++    attempts_list = evidence.get("attempts")
++    if isinstance(attempts_list, list):
++        for entry in attempts_list:
++            if not isinstance(entry, dict):
++                continue
++            resolved = _resolve_or_raw(entry.get("attempt"))
++            if resolved is not None:
++                keys.add(resolved)
++
++    return frozenset(keys)
+ 
+ 
+ def group_notes(
+@@ -254,9 +378,15 @@ def group_notes(
+     for it.
+ 
+     Two notes merge (transitively) if either:
+-      - Rule 1: they cite the same attempt — compared as the resolved full
+-        commit hash when ``coral_dir`` is given and the citation resolves to
+-        exactly one attempt, else the raw cited string.
++      - Rule 1: their cited-attempt sets intersect (see :func:`_cited_attempt_keys`
++        — each note's set is the resolved full commit hash, else the raw cited
++        string, for every attempt it cites: the single ``evidence.attempt``
++        plus every ``evidence.attempts[].attempt``). A note citing a single
++        attempt yields a size-1 set, so two such notes still only merge on
++        exact equality — the pre-existing single-attempt behavior is the
++        size-1 special case of this same rule, unchanged. A multi-attempt
++        (consolidated) note's larger set merges with any note that cites
++        *any one* of the same attempts.
+       - Rule 2: both have non-empty ``tags`` and the Jaccard overlap of their
+         tag sets is >= 0.5.
+     """
+@@ -278,12 +408,12 @@ def group_notes(
+         if ri != rj:
+             parent[ri] = rj
+ 
+-    attempt_keys = [_cited_attempt_key(m, coral_dir, island_id) for m in metas]
++    attempt_keys = [_cited_attempt_keys(m, coral_dir, island_id) for m in metas]
+     tag_sets = [_tag_set(m) for m in metas]
+ 
+     for i in range(n):
+         for j in range(i + 1, n):
+-            if attempt_keys[i] is not None and attempt_keys[i] == attempt_keys[j]:
++            if attempt_keys[i] & attempt_keys[j]:
+                 union(i, j)
+                 continue
+             if tag_sets[i] and tag_sets[j]:
+diff --git a/tests/test_gate_consolidation.py b/tests/test_gate_consolidation.py
+new file mode 100644
+index 0000000..e884f69
+--- /dev/null
++++ b/tests/test_gate_consolidation.py
+@@ -0,0 +1,357 @@
++"""Tests for the LLM note consolidator groundwork (config fields +
++multi-attempt evidence verification/grouping).
++
++Task 1: ``agents.gate_consolidator_model`` / ``agents.gate_consolidator_timeout``
++config fields. Task 2: the ``evidence.attempts`` (list) path of
++``verify_note()`` and the set-intersection Rule 1 in ``group_notes()``.
++
++Fixture helpers (``_make_attempt`` / ``_write_note_file`` / ``_note_and_meta``)
++mirror ``tests/test_publication_gate.py`` exactly so the two suites read the
++same way; kept local (not imported) since they're tiny and this file must
++not depend on that one's internals shifting.
++"""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++from coral.config import AgentConfig, CoralConfig, TaskConfig
++from coral.hub.attempts import write_attempt
++from coral.hub.notes import _parse_frontmatter
++from coral.hub.publication import Verdict, group_notes, verify_note
++from coral.types import Attempt
++
++# --------------------------------------------------------------------------- #
++# Fixture helpers (mirrors tests/test_publication_gate.py)                    #
++# --------------------------------------------------------------------------- #
++
++_FULL_HASH = "7b1e4d001122334455667788990011223344aabb"
++_SHORT_HASH = _FULL_HASH[:12]
++_FULL_HASH_2 = "9c2f5e112233445566778899001122334455bbcc"
++_SHORT_HASH_2 = _FULL_HASH_2[:12]
++
++
++def _make_attempt(
++    commit: str,
++    agent: str = "island-0-agent-2",
++    score: float | None = 0.42,
++    metadata: dict | None = None,
++) -> Attempt:
++    return Attempt(
++        commit_hash=commit,
++        agent_id=agent,
++        title="a change",
++        score=score,
++        status="improved" if score is not None else "pending",
++        parent_hash=None,
++        timestamp="2026-03-14T17:00:00-00:00",
++        metadata=metadata or {},
++    )
++
++
++def _write_note(path: Path, text: str) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(text)
++
++
++def _write_note_file(path: Path, frontmatter: str, body: str = "# Title\nBody text.\n") -> Path:
++    _write_note(path, f"---\n{frontmatter}\n---\n\n{body}")
++    return path
++
++
++def _note_and_meta(path: Path) -> tuple[Path, dict]:
++    meta, _ = _parse_frontmatter(path.read_text())
++    return path, meta
++
++
++# --------------------------------------------------------------------------- #
++# Task 1 — config fields                                                      #
++# --------------------------------------------------------------------------- #
++
++
++def test_gate_consolidator_defaults():
++    config = AgentConfig()
++    assert config.gate_consolidator_model is None
++    assert config.gate_consolidator_timeout == 120
++
++
++def test_gate_consolidator_off_by_default_even_with_publication_gate_on():
++    config = AgentConfig(publication_gate=True)
++    assert config.gate_consolidator_model is None
++
++
++def test_gate_consolidator_model_dotlist_override_roundtrips():
++    config = CoralConfig(
++        task=TaskConfig(name="test", description="A test"),
++        agents=AgentConfig(),
++    )
++    assert config.agents.gate_consolidator_model is None
++
++    merged = CoralConfig.merge_dotlist(config, ["agents.gate_consolidator_model=sonnet"])
++
++    assert merged.agents.gate_consolidator_model == "sonnet"
++    # Original unchanged
++    assert config.agents.gate_consolidator_model is None
++
++
++# --------------------------------------------------------------------------- #
++# Task 2 — verify_note(): evidence.attempts (list) path                       #
++# --------------------------------------------------------------------------- #
++
++
++def test_verify_note_multi_attempt_all_match_is_verified_high(tmp_path):
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH, agent="island-0-agent-1", score=0.42))
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH_2, agent="island-0-agent-2", score=0.55))
++    note = _write_note_file(
++        tmp_path / "public" / "notes" / "consolidated.md",
++        "creator: coral-consolidator\n"
++        "evidence:\n"
++        "  attempts:\n"
++        f"    - attempt: {_SHORT_HASH}\n"
++        '      score: "0.4200"\n'
++        f"    - attempt: {_SHORT_HASH_2}\n"
++        '      score: "0.5500"\n',
++    )
++
++    verdict = verify_note(note, tmp_path)
++
++    assert verdict.verified is True
++    assert verdict.confidence == "high"
++
++
++def test_verify_note_multi_attempt_one_wrong_score_is_false_low(tmp_path):
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH, agent="island-0-agent-1", score=0.42))
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH_2, agent="island-0-agent-2", score=0.55))
++    note = _write_note_file(
++        tmp_path / "public" / "notes" / "consolidated.md",
++        "creator: coral-consolidator\n"
++        "evidence:\n"
++        "  attempts:\n"
++        f"    - attempt: {_SHORT_HASH}\n"
++        '      score: "0.4200"\n'
++        f"    - attempt: {_SHORT_HASH_2}\n"
++        '      score: "0.9900"\n',  # wrong, real score is 0.55
++    )
++
++    verdict = verify_note(note, tmp_path)
++
++    assert verdict.verified is False
++    assert verdict.confidence == "low"
++    assert "0.99" in verdict.reason
++
++
++def test_verify_note_multi_attempt_unresolvable_hash_is_unverifiable(tmp_path):
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH, agent="island-0-agent-1", score=0.42))
++    note = _write_note_file(
++        tmp_path / "public" / "notes" / "consolidated.md",
++        "creator: coral-consolidator\n"
++        "evidence:\n"
++        "  attempts:\n"
++        f"    - attempt: {_SHORT_HASH}\n"
++        '      score: "0.4200"\n'
++        "    - attempt: deadbeef0000\n",  # doesn't resolve to any attempt
++    )
++
++    verdict = verify_note(note, tmp_path)
++
++    assert verdict.verified == "unverifiable"
++    assert verdict.confidence == "medium"
++
++
++def test_verify_note_multi_attempt_empty_list_is_unverifiable(tmp_path):
++    note = _write_note_file(
++        tmp_path / "public" / "notes" / "consolidated.md",
++        "creator: coral-consolidator\nevidence:\n  attempts: []\n",
++    )
++
++    verdict = verify_note(note, tmp_path)
++
++    assert verdict.verified == "unverifiable"
++    assert verdict.confidence == "medium"
++    assert "no evidence cited" in verdict.reason
++
++
++def test_verify_note_multi_attempt_no_score_key_passes_vacuously(tmp_path):
++    # Documented choice: an entry without a `score` key passes once its hash
++    # resolves to a real, scored attempt -- it's citing the attempt without
++    # making a numeric claim, so there's nothing to check against it.
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH, agent="island-0-agent-1", score=0.42))
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH_2, agent="island-0-agent-2", score=0.55))
++    note = _write_note_file(
++        tmp_path / "public" / "notes" / "consolidated.md",
++        "creator: coral-consolidator\n"
++        "evidence:\n"
++        "  attempts:\n"
++        f"    - attempt: {_SHORT_HASH}\n"
++        f"    - attempt: {_SHORT_HASH_2}\n",
++    )
++
++    verdict = verify_note(note, tmp_path)
++
++    assert verdict.verified is True
++    assert verdict.confidence == "high"
++
++
++def test_verify_note_multi_attempt_creator_check_skipped(tmp_path):
++    # A note authored by the consolidator, citing attempts from two DIFFERENT
++    # agents, still verifies True -- the creator == agent_id check that would
++    # fire on the single-attempt path is skipped entirely here.
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH, agent="island-0-agent-1", score=0.42))
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH_2, agent="island-0-agent-9", score=0.55))
++    note = _write_note_file(
++        tmp_path / "public" / "notes" / "consolidated.md",
++        "creator: coral-consolidator\n"
++        "evidence:\n"
++        "  attempts:\n"
++        f"    - attempt: {_SHORT_HASH}\n"
++        '      score: "0.4200"\n'
++        f"    - attempt: {_SHORT_HASH_2}\n"
++        '      score: "0.5500"\n',
++    )
++
++    verdict = verify_note(note, tmp_path)
++
++    assert verdict.verified is True
++    assert verdict.confidence == "high"
++
++
++def test_verify_note_multi_attempt_unscored_entry_is_unverifiable(tmp_path):
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH, agent="island-0-agent-1", score=0.42))
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH_2, agent="island-0-agent-2", score=None))
++    note = _write_note_file(
++        tmp_path / "public" / "notes" / "consolidated.md",
++        "creator: coral-consolidator\n"
++        "evidence:\n"
++        "  attempts:\n"
++        f"    - attempt: {_SHORT_HASH}\n"
++        '      score: "0.4200"\n'
++        f"    - attempt: {_SHORT_HASH_2}\n",
++    )
++
++    verdict = verify_note(note, tmp_path)
++
++    assert verdict.verified == "unverifiable"
++    assert verdict.confidence == "medium"
++
++
++def test_verify_note_single_attempt_path_still_works_unchanged(tmp_path):
++    # Sanity check: the pre-existing single-attempt path is untouched by the
++    # new list branch (evidence.attempt, not evidence.attempts).
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH, score=0.42))
++    note = _write_note_file(
++        tmp_path / "public" / "notes" / "a.md",
++        "creator: island-0-agent-2\n"
++        "evidence:\n"
++        f"  attempt: {_SHORT_HASH}\n"
++        '  score: "0.4200"\n',
++    )
++
++    verdict = verify_note(note, tmp_path)
++
++    assert verdict.verified is True
++    assert verdict.confidence == "high"
++
++
++# --------------------------------------------------------------------------- #
++# Task 2 — group_notes(): Rule 1 set intersection                             #
++# --------------------------------------------------------------------------- #
++
++
++def test_group_notes_single_hash_groups_with_multi_attempt_superset(tmp_path):
++    # Note A cites a single hash H; note B (a consolidated note) cites {H, H2}.
++    # Rule 1 must merge them via set intersection ({H} & {H, H2} = {H}).
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH, score=0.42))
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH_2, score=0.55))
++    notes_dir = tmp_path / "public" / "notes"
++    a = _write_note_file(
++        notes_dir / "a.md",
++        f"creator: agent-1\ncreated: 2026-03-10T00:00:00-00:00\nevidence:\n  attempt: {_SHORT_HASH}\n",
++        body="# A\nBody.\n",
++    )
++    b = _write_note_file(
++        notes_dir / "b.md",
++        "creator: coral-consolidator\n"
++        "created: 2026-03-12T00:00:00-00:00\n"
++        "evidence:\n"
++        "  attempts:\n"
++        f"    - attempt: {_SHORT_HASH}\n"
++        f"    - attempt: {_SHORT_HASH_2}\n",
++        body="# B consolidated\nBody.\n",
++    )
++    notes = [_note_and_meta(a), _note_and_meta(b)]
++    verdicts = {
++        a: Verdict(verified=True, confidence="high", reason="ok"),
++        b: Verdict(verified=True, confidence="high", reason="ok"),
++    }
++
++    groups = group_notes(notes, verdicts, coral_dir=tmp_path)
++
++    assert len(groups) == 1
++    # Most recent (b) wins representative -- same tier, later created.
++    assert groups[0].representative == b
++    assert groups[0].see_also == [a]
++
++
++def test_group_notes_disjoint_attempt_sets_and_tags_stay_separate(tmp_path):
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH, score=0.42))
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH_2, score=0.55))
++    third_hash = "aa11bb22cc33dd44ee55ff66001122334455aabb"
++    write_attempt(tmp_path, _make_attempt(third_hash, score=0.9))
++    notes_dir = tmp_path / "public" / "notes"
++    a = _write_note_file(
++        notes_dir / "a.md",
++        f"creator: agent-1\nevidence:\n  attempt: {_SHORT_HASH}\n",
++        body="# A\nBody.\n",
++    )
++    b = _write_note_file(
++        notes_dir / "b.md",
++        "creator: coral-consolidator\n"
++        "evidence:\n"
++        "  attempts:\n"
++        f"    - attempt: {_SHORT_HASH_2}\n"
++        f"    - attempt: {third_hash[:12]}\n",
++        body="# B consolidated\nBody.\n",
++    )
++    notes = [_note_and_meta(a), _note_and_meta(b)]
++    verdicts = {
++        a: Verdict(verified=True, confidence="high", reason="ok"),
++        b: Verdict(verified=True, confidence="high", reason="ok"),
++    }
++
++    groups = group_notes(notes, verdicts, coral_dir=tmp_path)
++
++    assert len(groups) == 2
++    assert {g.representative for g in groups} == {a, b}
++
++
++def test_group_notes_existing_single_hash_grouping_unchanged(tmp_path):
++    # Same scenario as test_publication_gate.py's
++    # test_group_notes_rule1_distinct_prefixes_resolve_to_same_attempt --
++    # confirms the size-1 special case of the new set-intersection rule
++    # reproduces the old single-key-equality behavior exactly.
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH, score=0.42))
++    notes_dir = tmp_path / "public" / "notes"
++    prefix8 = _FULL_HASH[:8]
++    prefix16 = _FULL_HASH[:16]
++    assert prefix8 != prefix16
++    a = _write_note_file(
++        notes_dir / "a.md",
++        f"creator: agent-1\ncreated: 2026-03-10T00:00:00-00:00\nevidence:\n  attempt: {prefix8}\n",
++        body="# Note A\nBody.\n",
++    )
++    b = _write_note_file(
++        notes_dir / "b.md",
++        f"creator: agent-1\ncreated: 2026-03-11T00:00:00-00:00\nevidence:\n  attempt: {prefix16}\n",
++        body="# Note B\nBody.\n",
++    )
++    notes = [_note_and_meta(a), _note_and_meta(b)]
++    verdicts = {
++        a: Verdict(verified=True, confidence="high", reason="ok"),
++        b: Verdict(verified=True, confidence="high", reason="ok"),
++    }
++
++    groups = group_notes(notes, verdicts, coral_dir=tmp_path)
++
++    assert len(groups) == 1
++    assert groups[0].representative == b
++    assert groups[0].see_also == [a]
+-- 
+2.45.1.windows.1
+

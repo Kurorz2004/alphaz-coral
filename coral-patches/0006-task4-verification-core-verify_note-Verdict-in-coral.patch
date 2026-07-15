@@ -1,0 +1,487 @@
+From cf472e9d7a8791a93698b7ff4945631e1797577d Mon Sep 17 00:00:00 2001
+From: Steve <steventhanhtuan@gmail.com>
+Date: Tue, 14 Jul 2026 14:39:45 +0700
+Subject: [PATCH 06/17] task4: verification core, verify_note + Verdict in
+ coral/hub/publication.py
+
+Cited attempt must exist (short-hash prefix resolution), be a real
+scored attempt by the note's own creator, and every quoted evidence
+score must match the recorded one (tol 5e-5). Refuted notes with valid
+evidence stay verified but demote to low confidence; an evidence
+mismatch overrides the refuted path. Unverifiable (no or in-flight
+evidence) is distinct from failed. score_delta deliberately unchecked.
+
+Reviewed; regression tests mutation-checked. 657 passed, ruff clean.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ coral/hub/publication.py       | 171 +++++++++++++++++++++
+ tests/test_publication_gate.py | 269 +++++++++++++++++++++++++++++++++
+ 2 files changed, 440 insertions(+)
+ create mode 100644 coral/hub/publication.py
+
+diff --git a/coral/hub/publication.py b/coral/hub/publication.py
+new file mode 100644
+index 0000000..3556f3c
+--- /dev/null
++++ b/coral/hub/publication.py
+@@ -0,0 +1,171 @@
++"""Verification predicate for the publication gate (``agents.publication_gate``).
++
++A note makes a claim and cites the graded attempt (``evidence.attempt``) that
++backs it. This module answers one question, purely: *does the evidence in the
++note's frontmatter actually match the attempt it cites?* It never writes
++anything, never calls an LLM, and never hardcodes a runtime-specific path
++(``.claude``, ``.codex``, ...) — everything is parameterized by ``coral_dir``.
++
++:func:`verify_note` returns a :class:`Verdict`. A later task (the wiring/pass
++that actually stamps frontmatter) calls this and writes the result back via
++``coral.hub.notes.upsert_frontmatter`` as ``coral_verified`` /
++``coral_confidence`` / ``coral_reason`` (+ its own ``coral_checked_at``
++timestamp — not produced here, since this function is a pure, deterministic
++predicate). This module is inert until ``agents.publication_gate`` is true;
++nothing here reads that config flag — the caller decides whether to invoke it.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Literal
++
++from coral.hub.attempts import _attempts_dir, read_attempt
++from coral.hub.notes import _parse_frontmatter
++from coral.types import BUDGET_CLASS_REAL
++
++# The evidence keys that must equal Attempt.score (within tolerance) when
++# present. ``score_delta`` is deliberately excluded — it's a delta between two
++# attempts, not a score, and can't be checked against a single Attempt.
++_SCORE_KEYS = ("score", "score_after", "final_score")
++
++# Absolute tolerance for comparing a quoted evidence score against
++# Attempt.score. Scores are floats round-tripped through string frontmatter
++# (e.g. "0.9752"); this absorbs formatting/precision noise without being loose
++# enough to paper over a genuinely wrong number.
++_SCORE_TOLERANCE = 5e-5
++
++Confidence = Literal["high", "medium", "low"]
++# True/False are real verdicts; "unverifiable" means "we couldn't check this,
++# don't demote it" (e.g. it cites an in-flight or unscored attempt).
++
++
++@dataclass(frozen=True)
++class Verdict:
++    """Result of :func:`verify_note`.
++
++    Field names map 1:1 onto the frontmatter keys the (later) stamping pass
++    writes: ``verified`` -> ``coral_verified``, ``confidence`` ->
++    ``coral_confidence``, ``reason`` -> ``coral_reason``.
++    """
++
++    verified: bool | Literal["unverifiable"]
++    confidence: Confidence
++    reason: str
++
++
++def _unverifiable(reason: str) -> Verdict:
++    return Verdict(verified="unverifiable", confidence="medium", reason=reason)
++
++
++def _resolve_attempt_hash(
++    coral_dir: str | Path, prefix: str, island_id: str | int | None
++) -> str | None:
++    """Resolve a (possibly short) cited hash to the full commit hash on disk.
++
++    Notes cite short hashes (typically 12 chars); attempt records are filed
++    as ``<full_commit_hash>.json``. Scans the attempts store for filenames
++    whose stem starts with ``prefix``. Exactly one match is required — zero
++    or an ambiguous prefix both return ``None`` rather than guessing.
++    """
++    prefix = str(prefix).strip()
++    if not prefix:
++        return None
++    attempts_dir = _attempts_dir(coral_dir, island_id)
++    matches = sorted(
++        {p.stem for p in attempts_dir.iterdir() if p.suffix == ".json" and p.stem.startswith(prefix)}
++    )
++    return matches[0] if len(matches) == 1 else None
++
++
++def verify_note(
++    note_path: str | Path,
++    coral_dir: str | Path,
++    island_id: str | int | None = None,
++) -> Verdict:
++    """Verify a note's cited evidence against the attempt store.
++
++    Predicate (short-circuits top to bottom):
++
++    1. No parseable frontmatter -> unverifiable/medium.
++    2. No ``evidence.attempt`` cited -> unverifiable/medium ("no evidence
++       cited") — a synthesis/open-question note isn't making a checkable
++       claim, that's not a failure.
++    3. Cited attempt can't be resolved to exactly one hash, is missing,
++       unscored (``score is None``), or not real budget
++       (``budget_class != "real"``) -> unverifiable/medium. An honest note
++       citing an in-flight attempt must not be demoted to "refuted".
++    4. ``creator`` != the attempt's ``agent_id`` -> False/low (someone
++       claiming credit for another agent's result).
++    5. Any of ``evidence.score`` / ``evidence.score_after`` /
++       ``evidence.final_score`` present and not numerically equal (within
++       ``5e-5``) to the attempt's score -> False/low. ``score_delta`` is
++       never checked (it's a delta, not a score). Keys that are absent pass
++       vacuously.
++    6. Otherwise the evidence checks out -> verified True. If the note
++       self-declared ``status: refuted``, that's respected as a *demotion*
++       (confidence "low", reason says so) rather than a falsification — an
++       honestly-refuted note is still verified, just lower-confidence.
++       Otherwise -> True/high.
++    """
++    note_path = Path(note_path)
++    try:
++        text = note_path.read_text()
++    except OSError as exc:
++        return _unverifiable(f"could not read note: {exc}")
++
++    meta, _ = _parse_frontmatter(text)
++    if not meta:
++        return _unverifiable("no parseable frontmatter")
++
++    evidence = meta.get("evidence")
++    evidence = evidence if isinstance(evidence, dict) else {}
++    attempt_ref = evidence.get("attempt")
++    if not attempt_ref:
++        return _unverifiable("no evidence cited")
++
++    commit_hash = _resolve_attempt_hash(coral_dir, str(attempt_ref), island_id)
++    if commit_hash is None:
++        return _unverifiable(f"cited attempt {attempt_ref!r} not found or ambiguous")
++
++    attempt = read_attempt(coral_dir, commit_hash, island_id=island_id)
++    if attempt is None or attempt.score is None or attempt.budget_class != BUDGET_CLASS_REAL:
++        return _unverifiable(f"cited attempt {attempt_ref!r} is absent, unscored, or not real budget")
++
++    creator = str(meta.get("creator", "") or "").strip()
++    if creator != attempt.agent_id:
++        return Verdict(
++            verified=False,
++            confidence="low",
++            reason=f"creator {creator!r} does not match attempt agent {attempt.agent_id!r}",
++        )
++
++    for key in _SCORE_KEYS:
++        if key not in evidence:
++            continue
++        raw = evidence[key]
++        try:
++            claimed = float(raw)
++        except (TypeError, ValueError):
++            return Verdict(
++                verified=False,
++                confidence="low",
++                reason=f"evidence.{key}={raw!r} is not a number",
++            )
++        if abs(claimed - attempt.score) > _SCORE_TOLERANCE:
++            return Verdict(
++                verified=False,
++                confidence="low",
++                reason=f"evidence.{key}={claimed} does not match attempt score {attempt.score}",
++            )
++
++    status = str(meta.get("status", "") or "").strip().lower()
++    if status == "refuted":
++        return Verdict(
++            verified=True,
++            confidence="low",
++            reason="evidence matches attempt; note self-declared refuted",
++        )
++
++    return Verdict(verified=True, confidence="high", reason="evidence matches attempt")
+diff --git a/tests/test_publication_gate.py b/tests/test_publication_gate.py
+index 9c3fad7..ab060a2 100644
+--- a/tests/test_publication_gate.py
++++ b/tests/test_publication_gate.py
+@@ -11,7 +11,10 @@ from __future__ import annotations
+ from pathlib import Path
+ 
+ from coral.config import AgentConfig, CoralConfig, TaskConfig
++from coral.hub.attempts import write_attempt
+ from coral.hub.notes import _parse_frontmatter, format_notes_list, list_notes, upsert_frontmatter
++from coral.hub.publication import verify_note
++from coral.types import Attempt
+ 
+ # --------------------------------------------------------------------------- #
+ # Task 1 — config flag
+@@ -263,3 +266,269 @@ def test_format_notes_list_shows_unverified_status(tmp_path):
+     formatted = format_notes_list(entries)
+ 
+     assert formatted.endswith("[unverified]")
++
++
++# --------------------------------------------------------------------------- #
++# Task 3 — verify_note()
++# --------------------------------------------------------------------------- #
++
++_FULL_HASH = "7b1e4d001122334455667788990011223344aabb"
++_SHORT_HASH = _FULL_HASH[:12]
++
++
++def _make_attempt(
++    commit: str,
++    agent: str = "island-0-agent-2",
++    score: float | None = 0.42,
++    metadata: dict | None = None,
++) -> Attempt:
++    return Attempt(
++        commit_hash=commit,
++        agent_id=agent,
++        title="a change",
++        score=score,
++        status="improved" if score is not None else "pending",
++        parent_hash=None,
++        timestamp="2026-03-14T17:00:00-00:00",
++        metadata=metadata or {},
++    )
++
++
++def _write_note_file(path: Path, frontmatter: str, body: str = "# Title\nBody text.\n") -> Path:
++    _write_note(path, f"---\n{frontmatter}\n---\n\n{body}")
++    return path
++
++
++def test_verify_note_matching_creator_and_score_is_verified_high(tmp_path):
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH, score=0.42))
++    note = _write_note_file(
++        tmp_path / "public" / "notes" / "a.md",
++        "creator: island-0-agent-2\n"
++        f"claim: matmul tiling helps\n"
++        "evidence:\n"
++        f"  attempt: {_SHORT_HASH}\n"
++        "  score: \"0.4200\"\n",
++    )
++
++    verdict = verify_note(note, tmp_path)
++
++    assert verdict.verified is True
++    assert verdict.confidence == "high"
++    assert "match" in verdict.reason
++
++
++def test_verify_note_no_evidence_is_unverifiable_medium(tmp_path):
++    note = _write_note_file(
++        tmp_path / "public" / "notes" / "synthesis.md",
++        "creator: island-0-agent-2\ntype: synthesis\nclaim: general pattern across attempts\n",
++    )
++
++    verdict = verify_note(note, tmp_path)
++
++    assert verdict.verified == "unverifiable"
++    assert verdict.confidence == "medium"
++    assert "no evidence cited" in verdict.reason
++
++
++def test_verify_note_wrong_creator_is_false_low(tmp_path):
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH, agent="island-0-agent-2", score=0.42))
++    note = _write_note_file(
++        tmp_path / "public" / "notes" / "a.md",
++        "creator: island-0-agent-9\n"
++        "evidence:\n"
++        f"  attempt: {_SHORT_HASH}\n"
++        "  score: \"0.4200\"\n",
++    )
++
++    verdict = verify_note(note, tmp_path)
++
++    assert verdict.verified is False
++    assert verdict.confidence == "low"
++    assert "island-0-agent-9" in verdict.reason
++    assert "island-0-agent-2" in verdict.reason
++
++
++def test_verify_note_mismatched_score_is_false_low(tmp_path):
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH, score=0.42))
++    note = _write_note_file(
++        tmp_path / "public" / "notes" / "a.md",
++        "creator: island-0-agent-2\n"
++        "evidence:\n"
++        f"  attempt: {_SHORT_HASH}\n"
++        "  score: \"0.99\"\n",
++    )
++
++    verdict = verify_note(note, tmp_path)
++
++    assert verdict.verified is False
++    assert verdict.confidence == "low"
++    assert "0.99" in verdict.reason
++
++
++def test_verify_note_refuted_with_valid_evidence_stays_verified_but_low(tmp_path):
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH, score=0.42))
++    note = _write_note_file(
++        tmp_path / "public" / "notes" / "a.md",
++        "creator: island-0-agent-2\n"
++        "status: refuted\n"
++        "evidence:\n"
++        f"  attempt: {_SHORT_HASH}\n"
++        "  score: \"0.4200\"\n",
++    )
++
++    verdict = verify_note(note, tmp_path)
++
++    assert verdict.verified is True
++    assert verdict.confidence == "low"
++    assert "refuted" in verdict.reason
++
++
++def test_verify_note_unscored_attempt_is_unverifiable(tmp_path):
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH, score=None))
++    note = _write_note_file(
++        tmp_path / "public" / "notes" / "a.md",
++        "creator: island-0-agent-2\nevidence:\n  attempt: " + _SHORT_HASH + "\n",
++    )
++
++    verdict = verify_note(note, tmp_path)
++
++    assert verdict.verified == "unverifiable"
++    assert verdict.confidence == "medium"
++
++
++def test_verify_note_short_hash_prefix_resolves_uniquely(tmp_path):
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH, score=0.42))
++    # A second, unrelated attempt with a different prefix must not interfere.
++    write_attempt(tmp_path, _make_attempt("ffffffff0000000000000000000000000000ff", score=0.1))
++    note = _write_note_file(
++        tmp_path / "public" / "notes" / "a.md",
++        "creator: island-0-agent-2\n"
++        "evidence:\n"
++        f"  attempt: {_SHORT_HASH}\n"
++        "  score: \"0.4200\"\n",
++    )
++
++    verdict = verify_note(note, tmp_path)
++
++    assert verdict.verified is True
++    assert verdict.confidence == "high"
++
++
++def test_verify_note_ambiguous_prefix_is_unverifiable(tmp_path):
++    prefix = "aaaaaaaaaaaa"  # 12 chars, shared by both full hashes below
++    write_attempt(tmp_path, _make_attempt(prefix + "1111111111111111111111111111", score=0.42))
++    write_attempt(tmp_path, _make_attempt(prefix + "2222222222222222222222222222", score=0.5))
++    note = _write_note_file(
++        tmp_path / "public" / "notes" / "a.md",
++        "creator: island-0-agent-2\nevidence:\n  attempt: " + prefix + "\n",
++    )
++
++    verdict = verify_note(note, tmp_path)
++
++    assert verdict.verified == "unverifiable"
++    assert verdict.confidence == "medium"
++    assert "ambiguous" in verdict.reason or "not found" in verdict.reason
++
++
++def test_verify_note_no_frontmatter_block_is_unverifiable_medium(tmp_path):
++    # No leading '---' at all — never even looks like a frontmatter block.
++    note = tmp_path / "public" / "notes" / "a.md"
++    note.parent.mkdir(parents=True, exist_ok=True)
++    note.write_text("# Just a title\nNo frontmatter here, straight into the body.\n")
++
++    verdict = verify_note(note, tmp_path)
++
++    assert verdict.verified == "unverifiable"
++    assert verdict.confidence == "medium"
++    assert "frontmatter" in verdict.reason
++
++
++def test_verify_note_unterminated_frontmatter_block_is_unverifiable_medium(tmp_path):
++    # Opens with '---' but never closes it — _parse_frontmatter can't find
++    # the block and verify_note must go through the real code path (not a
++    # direct _parse_frontmatter call) and still land on unverifiable/medium.
++    note = tmp_path / "public" / "notes" / "a.md"
++    note.parent.mkdir(parents=True, exist_ok=True)
++    note.write_text(
++        "---\ncreator: island-0-agent-2\nevidence:\n  attempt: " + _SHORT_HASH + "\n\n"
++        "# Title\nBody, but the frontmatter block was never closed.\n"
++    )
++
++    verdict = verify_note(note, tmp_path)
++
++    assert verdict.verified == "unverifiable"
++    assert verdict.confidence == "medium"
++    assert "frontmatter" in verdict.reason
++
++
++def test_verify_note_mismatch_overrides_refuted_precedence(tmp_path):
++    # A genuinely wrong evidence.score must win over the self-declared
++    # "refuted" status: verified=False/low, NOT True/low. Otherwise a note
++    # could hide bogus evidence behind an honest-looking refuted label.
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH, score=0.42))
++    note = _write_note_file(
++        tmp_path / "public" / "notes" / "a.md",
++        "creator: island-0-agent-2\n"
++        "status: refuted\n"
++        "evidence:\n"
++        f"  attempt: {_SHORT_HASH}\n"
++        "  score: \"0.99\"\n",
++    )
++
++    verdict = verify_note(note, tmp_path)
++
++    assert verdict.verified is False
++    assert verdict.confidence == "low"
++
++
++def test_verify_note_tune_budget_class_with_real_score_is_unverifiable(tmp_path):
++    # Distinct from the unscored case: this attempt IS scored, but it's a
++    # tune sweep, not a real submission — must not be treated as evidence.
++    write_attempt(
++        tmp_path, _make_attempt(_FULL_HASH, score=0.42, metadata={"budget_class": "tune"})
++    )
++    note = _write_note_file(
++        tmp_path / "public" / "notes" / "a.md",
++        "creator: island-0-agent-2\nevidence:\n  attempt: " + _SHORT_HASH + "\n",
++    )
++
++    verdict = verify_note(note, tmp_path)
++
++    assert verdict.verified == "unverifiable"
++    assert verdict.confidence == "medium"
++
++
++def test_verify_note_wrong_score_delta_does_not_affect_verdict(tmp_path):
++    # score_delta is a delta between two attempts, not a score against this
++    # one — it must never be checked, even when it's obviously wrong.
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH, score=0.42))
++    note = _write_note_file(
++        tmp_path / "public" / "notes" / "a.md",
++        "creator: island-0-agent-2\n"
++        "evidence:\n"
++        f"  attempt: {_SHORT_HASH}\n"
++        "  score_delta: 999.0\n",
++    )
++
++    verdict = verify_note(note, tmp_path)
++
++    assert verdict.verified is True
++    assert verdict.confidence == "high"
++
++
++def test_verify_note_full_hash_citation_resolves_exact_match(tmp_path):
++    # Cite the full 40-char commit hash directly (not a short prefix) —
++    # exercises the exact-match path of _resolve_attempt_hash.
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH, score=0.42))
++    note = _write_note_file(
++        tmp_path / "public" / "notes" / "a.md",
++        "creator: island-0-agent-2\n"
++        "evidence:\n"
++        f"  attempt: {_FULL_HASH}\n"
++        "  score: \"0.4200\"\n",
++    )
++
++    verdict = verify_note(note, tmp_path)
++
++    assert verdict.verified is True
++    assert verdict.confidence == "high"
+-- 
+2.45.1.windows.1
+

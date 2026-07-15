@@ -1,0 +1,162 @@
+From c2e5fda6ae61ab7bf39a6b88404f5378227e4a5d Mon Sep 17 00:00:00 2001
+From: Steve <steventhanhtuan@gmail.com>
+Date: Fri, 10 Jul 2026 10:11:39 +0700
+Subject: [PATCH 02/17] Fix the second heartbeat-regrowth path: _preprocess
+ back-fills an empty list
+
+The PROTECTED re-add in write_*_heartbeat was not the only way an empty
+heartbeat list came back to life. `_preprocess` (config.py) back-fills every
+default action the user did not *name* -- and an empty list names nothing, so
+`heartbeat: []` in task.yaml regrew all four defaults and was byte-identical
+to not setting it at all. Only the dotlist form (`agents.heartbeat=[]`), which
+bypasses _preprocess, ever reached the PROTECTED re-add.
+
+A partial list must still be back-filled; only an explicitly empty one is now
+taken at its word.
+
+Also records, as a test, that Condition B was reachable on stock CORAL with no
+source edit at all: naming all four actions with `every: 1000000` defeats both
+regrowth paths (both key off *absence*), and neither `count % every == 0` nor
+`streak >= every` can then fire. So these two fixes are a defect fix, not a
+prerequisite for the ablation arm -- the write-up should say so. Condition A
+remains genuinely unreachable from config: SharingConfig looks like the switch
+and is dead (nothing reads config.sharing).
+
+Verified against pristine upstream-base in a worktree: the default config and
+`heartbeat: []` produced the same 18 firings over 12 simulated evals.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ coral/config.py                  | 27 ++++++++-----
+ tests/test_knowledge_ablation.py | 69 ++++++++++++++++++++++++++++++++
+ 2 files changed, 85 insertions(+), 11 deletions(-)
+
+diff --git a/coral/config.py b/coral/config.py
+index acaf853..17e8240 100644
+--- a/coral/config.py
++++ b/coral/config.py
+@@ -671,17 +671,22 @@ def _preprocess(data: dict[str, Any]) -> dict[str, Any]:
+     old_heartbeat = agents_data.pop("heartbeat_every", None)
+ 
+     if heartbeat_raw is not None:
+-        specified = {h["name"] for h in heartbeat_raw}
+-        for dflt in AgentConfig().heartbeat:
+-            if dflt.name not in specified:
+-                heartbeat_raw.append(
+-                    {
+-                        "name": dflt.name,
+-                        "every": dflt.every,
+-                        "global": dflt.is_global,
+-                        "trigger": dflt.trigger,
+-                    }
+-                )
++        # A *partial* list means "override these, keep the rest", so the
++        # unspecified defaults are back-filled. An *empty* list means "no
++        # heartbeat actions" — back-filling it regrew all four defaults and
++        # made `heartbeat: []` silently identical to the default config.
++        if heartbeat_raw:
++            specified = {h["name"] for h in heartbeat_raw}
++            for dflt in AgentConfig().heartbeat:
++                if dflt.name not in specified:
++                    heartbeat_raw.append(
++                        {
++                            "name": dflt.name,
++                            "every": dflt.every,
++                            "global": dflt.is_global,
++                            "trigger": dflt.trigger,
++                        }
++                    )
+         agents_data["heartbeat"] = [
+             {
+                 "name": h["name"],
+diff --git a/tests/test_knowledge_ablation.py b/tests/test_knowledge_ablation.py
+index ca62485..bef00f7 100644
+--- a/tests/test_knowledge_ablation.py
++++ b/tests/test_knowledge_ablation.py
+@@ -10,7 +10,9 @@ from __future__ import annotations
+ import subprocess
+ 
+ import pytest
++import yaml
+ 
++from coral.agent.heartbeat import HeartbeatAction, HeartbeatRunner
+ from coral.config import AgentConfig, CoralConfig, GraderConfig, HeartbeatActionConfig, TaskConfig
+ from coral.hub.heartbeat import (
+     default_global_actions,
+@@ -162,6 +164,73 @@ def test_condition_b_config_yields_no_actions():
+     assert default_global_actions(cfg) == []
+ 
+ 
++def _from_yaml(tmp_path, agents: dict) -> CoralConfig:
++    p = tmp_path / "task.yaml"
++    p.write_text(
++        yaml.safe_dump(
++            {
++                "task": {"name": "T", "description": "d"},
++                "grader": {"entrypoint": "x:Y", "direction": "maximize"},
++                "workspace": {"repo_path": "./seed"},
++                "agents": agents,
++            }
++        )
++    )
++    return CoralConfig.from_yaml(p)
++
++
++def test_yaml_empty_heartbeat_list_is_not_backfilled(tmp_path):
++    """Regression: the *second* regrowth path, in `_preprocess`.
++
++    `write_*_heartbeat`'s PROTECTED re-add is not the only way an empty
++    heartbeat list came back to life. `_preprocess` back-fills every default
++    the user did not name — and an empty list names nothing, so `heartbeat: []`
++    in task.yaml regrew all four actions at their default intervals, i.e. was
++    byte-identical to not setting it at all. A *partial* list must still be
++    back-filled; only an explicitly empty one is taken at its word.
++    """
++    empty = _from_yaml(tmp_path, {"count": 2, "heartbeat": []})
++    assert list(empty.agents.heartbeat) == []
++
++    partial = _from_yaml(tmp_path, {"count": 2, "heartbeat": [{"name": "reflect", "every": 3}]})
++    named = {a.name: a.every for a in partial.agents.heartbeat}
++    assert named == {"reflect": 3, "consolidate": 10, "pivot": 5, "lint_wiki": 10}
++
++
++def test_unreachable_every_disables_heartbeats_without_any_code_change(tmp_path):
++    """Condition B is *also* reachable on pristine CORAL, with no source edit.
++
++    Naming all four actions defeats `_preprocess` back-fill and the PROTECTED
++    re-add (both key off absence), and an unreachable `every` means neither the
++    interval check (`count % every == 0`) nor the plateau check
++    (`streak >= every`) can ever fire. Recorded so the Task 3 write-up can state
++    that the `protect` fix was a *defect fix*, not a prerequisite for the arm.
++    """
++    big = 1_000_000
++    cfg = _from_yaml(
++        tmp_path,
++        {
++            "count": 2,
++            "heartbeat": [
++                {"name": "reflect", "every": big},
++                {"name": "consolidate", "every": big, "global": True},
++                {"name": "pivot", "every": big, "trigger": "plateau"},
++                {"name": "lint_wiki", "every": big, "global": True},
++            ],
++        },
++    )
++    actions = [
++        HeartbeatAction(name=a["name"], every=a["every"], prompt="", trigger=a["trigger"])
++        for a in default_local_actions(cfg) + default_global_actions(cfg)
++    ]
++    assert len(actions) == 4
++    runner = HeartbeatRunner(actions)
++    scores: list[float] = []
++    for i in range(1, 13):
++        scores.append(0.70)  # flat: maximises the plateau streak
++        assert runner.check(local_eval_count=i, global_eval_count=2 * i, score_history=scores) == []
++
++
+ def test_condition_a_keeps_pivot_plateau_trigger():
+     pivot = next(a for a in default_local_actions(_config(False)) if a["name"] == "pivot")
+     assert pivot["trigger"] == "plateau"
+-- 
+2.45.1.windows.1
+

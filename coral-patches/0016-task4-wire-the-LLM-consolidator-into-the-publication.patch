@@ -1,0 +1,689 @@
+From f940956b8075bcb4281563f5cef578da05800228 Mon Sep 17 00:00:00 2001
+From: Steve <steventhanhtuan@gmail.com>
+Date: Tue, 14 Jul 2026 22:42:00 +0700
+Subject: [PATCH 16/17] task4: wire the LLM consolidator into the publication
+ pass
+
+_effective_gate_llm_call resolves the injection seam first, then a
+functools.partial over default_llm_call when publication_gate and
+gate_consolidator_model are both set, else None (byte-identical
+pre-change path). _do_publication_pass consolidates after grouping and
+re-runs verify/stamp/group from disk when something was published, so
+the consolidated note is stamped through the multi-attempt path and
+archived originals drop out of the served views within the same pass.
+
+Six manager-level integration scenarios green (happy path, hallucinated
+score, LLM error, re-consolidation, settle, flag-off). Full suite 753
+passed, 73 gate tests unmodified, ruff clean. Reviewed, approved.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ coral/agent/manager.py                   | 120 +++++-
+ tests/test_gate_consolidation_manager.py | 479 +++++++++++++++++++++++
+ 2 files changed, 578 insertions(+), 21 deletions(-)
+ create mode 100644 tests/test_gate_consolidation_manager.py
+
+diff --git a/coral/agent/manager.py b/coral/agent/manager.py
+index b2d7632..055045a 100644
+--- a/coral/agent/manager.py
++++ b/coral/agent/manager.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import atexit
++import functools
+ import json
+ import logging
+ import multiprocessing
+@@ -48,6 +49,7 @@ from coral.agent.state import (
+ )
+ from coral.agent.warmstart import WarmStartRunner
+ from coral.config import CoralConfig
++from coral.hub import consolidation
+ from coral.hub._island import island_root
+ from coral.hub.attempts import (
+     agent_in_grader_queue,
+@@ -69,6 +71,7 @@ from coral.hub.heartbeat import (
+ )
+ from coral.hub.notes import _iter_user_note_files, _parse_frontmatter
+ from coral.hub.publication import (
++    Group,
+     Verdict,
+     generate_notes_view,
+     generate_skills_view,
+@@ -221,6 +224,12 @@ class AgentManager:
+         # signature from the last completed _run_publication_pass() tick (see
+         # that method) so an unchanged shared/view state is skipped cheaply.
+         self._last_publication_signature: tuple[tuple[float, int], ...] | None = None
++        # Test-injection seam for the publication gate's LLM note
++        # consolidator (see :meth:`_effective_gate_llm_call`). None means
++        # "use config" (agents.gate_consolidator_model, via
++        # consolidation.default_llm_call) -- tests set this directly to a
++        # fake callable instead of exercising the real subprocess call.
++        self._gate_llm_call: Callable[[str], str] | None = None
+ 
+     def _runtime_for(self, agent_id: str) -> AgentRuntime:
+         """Return the runtime instance for an agent_id, creating one on demand.
+@@ -1828,9 +1837,12 @@ class AgentManager:
+         return tuple(_dir_mtime_signature(d) for d in dirs)
+ 
+     def _run_publication_pass(self) -> None:
+-        """One publication-gate tick: harvest -> verify/stamp -> group/rank
+-        -> regenerate views (see ``coral.hub.publication``'s module
+-        docstring for why that order is required).
++        """One publication-gate tick: harvest -> verify/stamp -> group ->
++        CONSOLIDATE (optional, LLM, verified) -> re-verify/re-group when it
++        fired -> rank -> regenerate views (see ``coral.hub.publication``'s
++        module docstring for why the harvest/verify/group/serve order is
++        required, and :meth:`_do_publication_pass` for the consolidation
++        step's own re-verify/re-group rationale).
+ 
+         No-op unless ``agents.publication_gate`` and ``agents.knowledge``
+         are both on. v1 is single-island only (``islands.count > 1`` skips
+@@ -1881,13 +1893,62 @@ class AgentManager:
+             # ran) -- never recompute here. See the docstring for why.
+             self._last_publication_signature = signature
+ 
++    def _effective_gate_llm_call(self) -> Callable[[str], str] | None:
++        """The LLM callable :meth:`_do_publication_pass` should use for note
++        consolidation this pass, or ``None`` if consolidation is off.
++
++        ``self._gate_llm_call`` (a test-injection seam — see its docstring
++        in ``__init__``) always wins when set. Otherwise, consolidation is
++        only wired up when both ``agents.publication_gate`` and
++        ``agents.gate_consolidator_model`` are set: a
++        :func:`functools.partial` around :func:`consolidation.default_llm_call`
++        bound to the configured model/timeout. Returns ``None`` (feature
++        off) in every other case — including ``publication_gate`` off,
++        which makes this call irrelevant anyway since
++        :meth:`_run_publication_pass` already gates the whole pass on it.
++        """
++        if self._gate_llm_call is not None:
++            return self._gate_llm_call
++        agents_cfg = self.config.agents
++        if agents_cfg.publication_gate and agents_cfg.gate_consolidator_model is not None:
++            return functools.partial(
++                consolidation.default_llm_call,
++                model=agents_cfg.gate_consolidator_model,
++                timeout=agents_cfg.gate_consolidator_timeout,
++            )
++        return None
++
++    def _verify_stamp_and_group(
++        self, coral_dir: Path, shared_notes_dir: Path
++    ) -> tuple[list[Group], list[Group], dict[Path, Verdict]]:
++        """Verify + stamp every shared note's evidence against the attempt
++        store, then group/rank the result. Steps 2-3 of
++        :meth:`_do_publication_pass`'s pass order, factored out so the
++        consolidation step (which changes shared state) can re-run them
++        afterward. Returns ``(groups, ranked_groups, verdicts)``.
++        """
++        note_paths = _iter_user_note_files(shared_notes_dir)
++        notes: list[tuple[Path, dict[str, Any]]] = []
++        verdicts: dict[Path, Verdict] = {}
++        for note_path in note_paths:
++            meta, _ = _parse_frontmatter(note_path.read_text())
++            notes.append((note_path, meta))
++            verdicts[note_path] = verify_note(note_path, coral_dir)
++        stamp_verdicts(shared_notes_dir, verdicts)
++
++        groups = group_notes(notes, verdicts, coral_dir=coral_dir)
++        ranked_groups = rank_groups(groups, verdicts)
++        return groups, ranked_groups, verdicts
++
+     def _do_publication_pass(self) -> None:
+         """Publication-gate pass body (single island): harvest every live
+         agent's note drafts into shared state, verify + stamp their
+-        evidence, group/rank once, then regenerate every live agent's
+-        served notes/skills view. Skills have no verify/group/rank step, so
+-        :func:`generate_skills_view` harvests and mirrors them in one call
+-        (see its docstring) — no separate ``harvest_skills`` call here.
++        evidence, group them, optionally CONSOLIDATE via the LLM gate
++        (verified before anything is served), rank, then regenerate every
++        live agent's served notes/skills view. Skills have no verify/
++        group/rank step, so :func:`generate_skills_view` harvests and
++        mirrors them in one call (see its docstring) — no separate
++        ``harvest_skills`` call here.
+         """
+         if self.paths is None:
+             raise RuntimeError("run paths are not initialized; start_all() has not run")
+@@ -1920,20 +1981,37 @@ class AgentManager:
+             harvest_drafts(view_notes_dir, shared_notes_dir, manifest)
+             save_manifest(public_root, agent_id, manifest, kind="notes")
+ 
+-        # 2. Verify + stamp every shared note's evidence against the attempt
+-        #    store, now that this pass's drafts are folded in.
+-        note_paths = _iter_user_note_files(shared_notes_dir)
+-        notes: list[tuple[Path, dict[str, Any]]] = []
+-        verdicts: dict[Path, Verdict] = {}
+-        for note_path in note_paths:
+-            meta, _ = _parse_frontmatter(note_path.read_text())
+-            notes.append((note_path, meta))
+-            verdicts[note_path] = verify_note(note_path, coral_dir)
+-        stamp_verdicts(shared_notes_dir, verdicts)
+-
+-        # 3. Group + rank once over the now-harvested, now-stamped notes.
+-        groups = group_notes(notes, verdicts, coral_dir=coral_dir)
+-        ranked_groups = rank_groups(groups, verdicts)
++        # 2-3. Verify + stamp every shared note's evidence against the
++        #    attempt store, then group + rank, now that this pass's drafts
++        #    are folded in.
++        groups, ranked_groups, verdicts = self._verify_stamp_and_group(coral_dir, shared_notes_dir)
++
++        # 3.5. CONSOLIDATE (optional, LLM, verified): only when a gate LLM
++        #    callable is configured (see _effective_gate_llm_call). Each
++        #    eligible group gets at most one LLM call, verified against the
++        #    attempt store exactly like any agent-authored note before it's
++        #    ever served -- see consolidation.run_consolidation_pass's
++        #    docstring. A successful consolidation archives its member notes
++        #    out of shared_notes_dir and adds a new consolidated note, so
++        #    groups/ranked_groups/verdicts computed above are now stale --
++        #    re-run step 2-3 to pick up the new note (which needs its own
++        #    coral_* stamp from verify_note) and the shrunk member set
++        #    (archived originals must drop out of ranked_groups/the index).
++        #    A no-op (nothing newly consolidated) leaves shared state
++        #    untouched, so re-running would be redundant -- skipped.
++        llm_call = self._effective_gate_llm_call()
++        if llm_call is not None:
++            consolidated_any = consolidation.run_consolidation_pass(
++                shared_notes_dir,
++                coral_dir,
++                groups,
++                llm_call=llm_call,
++                public_root=public_root,
++            )
++            if consolidated_any:
++                groups, ranked_groups, verdicts = self._verify_stamp_and_group(
++                    coral_dir, shared_notes_dir
++                )
+ 
+         # 4. Regenerate every live agent's served view from shared state.
+         for agent_id, worktree_path, shared_dir_name in live_agents:
+diff --git a/tests/test_gate_consolidation_manager.py b/tests/test_gate_consolidation_manager.py
+new file mode 100644
+index 0000000..11479eb
+--- /dev/null
++++ b/tests/test_gate_consolidation_manager.py
+@@ -0,0 +1,479 @@
++"""Integration tests for the LLM note consolidator wired into
++``AgentManager._do_publication_pass`` (``coral/agent/manager.py``).
++
++Unlike ``tests/test_gate_consolidation_core.py`` (which drives
++``coral.hub.consolidation.run_consolidation_pass`` directly), these tests
++exercise the real manager entrypoint (``_run_publication_pass``) end to end:
++agent-authored note drafts sitting in a served view get harvested, verified/
++stamped, grouped, optionally consolidated, and mirrored back out to every
++live agent's view + index.
++
++A real LLM is never invoked here -- every test injects a fake callable via
++``mgr._gate_llm_call`` (see that attribute's docstring in
++``AgentManager.__init__``), and the autouse ``_forbid_real_llm_call``
++fixture monkeypatches :func:`coral.hub.consolidation.default_llm_call` to
++raise, so any accidental code path reaching for the real thing fails loudly.
++
++Fixture helpers (``_make_manager`` / ``_make_handle`` / ``_make_attempt`` /
++``_write_note_file``) mirror ``tests/test_publication_gate.py``'s Task 9
++harness so the suites read the same way; kept local (not imported) since
++this file must not depend on that one's internals shifting -- same
++convention as ``tests/test_gate_consolidation.py`` / ``test_gate_consolidation_core.py``.
++"""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++import pytest
++
++from coral.config import CoralConfig
++from coral.hub.attempts import write_attempt
++from coral.hub.consolidation import load_consolidation_cache
++from coral.hub.notes import _parse_frontmatter
++from coral.types import Attempt
++
++# --------------------------------------------------------------------------- #
++# Fixture helpers                                                             #
++# --------------------------------------------------------------------------- #
++
++_FULL_HASH = "7b1e4d001122334455667788990011223344aabb"
++_SHORT_HASH = _FULL_HASH[:12]
++_FULL_HASH_2 = "9c2f5e112233445566778899001122334455bbcc"
++_SHORT_HASH_2 = _FULL_HASH_2[:12]
++_FULL_HASH_3 = "aa11bb22cc33dd44ee55ff66001122334455aabb"
++_SHORT_HASH_3 = _FULL_HASH_3[:12]
++
++# Near-identical tag sets: intersection 3 / union 5 = 0.6 >= 0.5 -> Rule 2 groups.
++_TAGS_A = "tiling, matmul, cache, perf"
++_TAGS_B = "tiling, matmul, cache, alignment"
++
++
++@pytest.fixture(autouse=True)
++def _forbid_real_llm_call(monkeypatch):
++    """Safety net: nothing in this suite may ever reach the real LLM call."""
++
++    def _boom(*args, **kwargs):
++        raise AssertionError("default_llm_call must never be invoked by tests")
++
++    monkeypatch.setattr("coral.hub.consolidation.default_llm_call", _boom)
++
++
++def _make_attempt(
++    commit: str,
++    agent: str = "island-0-agent-2",
++    score: float | None = 0.42,
++    metadata: dict | None = None,
++) -> Attempt:
++    return Attempt(
++        commit_hash=commit,
++        agent_id=agent,
++        title="a change",
++        score=score,
++        status="improved" if score is not None else "pending",
++        parent_hash=None,
++        timestamp="2026-03-14T17:00:00-00:00",
++        metadata=metadata or {},
++    )
++
++
++def _write_note(path: Path, text: str) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(text)
++
++
++def _write_note_file(path: Path, frontmatter: str, body: str = "# Title\nBody text.\n") -> Path:
++    _write_note(path, f"---\n{frontmatter}\n---\n\n{body}")
++    return path
++
++
++def _make_manager(
++    tmp_path: Path,
++    *,
++    publication_gate: bool,
++    knowledge: bool = True,
++    islands_count: int = 1,
++):
++    """A real ``AgentManager`` (mirrors test_publication_gate.py's Task 9
++    ``_make_manager``) with 2 agents, but no live subprocess --
++    ``paths``/``handles`` are set directly rather than going through
++    ``start_all()``."""
++    from coral.agent.manager import AgentManager
++    from coral.workspace.project import ProjectPaths
++
++    cfg = CoralConfig.from_dict(
++        {
++            "task": {"name": "t", "description": "d"},
++            "agents": {
++                "count": 2,
++                "timeout": 1,
++                "publication_gate": publication_gate,
++                "knowledge": knowledge,
++            },
++            "islands": {"count": islands_count},
++        }
++    )
++    mgr = AgentManager(cfg)
++    coral_dir = tmp_path / ".coral"
++    mgr.paths = ProjectPaths(
++        results_dir=tmp_path,
++        task_dir=tmp_path,
++        run_dir=tmp_path,
++        coral_dir=coral_dir,
++        agents_dir=tmp_path / "agents",
++        repo_dir=tmp_path / "repo",
++    )
++    return mgr, coral_dir
++
++
++def _make_handle(agent_id: str, worktree_path: Path, log_path: Path):
++    from coral.agent.runtime import AgentHandle
++
++    worktree_path.mkdir(parents=True, exist_ok=True)
++    return AgentHandle(agent_id=agent_id, process=None, worktree_path=worktree_path, log_path=log_path)
++
++
++def _consolidation_response(
++    pairs: list[tuple[str, float]], *, title: str = "Combined finding", body: str = "Combined synthesis.\n"
++) -> str:
++    lines = [f"TITLE: {title}", "ATTEMPTS:"]
++    lines += [f"- {h}: {s}" for h, s in pairs]
++    lines += ["BODY:", body]
++    return "\n".join(lines) + "\n"
++
++
++def _setup_two_agent_group(mgr, coral_dir: Path) -> tuple[str, str, Path, Path]:
++    """Two live agents, two real scored attempts, two agent-authored draft
++    notes (near-identical tags -> group via Rule 2) sitting in each agent's
++    served view, ready to be harvested. Returns
++    ``(agent1_id, agent2_id, agent1_worktree, agent2_worktree)``.
++    """
++    agent1_id, agent2_id = (s.agent_id for s in mgr.specs)
++    (coral_dir / "public" / "notes").mkdir(parents=True)
++    (coral_dir / "public" / "attempts").mkdir(parents=True)
++
++    write_attempt(coral_dir, _make_attempt(_FULL_HASH, agent=agent1_id, score=0.42))
++    write_attempt(coral_dir, _make_attempt(_FULL_HASH_2, agent=agent2_id, score=0.55))
++
++    agent1_worktree = mgr.paths.agents_dir / agent1_id
++    agent2_worktree = mgr.paths.agents_dir / agent2_id
++    mgr.handles = [
++        _make_handle(agent1_id, agent1_worktree, agent1_worktree.parent / "a1.log"),
++        _make_handle(agent2_id, agent2_worktree, agent2_worktree.parent / "a2.log"),
++    ]
++    for wt in (agent1_worktree, agent2_worktree):
++        (wt / ".claude" / "notes").mkdir(parents=True)
++        (wt / ".claude" / "skills").mkdir(parents=True)
++
++    _write_note_file(
++        agent1_worktree / ".claude" / "notes" / "a.md",
++        f"creator: {agent1_id}\n"
++        "created: 2026-03-10T00:00:00-00:00\n"
++        f"tags: [{_TAGS_A}]\n"
++        "evidence:\n"
++        f"  attempt: {_SHORT_HASH}\n"
++        '  score: "0.4200"\n',
++        body="# A\nFinding A.\n",
++    )
++    _write_note_file(
++        agent2_worktree / ".claude" / "notes" / "b.md",
++        f"creator: {agent2_id}\n"
++        "created: 2026-03-11T00:00:00-00:00\n"
++        f"tags: [{_TAGS_B}]\n"
++        "evidence:\n"
++        f"  attempt: {_SHORT_HASH_2}\n"
++        '  score: "0.5500"\n',
++        body="# B\nFinding B.\n",
++    )
++    return agent1_id, agent2_id, agent1_worktree, agent2_worktree
++
++
++# --------------------------------------------------------------------------- #
++# (a) happy path                                                              #
++# --------------------------------------------------------------------------- #
++
++
++def test_consolidation_happy_path_archives_originals_and_serves_only_consolidated(tmp_path):
++    mgr, coral_dir = _make_manager(tmp_path, publication_gate=True)
++    _agent1_id, _agent2_id, agent1_worktree, agent2_worktree = _setup_two_agent_group(mgr, coral_dir)
++
++    calls: list[str] = []
++
++    def fake_llm(prompt: str) -> str:
++        calls.append(prompt)
++        return _consolidation_response([(_FULL_HASH, 0.42), (_FULL_HASH_2, 0.55)])
++
++    mgr._gate_llm_call = fake_llm
++
++    for _ in range(3):  # settle: active pass + cheap follow-up(s)
++        mgr._run_publication_pass()
++
++    assert len(calls) == 1
++
++    public_root = coral_dir / "public"
++    shared_notes_dir = public_root / "notes"
++
++    consolidated_files = list(shared_notes_dir.glob("consolidated-*.md"))
++    assert len(consolidated_files) == 1
++    consolidated_name = consolidated_files[0].name
++    consolidated_text = consolidated_files[0].read_text()
++    assert "coral_verified: true" in consolidated_text
++
++    # Originals gone from shared notes.
++    assert not (shared_notes_dir / "a.md").exists()
++    assert not (shared_notes_dir / "b.md").exists()
++
++    # Both originals archived together under one note_archive/<group_id>/ dir.
++    archive_dirs = list((public_root / "note_archive").iterdir())
++    assert len(archive_dirs) == 1
++    assert sorted(p.name for p in archive_dirs[0].iterdir()) == ["a.md", "b.md"]
++
++    # Both agents' views + index contain ONLY the consolidated note -- no
++    # see-also, originals absent from view dirs entirely.
++    for wt in (agent1_worktree, agent2_worktree):
++        view_notes_dir = wt / ".claude" / "notes"
++        assert not (view_notes_dir / "a.md").exists()
++        assert not (view_notes_dir / "b.md").exists()
++        assert (view_notes_dir / consolidated_name).exists()
++
++        md_files = {p.name for p in view_notes_dir.glob("*.md") if p.name != "index.md"}
++        assert md_files == {consolidated_name}
++
++        index_text = (view_notes_dir / "index.md").read_text()
++        assert "Combined finding" in index_text
++        assert "see also" not in index_text
++
++
++# --------------------------------------------------------------------------- #
++# (b) hallucinated score                                                      #
++# --------------------------------------------------------------------------- #
++
++
++def test_consolidation_hallucinated_score_leaves_originals_and_records_failure(tmp_path):
++    mgr, coral_dir = _make_manager(tmp_path, publication_gate=True)
++    _agent1_id, _agent2_id, agent1_worktree, agent2_worktree = _setup_two_agent_group(mgr, coral_dir)
++
++    calls: list[str] = []
++
++    def fake_llm(prompt: str) -> str:
++        calls.append(prompt)
++        # Wrong score for the second hash -- real score is 0.55.
++        return _consolidation_response([(_FULL_HASH, 0.42), (_FULL_HASH_2, 0.99)])
++
++    mgr._gate_llm_call = fake_llm
++
++    for _ in range(3):
++        mgr._run_publication_pass()
++
++    assert len(calls) == 1  # cache records the failure -> not retried on follow-up
++
++    public_root = coral_dir / "public"
++    shared_notes_dir = public_root / "notes"
++
++    assert list(shared_notes_dir.glob("consolidated-*.md")) == []
++    assert not (public_root / "note_archive").exists()
++
++    # Originals intact in shared state and in both agents' views.
++    assert (shared_notes_dir / "a.md").exists()
++    assert (shared_notes_dir / "b.md").exists()
++    assert (agent1_worktree / ".claude" / "notes" / "a.md").exists()
++    assert (agent2_worktree / ".claude" / "notes" / "b.md").exists()
++
++    # See-also representation still present in the index.
++    index_text = (agent1_worktree / ".claude" / "notes" / "index.md").read_text()
++    assert "see also" in index_text
++
++    cache = load_consolidation_cache(public_root)
++    assert len(cache) == 1
++    assert next(iter(cache.values()))["status"] == "failed"
++
++
++# --------------------------------------------------------------------------- #
++# (c) LLM raises                                                              #
++# --------------------------------------------------------------------------- #
++
++
++def test_consolidation_llm_exception_leaves_originals_and_records_failure(tmp_path):
++    mgr, coral_dir = _make_manager(tmp_path, publication_gate=True)
++    _agent1_id, _agent2_id, agent1_worktree, agent2_worktree = _setup_two_agent_group(mgr, coral_dir)
++
++    calls: list[str] = []
++
++    def fake_llm(prompt: str) -> str:
++        calls.append(prompt)
++        raise RuntimeError("LLM unavailable")
++
++    mgr._gate_llm_call = fake_llm
++
++    for _ in range(3):
++        mgr._run_publication_pass()
++
++    assert len(calls) == 1
++
++    public_root = coral_dir / "public"
++    shared_notes_dir = public_root / "notes"
++
++    assert list(shared_notes_dir.glob("consolidated-*.md")) == []
++    assert not (public_root / "note_archive").exists()
++    assert (shared_notes_dir / "a.md").exists()
++    assert (shared_notes_dir / "b.md").exists()
++    assert (agent1_worktree / ".claude" / "notes" / "a.md").exists()
++    assert (agent2_worktree / ".claude" / "notes" / "b.md").exists()
++
++    index_text = (agent1_worktree / ".claude" / "notes" / "index.md").read_text()
++    assert "see also" in index_text
++
++    cache = load_consolidation_cache(public_root)
++    assert len(cache) == 1
++    assert next(iter(cache.values()))["status"] == "failed"
++
++
++# --------------------------------------------------------------------------- #
++# (d) re-consolidation                                                        #
++# --------------------------------------------------------------------------- #
++
++
++def test_consolidation_reconsolidates_group_including_prior_consolidated_note(tmp_path):
++    mgr, coral_dir = _make_manager(tmp_path, publication_gate=True)
++    agent1_id, agent2_id, agent1_worktree, agent2_worktree = _setup_two_agent_group(mgr, coral_dir)
++
++    calls: list[str] = []
++
++    def fake_llm(prompt: str) -> str:
++        calls.append(prompt)
++        # Both consolidation rounds end up citing the same expected set
++        # ({hash1, hash2}): round 1 groups a.md+b.md; round 2 groups the
++        # resulting consolidated note (citing both) with a new note citing
++        # just hash1, whose union is still {hash1, hash2}.
++        return _consolidation_response([(_FULL_HASH, 0.42), (_FULL_HASH_2, 0.55)])
++
++    mgr._gate_llm_call = fake_llm
++
++    for _ in range(3):
++        mgr._run_publication_pass()
++
++    public_root = coral_dir / "public"
++    shared_notes_dir = public_root / "notes"
++
++    assert len(calls) == 1
++    first_consolidated = list(shared_notes_dir.glob("consolidated-*.md"))
++    assert len(first_consolidated) == 1
++    first_name = first_consolidated[0].name
++
++    # A third note (by agent2) citing one of the same attempts -- Rule 1
++    # set-intersection groups it with the existing consolidated note.
++    _write_note_file(
++        agent2_worktree / ".claude" / "notes" / "c.md",
++        f"creator: {agent2_id}\n"
++        "created: 2026-03-12T00:00:00-00:00\n"
++        "evidence:\n"
++        f"  attempt: {_SHORT_HASH}\n"
++        '  score: "0.4200"\n',
++        body="# C\nA follow-up note citing the same underlying attempt.\n",
++    )
++
++    for _ in range(3):
++        mgr._run_publication_pass()
++
++    assert len(calls) == 2  # exactly one new LLM call for the new member set
++
++    final_consolidated = list(shared_notes_dir.glob("consolidated-*.md"))
++    assert len(final_consolidated) == 1
++    final_name = final_consolidated[0].name
++    assert final_name != first_name  # a genuinely new consolidated note
++
++    # The prior consolidated note is no longer served -- it's archived too.
++    assert not (shared_notes_dir / first_name).exists()
++
++    archive_dirs = list((public_root / "note_archive").iterdir())
++    assert len(archive_dirs) == 2
++    member_sets = [sorted(p.name for p in d.iterdir()) for d in archive_dirs]
++    assert sorted(["a.md", "b.md"]) in member_sets
++    assert sorted([first_name, "c.md"]) in member_sets
++
++    # Views end up holding only the final consolidated note for this topic.
++    for wt in (agent1_worktree, agent2_worktree):
++        view_notes_dir = wt / ".claude" / "notes"
++        md_files = {p.name for p in view_notes_dir.glob("*.md") if p.name != "index.md"}
++        assert md_files == {final_name}
++
++
++# --------------------------------------------------------------------------- #
++# (e) settle / no hot loop                                                    #
++# --------------------------------------------------------------------------- #
++
++
++def test_consolidation_settle_no_hot_loop_llm_called_once_per_member_set(tmp_path, monkeypatch):
++    mgr, coral_dir = _make_manager(tmp_path, publication_gate=True)
++    _setup_two_agent_group(mgr, coral_dir)
++
++    llm_calls: list[str] = []
++
++    def fake_llm(prompt: str) -> str:
++        llm_calls.append(prompt)
++        return _consolidation_response([(_FULL_HASH, 0.42), (_FULL_HASH_2, 0.55)])
++
++    mgr._gate_llm_call = fake_llm
++
++    do_pass_calls: list[int] = []
++    real_do_pass = mgr._do_publication_pass
++
++    def _counting_do_pass():
++        do_pass_calls.append(1)
++        real_do_pass()
++
++    monkeypatch.setattr(mgr, "_do_publication_pass", _counting_do_pass)
++
++    for _ in range(5):
++        mgr._run_publication_pass()
++
++    # Exactly one active pass (harvest + consolidate + regenerate) plus one
++    # cheap follow-up (the active pass's own writes moved the signature) --
++    # never a hot loop.
++    assert len(do_pass_calls) == 2
++    assert len(llm_calls) == 1
++
++    for _ in range(3):  # a few more ticks: must stay perfectly stable
++        mgr._run_publication_pass()
++    assert len(do_pass_calls) == 2
++    assert len(llm_calls) == 1
++
++
++# --------------------------------------------------------------------------- #
++# (f) flag off                                                                #
++# --------------------------------------------------------------------------- #
++
++
++def test_consolidation_flag_off_is_byte_identical_current_path(tmp_path):
++    mgr, coral_dir = _make_manager(tmp_path, publication_gate=True)
++    _agent1_id, _agent2_id, agent1_worktree, agent2_worktree = _setup_two_agent_group(mgr, coral_dir)
++
++    # gate_consolidator_model defaults to None and mgr._gate_llm_call is
++    # never set -- consolidation is off entirely.
++    assert mgr.config.agents.gate_consolidator_model is None
++    assert mgr._gate_llm_call is None
++
++    for _ in range(3):
++        mgr._run_publication_pass()
++
++    public_root = coral_dir / "public"
++    shared_notes_dir = public_root / "notes"
++
++    assert list(shared_notes_dir.glob("consolidated-*.md")) == []
++    assert not (public_root / "note_archive").exists()
++    assert load_consolidation_cache(public_root) == {}
++
++    # Pre-existing see-also behavior intact: both originals served, one
++    # carries the see-also stub in its view copy, the index links the other.
++    assert (shared_notes_dir / "a.md").exists()
++    assert (shared_notes_dir / "b.md").exists()
++
++    view_a = (agent1_worktree / ".claude" / "notes" / "a.md").read_text()
++    view_b = (agent2_worktree / ".claude" / "notes" / "b.md").read_text()
++    assert "<!-- coral:see-also -->" in view_a or "<!-- coral:see-also -->" in view_b
++
++    index_text = (agent1_worktree / ".claude" / "notes" / "index.md").read_text()
++    assert "see also" in index_text
++
++    meta_a, _ = _parse_frontmatter((shared_notes_dir / "a.md").read_text())
++    assert meta_a["coral_verified"] is True
+-- 
+2.45.1.windows.1
+

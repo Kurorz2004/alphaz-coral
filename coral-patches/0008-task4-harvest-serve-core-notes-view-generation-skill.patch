@@ -1,0 +1,1079 @@
+From b934dc341806360e8ff4d8fda11984b50fa6f745 Mon Sep 17 00:00:00 2001
+From: Steve <steventhanhtuan@gmail.com>
+Date: Tue, 14 Jul 2026 16:22:53 +0700
+Subject: [PATCH 08/17] task4: harvest/serve core, notes view generation +
+ skills mirror
+
+Per-agent sha256 manifest under .publication/. harvest_drafts copies
+agent-written or edited notes into shared state (index.md excluded,
+see-also stub stripped) before any regeneration. generate_notes_view
+mirrors shared notes into the worktree view with a three-way write
+guard (absent / unchanged-since-last-write / already-target) so a
+mid-pass agent edit is never clobbered and is harvested next pass.
+stamp_verdicts writes coral_* fields only on change; unverifiable maps
+to coral_verified: null so it renders [unverified], never [verified].
+generate_skills_view harvests and mirrors skills verbatim, binary-safe.
+
+Reviewed twice; two runtime-confirmed blocking bugs (clobber window,
+unverifiable truthy misrender) fixed with regression tests.
+684 passed, ruff clean.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ coral/hub/publication.py       | 564 ++++++++++++++++++++++++++++++++-
+ tests/test_publication_gate.py | 447 ++++++++++++++++++++++++++
+ 2 files changed, 1009 insertions(+), 2 deletions(-)
+
+diff --git a/coral/hub/publication.py b/coral/hub/publication.py
+index ff17534..2471c2f 100644
+--- a/coral/hub/publication.py
++++ b/coral/hub/publication.py
+@@ -17,14 +17,24 @@ nothing here reads that config flag — the caller decides whether to invoke it.
+ 
+ from __future__ import annotations
+ 
++import hashlib
++import json
+ import os
++import re
++import tempfile
+ from dataclasses import dataclass
+-from datetime import datetime
++from datetime import UTC, datetime
+ from pathlib import Path
+ from typing import Any, Literal
+ 
+ from coral.hub.attempts import _attempts_dir, read_attempt
+-from coral.hub.notes import UNATTRIBUTED_CREATOR, _parse_frontmatter, _parse_note_file, _sort_key
++from coral.hub.notes import (
++    UNATTRIBUTED_CREATOR,
++    _parse_frontmatter,
++    _parse_note_file,
++    _sort_key,
++    upsert_frontmatter,
++)
+ from coral.types import BUDGET_CLASS_REAL
+ 
+ # The evidence keys that must equal Attempt.score (within tolerance) when
+@@ -415,3 +425,553 @@ def render_index(ranked_groups: list[Group], verdicts: dict[Path, Verdict], base
+             link = _relative_link(member_path, base_dir)
+             lines.append(f"    - see also: [{member['title']}]({link})")
+     return "\n".join(lines) + "\n"
++
++
++# --------------------------------------------------------------------------- #
++# Harvest + serve: agent view <-> shared state                                #
++# --------------------------------------------------------------------------- #
++#
++# When the publication gate is on, notes/ and skills/ in an agent worktree are
++# real directories the manager GENERATES (not symlinks). Agents write freely
++# into them; the manager harvests their writes into shared state, verifies/
++# stamps, then regenerates each view. A per-agent manifest records what the
++# framework last wrote so agent writes are never clobbered.
++#
++# Pass order (every call site follows this, and the functions below are
++# designed so calling them in this order is the natural thing to do):
++#
++#   1. harvest_drafts() / harvest_skills() - fold agent writes sitting in the
++#      view into shared state, using the manifest from the *previous* pass to
++#      tell an agent draft from a framework-written file.
++#   2. stamp_verdicts()                    - verify_note() + write verdicts
++#      into the now-current shared notes.
++#   3. group_notes() / rank_groups()       - cluster + order the (now
++#      harvested + stamped) shared notes.
++#   4. generate_notes_view() /
++#      generate_skills_view()              - rebuild the view from shared
++#      state and save the new manifest for next pass.
++#
++# Harvest must always run before regenerate: regenerate treats shared state
++# as ground truth and overwrites the view from it, so any agent edit still
++# sitting only in the view would be lost if harvest hadn't already folded it
++# into shared state first.
++
++_MANIFEST_DIR = ".publication"
++
++
++def _manifest_path(public_root: str | Path, agent_id: str, *, kind: str = "notes") -> Path:
++    suffix = "" if kind == "notes" else f".{kind}"
++    return Path(public_root) / _MANIFEST_DIR / f"{agent_id}{suffix}.json"
++
++
++def load_manifest(public_root: str | Path, agent_id: str, *, kind: str = "notes") -> dict[str, str]:
++    """Load the per-agent harvest/serve manifest.
++
++    Maps view-relative POSIX path -> sha256 of the file content the
++    framework last wrote there. A missing manifest file (never written yet)
++    returns an empty dict — the first pass then treats every file currently
++    in the view as a potential agent draft (see :func:`harvest_drafts`),
++    which is exactly right on migration from the old symlink-based view: the
++    dir may already contain pre-existing shared content, and harvesting a
++    file that's already byte-identical in shared state is a no-op.
++    """
++    path = _manifest_path(public_root, agent_id, kind=kind)
++    if not path.exists():
++        return {}
++    try:
++        data = json.loads(path.read_text())
++    except (OSError, json.JSONDecodeError):
++        return {}
++    if not isinstance(data, dict):
++        return {}
++    return {str(k): str(v) for k, v in data.items()}
++
++
++def save_manifest(
++    public_root: str | Path, agent_id: str, manifest: dict[str, str], *, kind: str = "notes"
++) -> None:
++    """Save the per-agent manifest atomically (tmp file + ``os.replace``, same
++    dir). Skipped entirely when the content on disk already matches, so an
++    unchanged pass leaves the manifest file's mtime untouched too."""
++    path = _manifest_path(public_root, agent_id, kind=kind)
++    payload = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
++    _write_if_changed(path, payload.encode("utf-8"))
++
++
++def _atomic_write_bytes(path: Path, data: bytes) -> None:
++    """Write ``data`` to ``path`` atomically: tmp file in the same directory,
++    then ``os.replace`` — same pattern as ``notes.upsert_frontmatter`` and
++    ``attempts._write_attempt_json``. Required (not a directory swap) so
++    Docker bind mounts always see the new content.
++    """
++    path.parent.mkdir(parents=True, exist_ok=True)
++    fd, tmp_path = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
++    try:
++        with os.fdopen(fd, "wb") as f:
++            f.write(data)
++            f.flush()
++            os.fsync(f.fileno())
++        os.replace(tmp_path, path)
++    except Exception:
++        try:
++            os.unlink(tmp_path)
++        except OSError:
++            pass
++        raise
++
++
++def _write_if_changed(path: Path, data: bytes) -> bool:
++    """Write ``data`` to ``path`` (atomically) only if it differs from what's
++    already there. Returns whether a write happened. Comparing by sha256
++    (rather than always writing) is what keeps an unchanged regenerate pass
++    from touching any mtimes or leaving tmp-file churn.
++    """
++    if path.exists():
++        try:
++            if _sha256_bytes(path.read_bytes()) == _sha256_bytes(data):
++                return False
++        except OSError:
++            pass
++    _atomic_write_bytes(path, data)
++    return True
++
++
++def _sha256_bytes(data: bytes) -> str:
++    return hashlib.sha256(data).hexdigest()
++
++
++def _sha256_file(path: Path) -> str | None:
++    try:
++        return _sha256_bytes(path.read_bytes())
++    except OSError:
++        return None
++
++
++# See-also stub: the framework appends this to a group representative's
++# *served view copy only* — shared notes (the canonical source) never carry
++# it. Delimited by exact marker lines so it can be stripped deterministically
++# before an edited representative is harvested back into shared state.
++_SEE_ALSO_START = "<!-- coral:see-also -->"
++_SEE_ALSO_END = "<!-- /coral:see-also -->"
++
++_SEE_ALSO_RE = re.compile(
++    r"\n*" + re.escape(_SEE_ALSO_START) + r".*?" + re.escape(_SEE_ALSO_END) + r"\n*",
++    re.DOTALL,
++)
++
++
++def _render_see_also_block(links: list[tuple[str, str]]) -> str:
++    lines = [_SEE_ALSO_START]
++    lines += [f"- see also: [{title}]({link})" for title, link in links]
++    lines.append(_SEE_ALSO_END)
++    return "\n".join(lines)
++
++
++def _append_see_also_stub(content: str, links: list[tuple[str, str]]) -> str:
++    """Append the see-also stub to a shared note's text for the view copy.
++
++    ``content`` is assumed to already end in a trailing newline (as note
++    files do); the stub is appended with exactly one blank line of
++    separation so :func:`strip_see_also_stub` can undo this exactly when
++    nothing else about the file changed.
++    """
++    return content.rstrip("\n") + "\n\n" + _render_see_also_block(links) + "\n"
++
++
++def strip_see_also_stub(content: str) -> str:
++    """Remove the framework-appended see-also stub (see
++    :func:`_append_see_also_stub`) from ``content``, if present.
++
++    A no-op on content that never had one. Used by :func:`harvest_drafts` so
++    the stub — which only belongs in the served view copy of a group
++    representative — never leaks into the shared, canonical copy of the
++    note when that file is harvested.
++    """
++    return _SEE_ALSO_RE.sub("\n", content)
++
++
++def harvest_drafts(
++    view_dir: str | Path, shared_notes_dir: str | Path, manifest: dict[str, str]
++) -> list[str]:
++    """Copy agent-authored/modified notes from the view into shared state.
++
++    Walks ``view_dir`` recursively for ``*.md`` files. A file is an *agent
++    draft* when its current sha256 is absent from, or differs from,
++    ``manifest`` (view-relative POSIX path -> sha256 the framework last
++    wrote there) — i.e. it's new, or the agent edited it since the
++    framework last wrote it. A file whose current hash matches its manifest
++    entry is framework-owned and untouched this pass — skipped entirely.
++
++    ``index.md`` is excluded unconditionally, anywhere it's found: it's a
++    generated file, and any agent edits to it are discarded (the next
++    regenerate pass overwrites it from :func:`render_index`).
++
++    Before copying a draft, the framework-appended see-also stub is
++    stripped (see :func:`strip_see_also_stub`) — shared notes never carry
++    it, even for a harvested copy of a group representative. If the
++    resulting content is already byte-identical to what's in
++    ``shared_notes_dir`` at that path, the write is skipped (this is what
++    makes harvesting a view that started as a plain copy of shared state —
++    the post-symlink-migration case — a no-op).
++
++    Returns the view-relative POSIX paths that were actually written into
++    ``shared_notes_dir`` this call.
++    """
++    view_dir = Path(view_dir)
++    shared_notes_dir = Path(shared_notes_dir)
++    harvested: list[str] = []
++    if not view_dir.is_dir():
++        return harvested
++
++    for path in sorted(view_dir.rglob("*.md")):
++        if not path.is_file() or path.name == "index.md":
++            continue
++        rel = path.relative_to(view_dir).as_posix()
++        current_hash = _sha256_file(path)
++        if current_hash is None or manifest.get(rel) == current_hash:
++            continue  # framework-owned and unmodified, or unreadable
++
++        try:
++            text = path.read_text()
++        except OSError:
++            continue
++        stripped = strip_see_also_stub(text)
++        dest_bytes = stripped.encode("utf-8")
++        dest = shared_notes_dir / rel
++        if dest.exists() and _sha256_file(dest) == _sha256_bytes(dest_bytes):
++            continue  # already identical in shared -> no-op
++
++        _atomic_write_bytes(dest, dest_bytes)
++        harvested.append(rel)
++
++    return harvested
++
++
++_VERDICT_FRONTMATTER_FIELDS = ("coral_verified", "coral_confidence", "coral_reason")
++
++
++def _coral_verified_value(verified: bool | Literal["unverifiable"]) -> bool | None:
++    """Map :attr:`Verdict.verified` onto the frontmatter value :func:`stamp_verdicts`
++    writes for ``coral_verified``.
++
++    True/False stamp literally. ``"unverifiable"`` stamps ``None`` (YAML
++    ``null``) — never the literal string ``"unverifiable"``: that string is
++    truthy, and ``notes._publication_status_token`` treats any *present*
++    ``coral_verified`` as a real verdict (``"verified"`` if truthy, else
++    ``"refuted"``), so writing the string would render an unverifiable note
++    as ``[verified/...]``.
++
++    ``notes._parse_note_file`` drops ``None``-valued trace fields when
++    building the entry dict ``list_notes()``/``format_notes_list()`` read
++    (``val not in (None, "", [], {})``), so a ``coral_verified: null`` is
++    indistinguishable from an absent ``coral_verified`` to the renderer —
++    exactly the ``[unverified]`` contract (``coral_verified`` absent,
++    ``coral_confidence`` present). ``upsert_frontmatter`` can only overwrite
++    a scalar value, not delete a key, so writing ``null`` is also how a
++    *stale* ``coral_verified: true``/``false`` left over from an earlier
++    pass gets cleared when a note's verdict later becomes unverifiable —
++    without needing a key-removal capability.
++    """
++    return None if verified == "unverifiable" else verified
++
++
++def stamp_verdicts(
++    shared_notes_dir: str | Path,
++    verdicts: dict[Path, Verdict],
++    *,
++    now: datetime | None = None,
++) -> list[Path]:
++    """Stamp :func:`verify_note` verdicts into shared source notes' frontmatter.
++
++    For each ``(note_path, verdict)`` pair (``note_path`` may be absolute, or
++    relative to ``shared_notes_dir`` — both resolve to the same file), maps
++    the :class:`Verdict` onto ``coral_verified`` (see
++    :func:`_coral_verified_value`) / ``coral_confidence`` / ``coral_reason``
++    and upserts it via ``notes.upsert_frontmatter`` — but ONLY when at least
++    one of those three values actually differs from what the note's
++    frontmatter already carries. ``upsert_frontmatter`` on its own is
++    idempotent for a byte-identical rewrite, but it would still stamp a
++    fresh ``coral_checked_at`` on every call; gating on an actual value
++    change is what keeps an unchanged note's ``coral_checked_at`` from
++    drifting forward on every pass.
++
++    Returns the paths actually rewritten.
++    """
++    shared_notes_dir = Path(shared_notes_dir)
++    now = now or datetime.now(UTC)
++    checked_at = now.isoformat()
++
++    changed: list[Path] = []
++    for raw_path, verdict in verdicts.items():
++        path = Path(raw_path)
++        if not path.is_absolute():
++            path = shared_notes_dir / path
++        if not path.is_file():
++            continue
++        try:
++            text = path.read_text()
++        except OSError:
++            continue
++        meta, _ = _parse_frontmatter(text)
++        if not meta:
++            continue
++
++        new_values = {
++            "coral_verified": _coral_verified_value(verdict.verified),
++            "coral_confidence": verdict.confidence,
++            "coral_reason": verdict.reason,
++        }
++        if all(meta.get(key) == value for key, value in new_values.items()):
++            continue  # nothing actually changed -> leave coral_checked_at alone too
++
++        new_values["coral_checked_at"] = checked_at
++        if upsert_frontmatter(path, new_values):
++            changed.append(path)
++    return changed
++
++
++def generate_notes_view(
++    view_dir: str | Path,
++    shared_notes_dir: str | Path,
++    public_root: str | Path,
++    agent_id: str,
++    verdicts: dict[Path, Verdict],
++    ranked_groups: list[Group],
++) -> None:
++    """Regenerate one agent's served notes view from shared state.
++
++    Call this only after harvest_drafts() -> stamp_verdicts() ->
++    group_notes()/rank_groups() have already run this pass against
++    ``shared_notes_dir`` (see the module-level pass-order note above) —
++    ``verdicts``/``ranked_groups`` are their output, and this function
++    treats ``shared_notes_dir`` as ground truth.
++
++    Writes, for every ``*.md`` file under ``shared_notes_dir``: a verbatim
++    copy at the same relative path under ``view_dir`` — except a group
++    representative (``group.representative`` for each group in
++    ``ranked_groups``), which additionally gets the see-also stub appended
++    (see :func:`strip_see_also_stub`), linking its group's other members by
++    path relative to ``view_dir``. Also writes ``view_dir/index.md`` via
++    :func:`render_index`, in ``ranked_groups`` order (call
++    :func:`rank_groups` first).
++
++    Every write goes through :func:`_write_if_changed` — tmp file +
++    ``os.replace`` in ``view_dir`` itself (never a directory swap — Docker
++    bind mounts don't see those), and skipped entirely when the sha256
++    already matches what's on disk, so an unchanged pass touches no mtimes.
++
++    Clobber-window guard: a view copy is only overwritten when it's absent,
++    or its *current* on-disk sha256 equals either (a) the manifest's
++    recorded hash from the *previous* pass (framework-owned, unedited since
++    then) or (b) the sha256 of the content about to be written (already in
++    sync — e.g. this same pass's ``harvest_drafts()`` just folded that exact
++    edit into ``shared_notes_dir``, so writing it back is a safe no-op).
++    Otherwise the view file diverged from both what we last wrote *and* what
++    we're about to write — an agent edit landed in the window between
++    harvest and this call — and it's left untouched, with its *previous*
++    manifest entry carried forward unchanged (or omitted, if it never had
++    one) instead of being overwritten with the hash of content we didn't
++    actually write. That's what makes the edit visible as a draft again
++    (mismatched against the carried-forward/absent manifest entry) and
++    harvested by the *next* pass's :func:`harvest_drafts`, rather than
++    silently destroyed and its loss masked by a manifest that claims the
++    framework wrote what's now on disk.
++
++    Files present in the agent's *notes* manifest (framework-generated last
++    pass) that are no longer part of this pass's generated set are deleted
++    from the view — but only when their current on-disk sha256 still equals
++    the manifest's recorded hash (the agent hasn't edited them since). An
++    agent-edited stale file is left alone; it becomes an ordinary agent
++    draft and is picked up by the next pass's :func:`harvest_drafts` instead
++    of being silently deleted.
++
++    Updates the agent's notes manifest to exactly the set of files
++    written/kept this pass (keyed by view-relative POSIX path) and saves it
++    atomically (see :func:`load_manifest`/:func:`save_manifest`).
++    """
++    view_dir = Path(view_dir)
++    shared_notes_dir = Path(shared_notes_dir)
++    public_root = Path(public_root)
++    view_dir.mkdir(parents=True, exist_ok=True)
++
++    manifest = load_manifest(public_root, agent_id, kind="notes")
++
++    # See-also links, keyed by the representative's path relative to
++    # shared_notes_dir. Values relative to shared_notes_dir equal the
++    # equivalent path relative to view_dir (the view mirrors shared state
++    # file-for-file), so no cross-directory relpath math is needed.
++    rep_links: dict[str, list[tuple[str, str]]] = {}
++    for group in ranked_groups:
++        if not group.see_also:
++            continue
++        try:
++            rep_rel = group.representative.relative_to(shared_notes_dir).as_posix()
++        except ValueError:
++            continue
++        links: list[tuple[str, str]] = []
++        for member in group.see_also:
++            try:
++                member_rel = member.relative_to(shared_notes_dir).as_posix()
++            except ValueError:
++                continue
++            title = _read_note_for_index(member).get("title") or member.stem
++            links.append((title, member_rel))
++        if links:
++            rep_links[rep_rel] = links
++
++    new_manifest: dict[str, str] = {}
++    if shared_notes_dir.is_dir():
++        for src in sorted(shared_notes_dir.rglob("*.md")):
++            if not src.is_file():
++                continue
++            rel = src.relative_to(shared_notes_dir).as_posix()
++            try:
++                content = src.read_text()
++            except OSError:
++                continue
++            links = rep_links.get(rel)
++            if links:
++                content = _append_see_also_stub(content, links)
++            content_bytes = content.encode("utf-8")
++
++            dest = view_dir / rel
++            prev_hash = manifest.get(rel)
++            target_hash = _sha256_bytes(content_bytes)
++            current_hash = _sha256_file(dest) if dest.exists() else None
++            if current_hash is None or current_hash in (prev_hash, target_hash):
++                _write_if_changed(dest, content_bytes)
++                new_manifest[rel] = target_hash
++            elif prev_hash is not None:
++                new_manifest[rel] = prev_hash
++            # else: leave rel out of new_manifest entirely -- an edited/
++            # foreign file with no prior tracked hash stays a draft
++            # candidate every pass until harvest_drafts() picks it up.
++
++    # base_dir=shared_notes_dir (not view_dir): the view mirrors
++    # shared_notes_dir's relative structure file-for-file, so the two
++    # produce identical relative-link strings, and this avoids re-keying the
++    # (shared-rooted) verdicts dict and ranked_groups paths.
++    index_text = render_index(ranked_groups, verdicts, base_dir=shared_notes_dir)
++    index_bytes = index_text.encode("utf-8")
++    _write_if_changed(view_dir / "index.md", index_bytes)
++    new_manifest["index.md"] = _sha256_bytes(index_bytes)
++
++    for rel, old_hash in manifest.items():
++        if rel in new_manifest:
++            continue
++        stale = view_dir / rel
++        if stale.is_file() and _sha256_file(stale) == old_hash:
++            try:
++                stale.unlink()
++            except OSError:
++                pass
++
++    save_manifest(public_root, agent_id, new_manifest, kind="notes")
++
++
++def harvest_skills(
++    view_skills_dir: str | Path, shared_skills_dir: str | Path, manifest: dict[str, str]
++) -> list[str]:
++    """Copy agent-written/changed skill files from the view into shared skills.
++
++    Skills are directories containing files (SKILL.md plus arbitrary
++    supporting files), so unlike :func:`harvest_drafts` this walks every
++    file recursively — not just ``*.md`` — and there is no ``index.md``
++    exclusion or see-also stripping (neither concept applies to skills).
++    Otherwise identical mechanics: a file whose current sha256 is absent
++    from or differs from ``manifest`` is an agent draft, copied atomically;
++    a draft that's already byte-identical in shared state is a no-op.
++
++    Returns the view-relative POSIX paths actually written into
++    ``shared_skills_dir`` this call.
++    """
++    view_skills_dir = Path(view_skills_dir)
++    shared_skills_dir = Path(shared_skills_dir)
++    harvested: list[str] = []
++    if not view_skills_dir.is_dir():
++        return harvested
++
++    for path in sorted(p for p in view_skills_dir.rglob("*") if p.is_file()):
++        rel = path.relative_to(view_skills_dir).as_posix()
++        current_hash = _sha256_file(path)
++        if current_hash is None or manifest.get(rel) == current_hash:
++            continue
++
++        try:
++            data = path.read_bytes()
++        except OSError:
++            continue
++        dest = shared_skills_dir / rel
++        if dest.exists() and _sha256_file(dest) == _sha256_bytes(data):
++            continue
++
++        _atomic_write_bytes(dest, data)
++        harvested.append(rel)
++
++    return harvested
++
++
++def generate_skills_view(
++    view_skills_dir: str | Path,
++    shared_skills_dir: str | Path,
++    public_root: str | Path,
++    agent_id: str,
++) -> list[str]:
++    """Harvest + mirror one agent's served skills view against shared skills.
++
++    No verify/group/rank/index for skills, so — unlike notes — harvest and
++    regenerate are one call: first harvests agent-written/changed files from
++    ``view_skills_dir`` into ``shared_skills_dir`` (see
++    :func:`harvest_skills`, using the ``"skills"`` manifest), then mirrors
++    ``shared_skills_dir`` back into ``view_skills_dir`` verbatim (every file,
++    any type, recursively) via the same atomic writer, the same
++    clobber-window guard, and the same prune rule as
++    :func:`generate_notes_view` (a stale/diverged view file is left
++    untouched — never overwritten or deleted — unless it's still unedited
++    since the framework wrote it; see that function's docstring for the
++    exact three-way rule).
++
++    Updates and saves the agent's skills manifest. Returns the view-relative
++    POSIX paths harvested from the view into shared state this call.
++    """
++    view_skills_dir = Path(view_skills_dir)
++    shared_skills_dir = Path(shared_skills_dir)
++    public_root = Path(public_root)
++    view_skills_dir.mkdir(parents=True, exist_ok=True)
++    shared_skills_dir.mkdir(parents=True, exist_ok=True)
++
++    manifest = load_manifest(public_root, agent_id, kind="skills")
++    harvested = harvest_skills(view_skills_dir, shared_skills_dir, manifest)
++
++    new_manifest: dict[str, str] = {}
++    for src in sorted(p for p in shared_skills_dir.rglob("*") if p.is_file()):
++        rel = src.relative_to(shared_skills_dir).as_posix()
++        try:
++            data = src.read_bytes()
++        except OSError:
++            continue
++
++        dest = view_skills_dir / rel
++        prev_hash = manifest.get(rel)
++        target_hash = _sha256_bytes(data)
++        current_hash = _sha256_file(dest) if dest.exists() else None
++        if current_hash is None or current_hash in (prev_hash, target_hash):
++            _write_if_changed(dest, data)
++            new_manifest[rel] = target_hash
++        elif prev_hash is not None:
++            new_manifest[rel] = prev_hash
++        # else: leave rel out of new_manifest -- edited/foreign file with no
++        # prior tracked hash stays a draft candidate until harvested.
++
++    for rel, old_hash in manifest.items():
++        if rel in new_manifest:
++            continue
++        stale = view_skills_dir / rel
++        if stale.is_file() and _sha256_file(stale) == old_hash:
++            try:
++                stale.unlink()
++            except OSError:
++                pass
++
++    save_manifest(public_root, agent_id, new_manifest, kind="skills")
++    return harvested
+diff --git a/tests/test_publication_gate.py b/tests/test_publication_gate.py
+index 39ab9e2..3971f94 100644
+--- a/tests/test_publication_gate.py
++++ b/tests/test_publication_gate.py
+@@ -17,9 +17,15 @@ from coral.hub.notes import _parse_frontmatter, format_notes_list, list_notes, u
+ from coral.hub.publication import (
+     Group,
+     Verdict,
++    generate_notes_view,
++    generate_skills_view,
+     group_notes,
++    harvest_drafts,
++    harvest_skills,
++    load_manifest,
+     rank_groups,
+     render_index,
++    stamp_verdicts,
+     verify_note,
+ )
+ from coral.types import Attempt
+@@ -875,3 +881,444 @@ def test_render_index_missing_member_file_does_not_crash(tmp_path):
+     # Missing member degrades to its filename stem instead of crashing.
+     assert "missing" in text
+     assert "(missing.md)" in text
++
++
++# --------------------------------------------------------------------------- #
++# Task 6 — harvest_drafts() / stamp_verdicts() / generate_notes_view()        #
++# --------------------------------------------------------------------------- #
++
++
++def _shared_and_view(tmp_path: Path) -> tuple[Path, Path, Path]:
++    """Set up a (public_root, shared_notes_dir, view_dir) triple that mirrors
++    the real layout, but with view_dir deliberately NOT nested under
++    public_root — the harvest/serve functions must never assume that."""
++    public_root = tmp_path / "public"
++    shared_notes_dir = public_root / "notes"
++    shared_notes_dir.mkdir(parents=True)
++    view_dir = tmp_path / "agent-view" / "notes"
++    view_dir.mkdir(parents=True)
++    return public_root, shared_notes_dir, view_dir
++
++
++def test_harvest_new_agent_note_lands_in_shared_and_survives_regeneration(tmp_path):
++    public_root, shared_notes_dir, view_dir = _shared_and_view(tmp_path)
++    draft = view_dir / "agent-note.md"
++    draft.write_text("---\ncreator: agent-1\n---\n\n# Agent Note\nFresh finding.\n")
++
++    manifest = load_manifest(public_root, "agent-1")
++    assert manifest == {}
++
++    harvested = harvest_drafts(view_dir, shared_notes_dir, manifest)
++
++    assert harvested == ["agent-note.md"]
++    shared_copy = shared_notes_dir / "agent-note.md"
++    assert shared_copy.read_text() == draft.read_text()
++
++    groups = group_notes([_note_and_meta(shared_copy)], {})
++    ranked = rank_groups(groups, {})
++    generate_notes_view(view_dir, shared_notes_dir, public_root, "agent-1", {}, ranked)
++
++    assert (view_dir / "agent-note.md").read_text() == draft.read_text()
++
++
++def test_harvest_modified_note_is_harvested_not_clobbered(tmp_path):
++    public_root, shared_notes_dir, view_dir = _shared_and_view(tmp_path)
++    shared = shared_notes_dir / "a.md"
++    shared.write_text("---\ncreator: agent-1\n---\n\n# Title\nOriginal body.\n")
++
++    groups = group_notes([_note_and_meta(shared)], {})
++    ranked = rank_groups(groups, {})
++    generate_notes_view(view_dir, shared_notes_dir, public_root, "agent-1", {}, ranked)
++
++    manifest = load_manifest(public_root, "agent-1")
++    assert "a.md" in manifest
++
++    view_copy = view_dir / "a.md"
++    view_copy.write_text("---\ncreator: agent-1\n---\n\n# Title\nAgent edited body.\n")
++
++    harvested = harvest_drafts(view_dir, shared_notes_dir, manifest)
++
++    assert harvested == ["a.md"]
++    assert "Agent edited body." in shared.read_text()
++    assert "Original body." not in shared.read_text()
++
++
++def test_generate_notes_view_leaves_no_tmp_debris(tmp_path):
++    public_root, shared_notes_dir, view_dir = _shared_and_view(tmp_path)
++    shared = shared_notes_dir / "a.md"
++    shared.write_text("---\ncreator: agent-1\n---\n\n# Title\nBody.\n")
++
++    groups = group_notes([_note_and_meta(shared)], {})
++    ranked = rank_groups(groups, {})
++    generate_notes_view(view_dir, shared_notes_dir, public_root, "agent-1", {}, ranked)
++
++    assert list(view_dir.rglob("*.tmp")) == []
++    assert list((public_root / ".publication").rglob("*.tmp")) == []
++
++
++def test_generate_notes_view_second_pass_with_no_changes_writes_nothing(tmp_path):
++    public_root, shared_notes_dir, view_dir = _shared_and_view(tmp_path)
++    shared = shared_notes_dir / "a.md"
++    shared.write_text("---\ncreator: agent-1\n---\n\n# Title\nBody.\n")
++
++    groups = group_notes([_note_and_meta(shared)], {})
++    ranked = rank_groups(groups, {})
++    generate_notes_view(view_dir, shared_notes_dir, public_root, "agent-1", {}, ranked)
++
++    note_mtime = (view_dir / "a.md").stat().st_mtime_ns
++    index_mtime = (view_dir / "index.md").stat().st_mtime_ns
++    manifest_path = public_root / ".publication" / "agent-1.json"
++    manifest_mtime = manifest_path.stat().st_mtime_ns
++    manifest_before = manifest_path.read_text()
++
++    groups2 = group_notes([_note_and_meta(shared)], {})
++    ranked2 = rank_groups(groups2, {})
++    generate_notes_view(view_dir, shared_notes_dir, public_root, "agent-1", {}, ranked2)
++
++    assert (view_dir / "a.md").stat().st_mtime_ns == note_mtime
++    assert (view_dir / "index.md").stat().st_mtime_ns == index_mtime
++    assert manifest_path.stat().st_mtime_ns == manifest_mtime
++    assert manifest_path.read_text() == manifest_before
++
++
++def test_index_md_edits_not_harvested_and_get_overwritten(tmp_path):
++    public_root, shared_notes_dir, view_dir = _shared_and_view(tmp_path)
++    shared = shared_notes_dir / "a.md"
++    shared.write_text("---\ncreator: agent-1\n---\n\n# Title\nBody.\n")
++
++    groups = group_notes([_note_and_meta(shared)], {})
++    ranked = rank_groups(groups, {})
++    generate_notes_view(view_dir, shared_notes_dir, public_root, "agent-1", {}, ranked)
++
++    (view_dir / "index.md").write_text("# hacked index\n")
++
++    manifest = load_manifest(public_root, "agent-1")
++    harvested = harvest_drafts(view_dir, shared_notes_dir, manifest)
++
++    assert "index.md" not in harvested
++    assert not (shared_notes_dir / "index.md").exists()
++
++    groups2 = group_notes([_note_and_meta(shared)], {})
++    ranked2 = rank_groups(groups2, {})
++    generate_notes_view(view_dir, shared_notes_dir, public_root, "agent-1", {}, ranked2)
++
++    regenerated = (view_dir / "index.md").read_text()
++    assert "hacked index" not in regenerated
++    assert "GENERATED" in regenerated
++
++
++def test_see_also_stub_present_in_view_but_stripped_on_harvest(tmp_path):
++    public_root, shared_notes_dir, view_dir = _shared_and_view(tmp_path)
++    rep = shared_notes_dir / "rep.md"
++    rep.write_text(
++        "---\ncreator: agent-1\ncreated: 2026-03-12T00:00:00-00:00\ntags: [x, y]\n---\n\n"
++        "# Representative\nBody.\n"
++    )
++    member = shared_notes_dir / "member.md"
++    member.write_text(
++        "---\ncreator: agent-1\ncreated: 2026-03-10T00:00:00-00:00\ntags: [x, y]\n---\n\n"
++        "# Member\nBody.\n"
++    )
++
++    notes = [_note_and_meta(rep), _note_and_meta(member)]
++    verdicts = {
++        rep: Verdict(verified=True, confidence="high", reason="ok"),
++        member: Verdict(verified=True, confidence="high", reason="ok"),
++    }
++    groups = group_notes(notes, verdicts)
++    ranked = rank_groups(groups, verdicts)
++    generate_notes_view(view_dir, shared_notes_dir, public_root, "agent-1", verdicts, ranked)
++
++    view_rep = view_dir / "rep.md"
++    view_text = view_rep.read_text()
++    assert "<!-- coral:see-also -->" in view_text
++    assert "member.md" in view_text
++
++    # Agent edits the representative's view copy (below the stub) -> forces a harvest.
++    view_rep.write_text(view_text.replace("Body.", "Body. Extra agent text."))
++
++    manifest = load_manifest(public_root, "agent-1")
++    harvested = harvest_drafts(view_dir, shared_notes_dir, manifest)
++
++    assert "rep.md" in harvested
++    shared_text = rep.read_text()
++    assert "<!-- coral:see-also -->" not in shared_text
++    assert "/coral:see-also" not in shared_text
++    assert "Extra agent text." in shared_text
++
++
++def test_prune_deleted_shared_note_removed_from_view_only_if_unedited(tmp_path):
++    public_root, shared_notes_dir, view_dir = _shared_and_view(tmp_path)
++    a = shared_notes_dir / "a.md"
++    a.write_text("---\ncreator: agent-1\n---\n\n# A\nBody.\n")
++    b = shared_notes_dir / "b.md"
++    b.write_text("---\ncreator: agent-1\n---\n\n# B\nBody.\n")
++
++    notes = [_note_and_meta(a), _note_and_meta(b)]
++    verdicts = {
++        a: Verdict(verified=True, confidence="high", reason="ok"),
++        b: Verdict(verified=True, confidence="high", reason="ok"),
++    }
++    groups = group_notes(notes, verdicts)
++    ranked = rank_groups(groups, verdicts)
++    generate_notes_view(view_dir, shared_notes_dir, public_root, "agent-1", verdicts, ranked)
++
++    assert (view_dir / "a.md").exists()
++    assert (view_dir / "b.md").exists()
++
++    # Agent edits the view copy of b.md (never harvested) -> its hash no
++    # longer matches the manifest entry recorded for it.
++    (view_dir / "b.md").write_text("agent edit, not yet harvested\n")
++
++    a.unlink()
++    b.unlink()
++
++    groups2 = group_notes([], {})
++    ranked2 = rank_groups(groups2, {})
++    generate_notes_view(view_dir, shared_notes_dir, public_root, "agent-1", {}, ranked2)
++
++    assert not (view_dir / "a.md").exists()  # unedited since written -> pruned
++    assert (view_dir / "b.md").exists()  # edited since written -> left alone
++
++
++def test_stamp_verdicts_skips_unchanged_and_preserves_checked_at(tmp_path):
++    public_root, shared_notes_dir, _view_dir = _shared_and_view(tmp_path)
++    note = shared_notes_dir / "a.md"
++    note.write_text("---\ncreator: agent-1\n---\n\n# Title\nBody.\n")
++
++    verdict = Verdict(verified=True, confidence="high", reason="evidence matches attempt")
++    changed = stamp_verdicts(shared_notes_dir, {note: verdict})
++    assert changed == [note]
++
++    meta_first, _ = _parse_frontmatter(note.read_text())
++    first_checked_at = meta_first["coral_checked_at"]
++    assert meta_first["coral_verified"] is True
++
++    # Re-stamp with the identical verdict at a different "now" -> no-op;
++    # coral_checked_at must not drift forward.
++    changed2 = stamp_verdicts(
++        shared_notes_dir, {note: verdict}, now=datetime(2030, 1, 1, tzinfo=UTC)
++    )
++    assert changed2 == []
++    meta_second, _ = _parse_frontmatter(note.read_text())
++    assert meta_second["coral_checked_at"] == first_checked_at
++
++
++# --------------------------------------------------------------------------- #
++# Task 7 — skills mirror                                                      #
++# --------------------------------------------------------------------------- #
++
++
++def _shared_and_view_skills(tmp_path: Path) -> tuple[Path, Path, Path]:
++    public_root = tmp_path / "public"
++    shared_skills_dir = public_root / "skills"
++    shared_skills_dir.mkdir(parents=True)
++    view_skills_dir = tmp_path / "agent-view" / "skills"
++    view_skills_dir.mkdir(parents=True)
++    return public_root, shared_skills_dir, view_skills_dir
++
++
++def test_skills_shared_dir_mirrored_into_view(tmp_path):
++    public_root, shared_skills_dir, view_skills_dir = _shared_and_view_skills(tmp_path)
++    skill_dir = shared_skills_dir / "my-skill"
++    skill_dir.mkdir()
++    (skill_dir / "SKILL.md").write_text("# My Skill\n")
++
++    harvested = generate_skills_view(view_skills_dir, shared_skills_dir, public_root, "agent-1")
++
++    assert harvested == []
++    assert (view_skills_dir / "my-skill" / "SKILL.md").read_text() == "# My Skill\n"
++
++
++def test_skills_agent_written_file_harvested_into_shared_and_preserved(tmp_path):
++    public_root, shared_skills_dir, view_skills_dir = _shared_and_view_skills(tmp_path)
++    skill_dir = shared_skills_dir / "my-skill"
++    skill_dir.mkdir()
++    (skill_dir / "SKILL.md").write_text("# My Skill\n")
++    generate_skills_view(view_skills_dir, shared_skills_dir, public_root, "agent-1")
++
++    new_skill_dir = view_skills_dir / "new-skill"
++    new_skill_dir.mkdir()
++    (new_skill_dir / "SKILL.md").write_text("# New Skill\n")
++    (new_skill_dir / "helper.py").write_bytes(b"def run():\n    pass\n")
++
++    harvested = generate_skills_view(view_skills_dir, shared_skills_dir, public_root, "agent-1")
++
++    assert set(harvested) == {"new-skill/SKILL.md", "new-skill/helper.py"}
++    assert (shared_skills_dir / "new-skill" / "SKILL.md").read_text() == "# New Skill\n"
++    assert (shared_skills_dir / "new-skill" / "helper.py").read_bytes() == b"def run():\n    pass\n"
++    # Still present in the view: mirrored back in the same pass.
++    assert (view_skills_dir / "new-skill" / "helper.py").exists()
++
++
++def test_harvest_skills_directly_returns_only_actually_written_paths(tmp_path):
++    public_root, shared_skills_dir, view_skills_dir = _shared_and_view_skills(tmp_path)
++    (view_skills_dir / "s1").mkdir()
++    (view_skills_dir / "s1" / "SKILL.md").write_text("# S1\n")
++
++    manifest = load_manifest(public_root, "agent-1", kind="skills")
++    harvested = harvest_skills(view_skills_dir, shared_skills_dir, manifest)
++
++    assert harvested == ["s1/SKILL.md"]
++    assert (shared_skills_dir / "s1" / "SKILL.md").read_text() == "# S1\n"
++
++
++# --------------------------------------------------------------------------- #
++# Task 6/7 — first-run migration (view dir starts as a copy of shared)        #
++# --------------------------------------------------------------------------- #
++
++
++def test_first_run_migration_harvests_nothing_and_regenerates_cleanly(tmp_path):
++    public_root, shared_notes_dir, view_dir = _shared_and_view(tmp_path)
++    shared = shared_notes_dir / "a.md"
++    shared_text = "---\ncreator: agent-1\n---\n\n# Title\nBody.\n"
++    shared.write_text(shared_text)
++
++    # Simulate the post-symlink state: view_dir already holds a byte-identical
++    # copy of shared content, and no manifest has ever been written.
++    (view_dir / "a.md").write_text(shared_text)
++
++    manifest = load_manifest(public_root, "agent-1")
++    assert manifest == {}
++
++    harvested = harvest_drafts(view_dir, shared_notes_dir, manifest)
++
++    assert harvested == []
++    assert shared.read_text() == shared_text  # untouched
++
++    groups = group_notes([_note_and_meta(shared)], {})
++    ranked = rank_groups(groups, {})
++    generate_notes_view(view_dir, shared_notes_dir, public_root, "agent-1", {}, ranked)
++
++    assert (view_dir / "a.md").read_text() == shared_text
++    assert (view_dir / "index.md").exists()
++
++
++# --------------------------------------------------------------------------- #
++# Regression: clobber window (agent edit lands between harvest and copy-back) #
++# --------------------------------------------------------------------------- #
++
++
++def test_notes_clobber_window_edit_survives_and_is_harvested_next_pass(tmp_path):
++    public_root, shared_notes_dir, view_dir = _shared_and_view(tmp_path)
++    shared = shared_notes_dir / "a.md"
++    shared.write_text("---\ncreator: agent-1\n---\n\n# Title\nBody v1.\n")
++
++    groups = group_notes([_note_and_meta(shared)], {})
++    ranked = rank_groups(groups, {})
++    generate_notes_view(view_dir, shared_notes_dir, public_root, "agent-1", {}, ranked)
++
++    # Pass N: harvest runs first and sees nothing new (view still matches
++    # what the framework wrote)...
++    manifest = load_manifest(public_root, "agent-1")
++    harvest_drafts(view_dir, shared_notes_dir, manifest)
++
++    # ...but before generate_notes_view's copy-back runs, the agent writes a
++    # NEW edit directly into the view -- the clobber window this test covers.
++    view_note = view_dir / "a.md"
++    view_note.write_text("---\ncreator: agent-1\n---\n\n# Title\nBody v2 -- mid-pass agent edit.\n")
++
++    groups2 = group_notes([_note_and_meta(shared)], {})
++    ranked2 = rank_groups(groups2, {})
++    generate_notes_view(view_dir, shared_notes_dir, public_root, "agent-1", {}, ranked2)
++
++    # The mid-pass edit must survive -- not be clobbered by the framework's
++    # (stale, pre-edit) copy-back write.
++    assert "Body v2" in view_note.read_text()
++    # And shared state must NOT have silently absorbed the framework's write
++    # as if it were the agent's edit -- it still holds what harvest_drafts
++    # actually harvested this pass (v1; v2 arrived after harvest ran).
++    assert "Body v1" in shared.read_text()
++
++    # Next pass: harvest_drafts() must pick up the mid-pass edit, because the
++    # manifest entry for it was NOT overwritten with the (unwritten) v1 hash.
++    manifest2 = load_manifest(public_root, "agent-1")
++    harvested = harvest_drafts(view_dir, shared_notes_dir, manifest2)
++
++    assert "a.md" in harvested
++    assert "Body v2" in shared.read_text()
++
++
++def test_skills_clobber_window_edit_survives_and_is_harvested_next_pass(tmp_path, monkeypatch):
++    import coral.hub.publication as publication_mod
++
++    public_root, shared_skills_dir, view_skills_dir = _shared_and_view_skills(tmp_path)
++    skill_dir = shared_skills_dir / "my-skill"
++    skill_dir.mkdir()
++    (skill_dir / "SKILL.md").write_text("v1\n")
++    generate_skills_view(view_skills_dir, shared_skills_dir, public_root, "agent-1")
++
++    real_harvest_skills = publication_mod.harvest_skills
++
++    def _harvest_then_midpass_edit(view_dir, shared_dir, manifest):
++        # Run the real harvest first (as generate_skills_view would), then
++        # simulate an agent write landing in the window between that
++        # harvest and the copy-back mirror that follows in the same pass.
++        result = real_harvest_skills(view_dir, shared_dir, manifest)
++        (view_dir / "my-skill" / "SKILL.md").write_text("v2 -- mid-pass edit\n")
++        return result
++
++    monkeypatch.setattr(publication_mod, "harvest_skills", _harvest_then_midpass_edit)
++    try:
++        generate_skills_view(view_skills_dir, shared_skills_dir, public_root, "agent-1")
++    finally:
++        monkeypatch.setattr(publication_mod, "harvest_skills", real_harvest_skills)
++
++    # The mid-pass edit must survive in the view...
++    assert (view_skills_dir / "my-skill" / "SKILL.md").read_text() == "v2 -- mid-pass edit\n"
++    # ...and shared state must still hold what harvest actually saw (v1).
++    assert (shared_skills_dir / "my-skill" / "SKILL.md").read_text() == "v1\n"
++
++    # Next pass: the real harvest_skills() picks up the edit because the
++    # manifest wasn't overwritten with the (unwritten) v1 hash.
++    harvested = generate_skills_view(view_skills_dir, shared_skills_dir, public_root, "agent-1")
++
++    assert "my-skill/SKILL.md" in harvested
++    assert (shared_skills_dir / "my-skill" / "SKILL.md").read_text() == "v2 -- mid-pass edit\n"
++
++
++# --------------------------------------------------------------------------- #
++# Regression: stamp_verdicts() must never write coral_verified: unverifiable  #
++# --------------------------------------------------------------------------- #
++
++
++def test_stamp_verdicts_unverifiable_renders_as_unverified_not_verified(tmp_path):
++    public_root, shared_notes_dir, _view_dir = _shared_and_view(tmp_path)
++    note = shared_notes_dir / "a.md"
++    note.write_text("---\ncreator: agent-1\n---\n\n# Title\nBody.\n")
++
++    verdict = Verdict(verified="unverifiable", confidence="medium", reason="no evidence cited")
++    stamp_verdicts(shared_notes_dir, {note: verdict})
++
++    # The literal string "unverifiable" must never land in the frontmatter.
++    assert "coral_verified: unverifiable" not in note.read_text()
++
++    entries = list_notes(tmp_path)
++    formatted = format_notes_list(entries)
++
++    assert formatted.endswith("[unverified]")
++    assert "[verified" not in formatted
++
++
++def test_stamp_verdicts_transition_from_verified_to_unverifiable_clears_stale_verified(tmp_path):
++    public_root, shared_notes_dir, _view_dir = _shared_and_view(tmp_path)
++    note = shared_notes_dir / "a.md"
++    note.write_text("---\ncreator: agent-1\n---\n\n# Title\nBody.\n")
++
++    stamp_verdicts(
++        shared_notes_dir,
++        {note: Verdict(verified=True, confidence="high", reason="evidence matches attempt")},
++    )
++    assert format_notes_list(list_notes(tmp_path)).endswith("[verified/high]")
++
++    # Re-stamp: this pass the citation no longer resolves (e.g. the attempt
++    # it cited disappeared). The stale coral_verified: true must not keep
++    # rendering the note as verified.
++    stamp_verdicts(
++        shared_notes_dir,
++        {note: Verdict(verified="unverifiable", confidence="medium", reason="cited attempt not found")},
++    )
++    formatted2 = format_notes_list(list_notes(tmp_path))
++
++    assert formatted2.endswith("[unverified]")
++    assert "[verified" not in formatted2
+-- 
+2.45.1.windows.1
+

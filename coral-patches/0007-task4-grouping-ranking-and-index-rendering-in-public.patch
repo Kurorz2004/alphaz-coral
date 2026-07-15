@@ -1,0 +1,660 @@
+From ad723cb32d3fc65e6b2338310a76ac12930628c4 Mon Sep 17 00:00:00 2001
+From: Steve <steventhanhtuan@gmail.com>
+Date: Tue, 14 Jul 2026 15:13:09 +0700
+Subject: [PATCH 07/17] task4: grouping, ranking and index rendering in
+ publication.py
+
+group_notes merges duplicates transitively: same resolved attempt hash,
+or tag-set Jaccard >= 0.5 (both non-empty). Representative = best
+verdict then most recent. rank_groups serves four tiers (verified/high,
+unverifiable, honest-refuted, failed), recency within tier.
+render_index generates a deterministic index.md with a status column
+and see-also sublines; links are POSIX paths relative to base_dir;
+missing member files degrade instead of crashing.
+
+Reviewed; two blocking issues (absolute links, missing-file crash)
+found and fixed. 668 passed, ruff clean.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ coral/hub/publication.py       | 250 +++++++++++++++++++++++-
+ tests/test_publication_gate.py | 345 ++++++++++++++++++++++++++++++++-
+ 2 files changed, 592 insertions(+), 3 deletions(-)
+
+diff --git a/coral/hub/publication.py b/coral/hub/publication.py
+index 3556f3c..ff17534 100644
+--- a/coral/hub/publication.py
++++ b/coral/hub/publication.py
+@@ -17,12 +17,14 @@ nothing here reads that config flag — the caller decides whether to invoke it.
+ 
+ from __future__ import annotations
+ 
++import os
+ from dataclasses import dataclass
++from datetime import datetime
+ from pathlib import Path
+-from typing import Literal
++from typing import Any, Literal
+ 
+ from coral.hub.attempts import _attempts_dir, read_attempt
+-from coral.hub.notes import _parse_frontmatter
++from coral.hub.notes import UNATTRIBUTED_CREATOR, _parse_frontmatter, _parse_note_file, _sort_key
+ from coral.types import BUDGET_CLASS_REAL
+ 
+ # The evidence keys that must equal Attempt.score (within tolerance) when
+@@ -169,3 +171,247 @@ def verify_note(
+         )
+ 
+     return Verdict(verified=True, confidence="high", reason="evidence matches attempt")
++
++
++# --------------------------------------------------------------------------- #
++# Grouping (anti-redundancy) + ranking + index rendering                      #
++# --------------------------------------------------------------------------- #
++#
++# Downstream of verify_note: a later pass calls verify_note() once per note,
++# then group_notes()/rank_groups()/render_index() to decide what the served
++# index.md looks like. Nothing here writes, calls an LLM, or hardcodes a
++# runtime-specific path, matching the rest of this module.
++
++
++@dataclass(frozen=True)
++class Group:
++    """A cluster of notes that mechanically make the same claim.
++
++    ``representative`` is the best member to serve in the index; ``see_also``
++    are the rest, most-relevant first (same ordering rule as representative
++    selection). ``recency`` is the representative's sort datetime
++    (frontmatter date, mtime fallback — see ``coral.hub.notes._sort_key``),
++    cached here so :func:`rank_groups` and :func:`render_index` don't need to
++    re-stat/re-parse the note file.
++    """
++
++    representative: Path
++    see_also: list[Path]
++    recency: datetime
++
++
++def _verified_rank(verified: bool | Literal["unverifiable"]) -> int:
++    """Order verdicts for representative selection: True > "unverifiable" > False."""
++    if verified is True:
++        return 0
++    if verified == "unverifiable":
++        return 1
++    return 2
++
++
++def _tag_set(meta: dict[str, Any]) -> set[str]:
++    tags = meta.get("tags")
++    if isinstance(tags, list):
++        return {str(t).strip() for t in tags if str(t).strip()}
++    if tags:
++        return {s.strip() for s in str(tags).split(",") if s.strip()}
++    return set()
++
++
++def _cited_attempt_key(
++    meta: dict[str, Any], coral_dir: str | Path | None, island_id: str | int | None
++) -> str | None:
++    """The value Rule 1 compares: the resolved full hash, else the raw citation."""
++    evidence = meta.get("evidence")
++    evidence = evidence if isinstance(evidence, dict) else {}
++    raw = evidence.get("attempt")
++    raw = str(raw).strip() if raw else ""
++    if not raw:
++        return None
++    if coral_dir is not None:
++        resolved = _resolve_attempt_hash(coral_dir, raw, island_id)
++        if resolved is not None:
++            return resolved
++    return raw
++
++
++def group_notes(
++    notes: list[tuple[str | Path, dict[str, Any]]],
++    verdicts: dict[Path, Verdict],
++    coral_dir: str | Path | None = None,
++    island_id: str | int | None = None,
++) -> list[Group]:
++    """Cluster notes that mechanically make the same claim (connected components).
++
++    ``notes`` is ``[(note_path, meta), ...]`` where ``meta`` is the frontmatter
++    dict the caller already parsed (e.g. via ``_parse_frontmatter`` — the same
++    parse used to drive ``verify_note``), so no note is re-read here. ``verdicts``
++    maps each note path to the :class:`Verdict` :func:`verify_note` returned
++    for it.
++
++    Two notes merge (transitively) if either:
++      - Rule 1: they cite the same attempt — compared as the resolved full
++        commit hash when ``coral_dir`` is given and the citation resolves to
++        exactly one attempt, else the raw cited string.
++      - Rule 2: both have non-empty ``tags`` and the Jaccard overlap of their
++        tag sets is >= 0.5.
++    """
++    paths = [Path(p) for p, _ in notes]
++    metas = [m for _, m in notes]
++    verdict_map = {Path(k): v for k, v in verdicts.items()}
++    n = len(paths)
++
++    parent = list(range(n))
++
++    def find(i: int) -> int:
++        while parent[i] != i:
++            parent[i] = parent[parent[i]]
++            i = parent[i]
++        return i
++
++    def union(i: int, j: int) -> None:
++        ri, rj = find(i), find(j)
++        if ri != rj:
++            parent[ri] = rj
++
++    attempt_keys = [_cited_attempt_key(m, coral_dir, island_id) for m in metas]
++    tag_sets = [_tag_set(m) for m in metas]
++
++    for i in range(n):
++        for j in range(i + 1, n):
++            if attempt_keys[i] is not None and attempt_keys[i] == attempt_keys[j]:
++                union(i, j)
++                continue
++            if tag_sets[i] and tag_sets[j]:
++                # Case-sensitive set comparison, consistent with notes.py conventions
++                # (e.g. exact `creator` equality) — tags aren't casefolded before compare.
++                overlap = len(tag_sets[i] & tag_sets[j]) / len(tag_sets[i] | tag_sets[j])
++                if overlap >= 0.5:
++                    union(i, j)
++
++    def recency(i: int) -> datetime:
++        try:
++            mtime = os.path.getmtime(paths[i])
++        except OSError:
++            mtime = None
++        return _sort_key({"date": str(metas[i].get("created", "") or ""), "_mtime": mtime})
++
++    def sort_key(i: int) -> tuple[int, float, str]:
++        verdict = verdict_map.get(paths[i])
++        rank = _verified_rank(verdict.verified if verdict else "unverifiable")
++        return (rank, -recency(i).timestamp(), str(paths[i]))
++
++    components: dict[int, list[int]] = {}
++    for i in range(n):
++        components.setdefault(find(i), []).append(i)
++
++    groups: list[Group] = []
++    for idxs in components.values():
++        ordered = sorted(idxs, key=sort_key)
++        rep_idx = ordered[0]
++        groups.append(
++            Group(
++                representative=paths[rep_idx],
++                see_also=[paths[i] for i in ordered[1:]],
++                recency=recency(rep_idx),
++            )
++        )
++    return groups
++
++
++def _tier(verdict: Verdict | None) -> int:
++    """Serving tier: 1 verified/high, 2 unverifiable, 3 verified/low (self-refuted), 4 failed."""
++    if verdict is None or verdict.verified == "unverifiable":
++        return 2
++    if verdict.verified is True:
++        return 1 if verdict.confidence == "high" else 3
++    return 4
++
++
++def rank_groups(groups: list[Group], verdicts: dict[Path, Verdict]) -> list[Group]:
++    """Order groups for serving: by tier (see :func:`_tier`), most-recent first within a tier."""
++    verdict_map = {Path(k): v for k, v in verdicts.items()}
++
++    def key(g: Group) -> tuple[int, float]:
++        return (_tier(verdict_map.get(g.representative)), -g.recency.timestamp())
++
++    return sorted(groups, key=key)
++
++
++_STATUS_LABELS = {1: "verified/high", 2: "unverified", 3: "refuted", 4: "failed"}
++
++
++def _status_label(verdict: Verdict | None) -> str:
++    """Status column wording for the served index: verified/high, unverified,
++    refuted, failed.
++
++    Deliberately *not* the same vocabulary as ``notes._publication_status_token``
++    (which only distinguishes verified/refuted): the index needs a finer split
++    within "verified True" so an honestly self-declared-refuted note whose
++    evidence still checks out (tier 3, "refuted") reads differently from a
++    note that genuinely failed verification (tier 4, "failed") — see
++    :func:`_tier`.
++    """
++    return _STATUS_LABELS[_tier(verdict)]
++
++
++_INDEX_HEADER = (
++    "<!-- GENERATED by the publication gate (agents.publication_gate). "
++    "Do not hand-edit this file — the next verification pass regenerates it "
++    "and any manual edits will be lost. -->\n"
++    "# Notes Index"
++)
++
++
++def _read_note_for_index(path: Path) -> dict[str, Any]:
++    """Parse a note file for index rendering, degrading gracefully if unreadable.
++
++    Mirrors verify_note's defensive posture on unreadable files: a note that
++    goes missing between grouping and rendering (deleted, moved, whatever)
++    must not crash the index — it falls back to the file's stem as the title
++    with no date/creator, rather than letting ``FileNotFoundError`` propagate.
++    """
++    try:
++        return _parse_note_file(path)
++    except OSError:
++        return {"title": path.stem, "date": "", "creator": ""}
++
++
++def _relative_link(path: Path, base_dir: Path) -> str:
++    """POSIX-style path to ``path``, relative to ``base_dir`` — never absolute."""
++    return Path(os.path.relpath(path, base_dir)).as_posix()
++
++
++def render_index(ranked_groups: list[Group], verdicts: dict[Path, Verdict], base_dir: str | Path) -> str:
++    """Render the served ``index.md`` content for a publication-gated notes tree.
++
++    ``base_dir`` is the directory ``index.md`` itself will live in (the served
++    notes view root). Every see-also link is rendered as a POSIX-style path
++    *relative to* ``base_dir`` (``os.path.relpath`` + forward slashes) —
++    never an absolute filesystem path, so the generated file stays portable
++    across machines/checkouts/runtimes.
++
++    One line per group representative — date, title, creator, status — with
++    the group's remaining members rendered as indented "see also" sublines
++    directly under it, linking their actual (relative) file paths. Renders
++    ``ranked_groups`` in the order given, so call :func:`rank_groups` first to
++    put refuted/failed entries last. A note file that's gone missing since
++    grouping degrades gracefully instead of raising — see
++    :func:`_read_note_for_index`. Deterministic: the same
++    ``ranked_groups``/``verdicts``/``base_dir`` (and unchanged note files on
++    disk) always produce the same bytes.
++    """
++    verdict_map = {Path(k): v for k, v in verdicts.items()}
++    base_dir = Path(base_dir)
++    lines = [_INDEX_HEADER, ""]
++    for group in ranked_groups:
++        rep = _read_note_for_index(group.representative)
++        status = _status_label(verdict_map.get(group.representative))
++        date = rep.get("date", "") or ""
++        creator = rep.get("creator") or UNATTRIBUTED_CREATOR
++        lines.append(f"- [{date}] {rep['title']} ({creator}) [{status}]")
++        for member_path in group.see_also:
++            member = _read_note_for_index(member_path)
++            link = _relative_link(member_path, base_dir)
++            lines.append(f"    - see also: [{member['title']}]({link})")
++    return "\n".join(lines) + "\n"
+diff --git a/tests/test_publication_gate.py b/tests/test_publication_gate.py
+index ab060a2..39ab9e2 100644
+--- a/tests/test_publication_gate.py
++++ b/tests/test_publication_gate.py
+@@ -8,12 +8,20 @@ land the gate's verification logic.
+ 
+ from __future__ import annotations
+ 
++from datetime import UTC, datetime
+ from pathlib import Path
+ 
+ from coral.config import AgentConfig, CoralConfig, TaskConfig
+ from coral.hub.attempts import write_attempt
+ from coral.hub.notes import _parse_frontmatter, format_notes_list, list_notes, upsert_frontmatter
+-from coral.hub.publication import verify_note
++from coral.hub.publication import (
++    Group,
++    Verdict,
++    group_notes,
++    rank_groups,
++    render_index,
++    verify_note,
++)
+ from coral.types import Attempt
+ 
+ # --------------------------------------------------------------------------- #
+@@ -532,3 +540,338 @@ def test_verify_note_full_hash_citation_resolves_exact_match(tmp_path):
+ 
+     assert verdict.verified is True
+     assert verdict.confidence == "high"
++
++
++# --------------------------------------------------------------------------- #
++# Task 4 — group_notes()
++# --------------------------------------------------------------------------- #
++
++
++def _note_and_meta(path: Path) -> tuple[Path, dict]:
++    """Mirror how a real caller would drive group_notes: parse frontmatter once."""
++    meta, _ = _parse_frontmatter(path.read_text())
++    return path, meta
++
++
++def test_group_notes_rule2_similar_tags_forms_one_group(tmp_path):
++    # Clarke-Wright-like pair: different attempt hashes, tags nearly
++    # identical ({cw,2opt,relocate,swap} vs {cw,2opt,relocate,or-opt} ->
++    # jaccard 3/5 = 0.6 >= 0.5) -> one group via Rule 2.
++    notes_dir = tmp_path / "public" / "notes"
++    a = _write_note_file(
++        notes_dir / "a.md",
++        "creator: agent-1\n"
++        "created: 2026-03-10T00:00:00-00:00\n"
++        "tags: [cw, 2opt, relocate, swap]\n"
++        "evidence:\n  attempt: aaaa1111\n",
++        body="# Clarke-Wright with swap\nEarlier attempt.\n",
++    )
++    b = _write_note_file(
++        notes_dir / "b.md",
++        "creator: agent-2\n"
++        "created: 2026-03-12T00:00:00-00:00\n"
++        "tags: [cw, 2opt, relocate, or-opt]\n"
++        "evidence:\n  attempt: bbbb2222\n",
++        body="# Clarke-Wright with or-opt\nLater attempt.\n",
++    )
++    notes = [_note_and_meta(a), _note_and_meta(b)]
++    verdicts = {
++        a: Verdict(verified=True, confidence="high", reason="ok"),
++        b: Verdict(verified="unverifiable", confidence="medium", reason="pending"),
++    }
++
++    groups = group_notes(notes, verdicts)
++
++    assert len(groups) == 1
++    # a is the better-verified one (True beats "unverifiable") -> representative.
++    assert groups[0].representative == a
++    assert groups[0].see_also == [b]
++
++
++def test_group_notes_rule1_distinct_prefixes_resolve_to_same_attempt(tmp_path):
++    # Two DIFFERENT-LENGTH short prefixes (8 chars vs 16 chars) citing the
++    # same underlying attempt must both resolve to the same full hash and
++    # merge via Rule 1 -- not just the trivial short-vs-full-hash case.
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH, score=0.42))
++    notes_dir = tmp_path / "public" / "notes"
++    prefix8 = _FULL_HASH[:8]
++    prefix16 = _FULL_HASH[:16]
++    assert prefix8 != prefix16
++    a = _write_note_file(
++        notes_dir / "a.md",
++        f"creator: agent-1\ncreated: 2026-03-10T00:00:00-00:00\nevidence:\n  attempt: {prefix8}\n",
++        body="# Note A\nBody.\n",
++    )
++    b = _write_note_file(
++        notes_dir / "b.md",
++        f"creator: agent-1\ncreated: 2026-03-11T00:00:00-00:00\nevidence:\n  attempt: {prefix16}\n",
++        body="# Note B\nBody.\n",
++    )
++    notes = [_note_and_meta(a), _note_and_meta(b)]
++    verdicts = {
++        a: Verdict(verified=True, confidence="high", reason="ok"),
++        b: Verdict(verified=True, confidence="high", reason="ok"),
++    }
++
++    groups = group_notes(notes, verdicts, coral_dir=tmp_path)
++
++    assert len(groups) == 1
++    # Same verdict tier -> most recent (b) wins representative.
++    assert groups[0].representative == b
++    assert groups[0].see_also == [a]
++
++
++def test_group_notes_disjoint_notes_stay_singletons(tmp_path):
++    notes_dir = tmp_path / "public" / "notes"
++    a = _write_note_file(
++        notes_dir / "a.md",
++        "creator: agent-1\ntags: [x, y]\nevidence:\n  attempt: aaaa1111\n",
++        body="# A\nBody.\n",
++    )
++    b = _write_note_file(
++        notes_dir / "b.md",
++        "creator: agent-2\ntags: [z, w]\nevidence:\n  attempt: bbbb2222\n",
++        body="# B\nBody.\n",
++    )
++    notes = [_note_and_meta(a), _note_and_meta(b)]
++    verdicts = {
++        a: Verdict(verified=True, confidence="high", reason="ok"),
++        b: Verdict(verified=True, confidence="high", reason="ok"),
++    }
++
++    groups = group_notes(notes, verdicts)
++
++    assert len(groups) == 2
++    assert {g.representative for g in groups} == {a, b}
++    assert all(g.see_also == [] for g in groups)
++
++
++def test_group_notes_transitive_merge_across_rules(tmp_path):
++    # A~B via Rule 1 (same attempt hash), B~C via Rule 2 (tags jaccard 0.5)
++    # -> one group of three, even though A and C share neither.
++    notes_dir = tmp_path / "public" / "notes"
++    a = _write_note_file(
++        notes_dir / "a.md",
++        "creator: agent-1\ncreated: 2026-03-10T00:00:00-00:00\nevidence:\n  attempt: cccc3333\n",
++        body="# A\nBody.\n",
++    )
++    b = _write_note_file(
++        notes_dir / "b.md",
++        "creator: agent-1\ncreated: 2026-03-11T00:00:00-00:00\n"
++        "tags: [p, q, r]\nevidence:\n  attempt: cccc3333\n",
++        body="# B\nBody.\n",
++    )
++    c = _write_note_file(
++        notes_dir / "c.md",
++        "creator: agent-1\ncreated: 2026-03-12T00:00:00-00:00\ntags: [p, q, s]\n",
++        body="# C\nBody.\n",
++    )
++    notes = [_note_and_meta(a), _note_and_meta(b), _note_and_meta(c)]
++    verdicts = {
++        a: Verdict(verified=True, confidence="high", reason="ok"),
++        b: Verdict(verified=True, confidence="high", reason="ok"),
++        c: Verdict(verified="unverifiable", confidence="medium", reason="no evidence cited"),
++    }
++
++    groups = group_notes(notes, verdicts)
++
++    assert len(groups) == 1
++    assert {groups[0].representative, *groups[0].see_also} == {a, b, c}
++
++
++def test_group_notes_jaccard_exactly_half_groups(tmp_path):
++    notes_dir = tmp_path / "public" / "notes"
++    a = _write_note_file(
++        notes_dir / "a.md", "creator: agent-1\ntags: [a, b]\n", body="# A\nBody.\n"
++    )
++    b = _write_note_file(
++        notes_dir / "b.md", "creator: agent-1\ntags: [a]\n", body="# B\nBody.\n"
++    )
++    notes = [_note_and_meta(a), _note_and_meta(b)]
++    verdicts = {
++        a: Verdict(verified=True, confidence="high", reason="ok"),
++        b: Verdict(verified=True, confidence="high", reason="ok"),
++    }
++
++    # {a,b} vs {a}: intersection 1, union 2 -> jaccard exactly 0.5 -> groups.
++    groups = group_notes(notes, verdicts)
++
++    assert len(groups) == 1
++
++
++def test_group_notes_jaccard_just_below_half_does_not_group(tmp_path):
++    notes_dir = tmp_path / "public" / "notes"
++    a = _write_note_file(
++        notes_dir / "a.md", "creator: agent-1\ntags: [a, b, c]\n", body="# A\nBody.\n"
++    )
++    b = _write_note_file(
++        notes_dir / "b.md", "creator: agent-1\ntags: [a, d, e]\n", body="# B\nBody.\n"
++    )
++    notes = [_note_and_meta(a), _note_and_meta(b)]
++    verdicts = {
++        a: Verdict(verified=True, confidence="high", reason="ok"),
++        b: Verdict(verified=True, confidence="high", reason="ok"),
++    }
++
++    # {a,b,c} vs {a,d,e}: intersection 1, union 5 -> jaccard 0.2 < 0.5 -> no group.
++    groups = group_notes(notes, verdicts)
++
++    assert len(groups) == 2
++
++
++def test_group_notes_empty_tags_never_group_via_rule2(tmp_path):
++    notes_dir = tmp_path / "public" / "notes"
++    a = _write_note_file(notes_dir / "a.md", "creator: agent-1\n", body="# A\nBody.\n")
++    b = _write_note_file(notes_dir / "b.md", "creator: agent-2\n", body="# B\nBody.\n")
++    notes = [_note_and_meta(a), _note_and_meta(b)]
++    verdicts = {
++        a: Verdict(verified=True, confidence="high", reason="ok"),
++        b: Verdict(verified=True, confidence="high", reason="ok"),
++    }
++
++    groups = group_notes(notes, verdicts)
++
++    assert len(groups) == 2
++
++
++# --------------------------------------------------------------------------- #
++# Task 5 — rank_groups() + render_index()
++# --------------------------------------------------------------------------- #
++
++
++def test_rank_groups_orders_by_tier_over_recency():
++    high = Path("verified_high.md")
++    unverifiable = Path("unverifiable.md")
++    refuted = Path("refuted.md")
++    failed = Path("failed.md")
++
++    # Deliberately reverse chronological order so tier (not recency) has to
++    # be the thing that produces the expected order.
++    groups = [
++        Group(representative=failed, see_also=[], recency=datetime(2026, 3, 15, tzinfo=UTC)),
++        Group(representative=refuted, see_also=[], recency=datetime(2026, 3, 14, tzinfo=UTC)),
++        Group(representative=unverifiable, see_also=[], recency=datetime(2026, 3, 13, tzinfo=UTC)),
++        Group(representative=high, see_also=[], recency=datetime(2026, 3, 12, tzinfo=UTC)),
++    ]
++    verdicts = {
++        high: Verdict(verified=True, confidence="high", reason="ok"),
++        unverifiable: Verdict(verified="unverifiable", confidence="medium", reason="pending"),
++        refuted: Verdict(verified=True, confidence="low", reason="self-declared refuted"),
++        failed: Verdict(verified=False, confidence="low", reason="score mismatch"),
++    }
++
++    ranked = rank_groups(groups, verdicts)
++
++    assert [g.representative for g in ranked] == [high, unverifiable, refuted, failed]
++
++
++def test_rank_groups_recency_breaks_ties_within_tier():
++    older = Path("older.md")
++    newer = Path("newer.md")
++    groups = [
++        Group(representative=older, see_also=[], recency=datetime(2026, 1, 1, tzinfo=UTC)),
++        Group(representative=newer, see_also=[], recency=datetime(2026, 6, 1, tzinfo=UTC)),
++    ]
++    verdicts = {
++        older: Verdict(verified=True, confidence="high", reason="ok"),
++        newer: Verdict(verified=True, confidence="high", reason="ok"),
++    }
++
++    ranked = rank_groups(groups, verdicts)
++
++    assert [g.representative for g in ranked] == [newer, older]
++
++
++def test_render_index_status_seealso_bottom_placement_and_header(tmp_path):
++    notes_dir = tmp_path / "public" / "notes"
++    rep = _write_note_file(
++        notes_dir / "rep.md",
++        "creator: agent-1\ncreated: 2026-03-12T00:00:00-00:00\n",
++        body="# Representative note\nBody.\n",
++    )
++    member = _write_note_file(
++        notes_dir / "member.md",
++        "creator: agent-2\ncreated: 2026-03-10T00:00:00-00:00\n",
++        body="# See-also note\nBody.\n",
++    )
++    refuted_note = _write_note_file(
++        notes_dir / "refuted.md",
++        "creator: agent-3\ncreated: 2026-03-09T00:00:00-00:00\n",
++        body="# Refuted note\nBody.\n",
++    )
++    failed_note = _write_note_file(
++        notes_dir / "failed.md",
++        "creator: agent-4\ncreated: 2026-03-08T00:00:00-00:00\n",
++        body="# Failed note\nBody.\n",
++    )
++
++    groups = [
++        Group(representative=rep, see_also=[member], recency=datetime(2026, 3, 12, tzinfo=UTC)),
++        Group(representative=refuted_note, see_also=[], recency=datetime(2026, 3, 9, tzinfo=UTC)),
++        Group(representative=failed_note, see_also=[], recency=datetime(2026, 3, 8, tzinfo=UTC)),
++    ]
++    verdicts = {
++        rep: Verdict(verified=True, confidence="high", reason="ok"),
++        member: Verdict(verified=True, confidence="high", reason="ok"),
++        refuted_note: Verdict(verified=True, confidence="low", reason="self-declared refuted"),
++        failed_note: Verdict(verified=False, confidence="low", reason="score mismatch"),
++    }
++
++    ranked = rank_groups(groups, verdicts)
++    text = render_index(ranked, verdicts, base_dir=notes_dir)
++
++    # Generated-file header, agents shouldn't hand-edit it.
++    assert "GENERATED" in text
++    assert "hand-edit" in text.lower()
++
++    # Status column, wording aligned with format_notes_list's tokens.
++    assert "[verified/high]" in text
++    assert "[refuted]" in text
++    assert "[failed]" in text
++
++    # See-also is an indented subline directly under its representative;
++    # refuted/failed land at the bottom, mirroring the ranking.
++    idx_rep = text.index("Representative note")
++    idx_member = text.index("See-also note")
++    idx_refuted = text.index("Refuted note")
++    idx_failed = text.index("Failed note")
++    assert idx_rep < idx_member < idx_refuted < idx_failed
++
++    seealso_line = next(ln for ln in text.splitlines() if "See-also note" in ln)
++    assert seealso_line.startswith("    ")
++    # Link is relative to base_dir (member.md lives directly in notes_dir),
++    # POSIX-style, never the absolute filesystem path.
++    assert "(member.md)" in seealso_line
++    assert str(member) not in text
++
++    # Deterministic: same input -> byte-identical output.
++    assert render_index(ranked, verdicts, base_dir=notes_dir) == text
++
++
++def test_render_index_missing_member_file_does_not_crash(tmp_path):
++    notes_dir = tmp_path / "public" / "notes"
++    rep = _write_note_file(
++        notes_dir / "rep.md",
++        "creator: agent-1\ncreated: 2026-03-12T00:00:00-00:00\n",
++        body="# Representative note\nBody.\n",
++    )
++    # A see-also member whose file was deleted/moved after grouping.
++    missing_member = notes_dir / "missing.md"
++    assert not missing_member.exists()
++
++    groups = [
++        Group(
++            representative=rep,
++            see_also=[missing_member],
++            recency=datetime(2026, 3, 12, tzinfo=UTC),
++        )
++    ]
++    verdicts = {rep: Verdict(verified=True, confidence="high", reason="ok")}
++
++    text = render_index(groups, verdicts, base_dir=notes_dir)
++
++    # Representative still renders normally.
++    assert "Representative note" in text
++    # Missing member degrades to its filename stem instead of crashing.
++    assert "missing" in text
++    assert "(missing.md)" in text
+-- 
+2.45.1.windows.1
+

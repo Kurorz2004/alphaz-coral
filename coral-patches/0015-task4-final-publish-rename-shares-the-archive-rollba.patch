@@ -1,0 +1,189 @@
+From 93a47101d35f40d0a58d8662cbae1f415ae470de Mon Sep 17 00:00:00 2001
+From: Steve <steventhanhtuan@gmail.com>
+Date: Tue, 14 Jul 2026 22:23:53 +0700
+Subject: [PATCH 15/17] task4: final publish rename shares the archive rollback
+ path
+
+A failure on the consolidated-note publish os.replace now rolls the
+just-archived members back, unlinks the temp note and records a failed
+cache entry, exactly like a mid-archive failure; previously it only hit
+the per-group catch-all (logged, no cache record, members stranded in
+the archive). Reviewer-prescribed fast-follow with regression test.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ coral/hub/consolidation.py            | 65 ++++++++++++++++-----------
+ tests/test_gate_consolidation_core.py | 61 +++++++++++++++++++++++++
+ 2 files changed, 99 insertions(+), 27 deletions(-)
+
+diff --git a/coral/hub/consolidation.py b/coral/hub/consolidation.py
+index 0e315ca..af19c4e 100644
+--- a/coral/hub/consolidation.py
++++ b/coral/hub/consolidation.py
+@@ -384,15 +384,17 @@ def run_consolidation_pass(
+        original member is atomically moved (``os.replace``, never copied)
+        into ``<public_root>/note_archive/<group_id>/`` first; only once
+        every member has been archived does the temp note become
+-       ``consolidated-<group_id>.md`` in ``shared_notes_dir``. If any member
+-       fails to archive (vanished mid-pass, cross-device dir, a locked
+-       file, ...), archiving stops immediately, everything already archived
+-       THIS group is moved back into ``shared_notes_dir`` on a best-effort
+-       basis (each move attempted in its own try/except -- a rollback
+-       failure is logged, never raised), the temp note is deleted, and the
+-       group is recorded as failed. A group therefore never ends up
+-       half-archived with its consolidated note already published, and
+-       never gets published while a member is still missing.
++       ``consolidated-<group_id>.md`` in ``shared_notes_dir``. BOTH the
++       archive loop and the final publish ``os.replace`` share the same
++       rollback treatment: if either fails (a member vanished mid-pass, a
++       cross-device dir, a locked file, the rename to the final name itself
++       failing, ...), everything already archived THIS group is moved back
++       into ``shared_notes_dir`` on a best-effort basis (each move attempted
++       in its own try/except -- a rollback failure is logged, never
++       raised), the temp note is deleted, and the group is recorded as
++       failed. A group therefore never ends up half-archived with its
++       consolidated note already published, and never gets published while
++       a member is still missing.
+     8. Failures record ``status: "failed"`` in the cache (still logged via
+        the module logger) so a broken group isn't retried every pass either
+        -- but member notes and the group itself are left completely
+@@ -545,25 +547,14 @@ def run_consolidation_pass(
+                 # Archive-first-then-publish (see docstring step 7): move
+                 # every member into note_archive/<group_id>/ BEFORE
+                 # publishing the consolidated note. A failure partway
+-                # through is rolled back on a best-effort basis and never
+-                # propagates.
++                # through EITHER step is rolled back on a best-effort basis
++                # and never propagates -- see _rollback_and_fail below,
++                # shared by both the archive loop and the final publish
++                # rename.
+                 archive_dir = public_root / "note_archive" / group_id
+                 archived: list[Path] = []
+-                archive_error: OSError | None = None
+-                try:
+-                    archive_dir.mkdir(parents=True, exist_ok=True)
+-                    for member_path in members_paths:
+-                        os.replace(member_path, archive_dir / member_path.name)
+-                        archived.append(member_path)
+-                except OSError as exc:
+-                    archive_error = exc
+ 
+-                if archive_error is not None:
+-                    logger.warning(
+-                        "consolidation: group %s failed to archive a member: %r",
+-                        group_id,
+-                        archive_error,
+-                    )
++                def _rollback_and_fail(reason: str) -> None:
+                     for original_path in archived:
+                         try:
+                             os.replace(archive_dir / original_path.name, original_path)
+@@ -575,11 +566,31 @@ def run_consolidation_pass(
+                                 rollback_exc,
+                             )
+                     tmp_path.unlink(missing_ok=True)
+-                    _fail(f"archiving members failed: {archive_error!r}")
++                    _fail(reason)
++
++                try:
++                    archive_dir.mkdir(parents=True, exist_ok=True)
++                    for member_path in members_paths:
++                        os.replace(member_path, archive_dir / member_path.name)
++                        archived.append(member_path)
++                except OSError as exc:
++                    logger.warning(
++                        "consolidation: group %s failed to archive a member: %r", group_id, exc
++                    )
++                    _rollback_and_fail(f"archiving members failed: {exc!r}")
+                     continue
+ 
+                 final_path = shared_notes_dir / f"consolidated-{group_id}.md"
+-                os.replace(tmp_path, final_path)
++                try:
++                    os.replace(tmp_path, final_path)
++                except OSError as exc:
++                    logger.warning(
++                        "consolidation: group %s failed to publish consolidated note: %r",
++                        group_id,
++                        exc,
++                    )
++                    _rollback_and_fail(f"publishing consolidated note failed: {exc!r}")
++                    continue
+ 
+                 cache[group_id] = {
+                     "status": "consolidated",
+diff --git a/tests/test_gate_consolidation_core.py b/tests/test_gate_consolidation_core.py
+index 76781d9..6c53a5a 100644
+--- a/tests/test_gate_consolidation_core.py
++++ b/tests/test_gate_consolidation_core.py
+@@ -716,6 +716,67 @@ def test_orchestrator_archive_failure_rolls_back_and_preserves_other_group_cache
+     assert consolidated_entries[0]["note"] in consolidated_files
+ 
+ 
++def test_orchestrator_final_publish_failure_rolls_back_archived_members(tmp_path, monkeypatch):
++    # The archive moves succeed for both members; only the final rename of
++    # the temp note to consolidated-<group_id>.md fails.
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH, agent="island-0-agent-1", score=0.42))
++    write_attempt(tmp_path, _make_attempt(_FULL_HASH_2, agent="island-0-agent-2", score=0.55))
++    public_root, shared_notes_dir = _public_dirs(tmp_path)
++
++    a = _write_note_file(
++        shared_notes_dir / "a.md",
++        f"creator: island-0-agent-1\nevidence:\n  attempt: {_SHORT_HASH}\n",
++        body="# A\nFinding A.\n",
++    )
++    b = _write_note_file(
++        shared_notes_dir / "b.md",
++        f"creator: island-0-agent-2\nevidence:\n  attempt: {_SHORT_HASH_2}\n",
++        body="# B\nFinding B.\n",
++    )
++    group = Group(representative=b, see_also=[a], recency=datetime.now(UTC))
++
++    llm_output = (
++        "TITLE: Combined finding\n"
++        "ATTEMPTS:\n"
++        f"- {_FULL_HASH}: 0.42\n"
++        f"- {_FULL_HASH_2}: 0.55\n"
++        "BODY:\n"
++        "Both notes agree the change improves score.\n"
++    )
++
++    real_replace = os.replace
++
++    def failing_replace(src, dst, *args, **kwargs):
++        # Fail ONLY the final publish rename: src is a mkstemp-named temp
++        # file (".consolidated-<group_id>....md.tmp") and dst is the final
++        # "consolidated-<group_id>.md" name -- both archive moves (member ->
++        # note_archive/) go through for real.
++        if Path(dst).name.startswith("consolidated-") and not Path(dst).name.endswith(".tmp"):
++            raise OSError("simulated failure publishing the consolidated note")
++        return real_replace(src, dst, *args, **kwargs)
++
++    monkeypatch.setattr(os, "replace", failing_replace)
++
++    result = run_consolidation_pass(
++        shared_notes_dir, tmp_path, [group], llm_call=lambda p: llm_output, public_root=public_root
++    )
++
++    assert result is False
++    # Rolled back: both originals restored to shared_notes_dir.
++    assert a.exists()
++    assert b.exists()
++    # No files left archived (the now-empty note_archive/<group_id>/ dir may
++    # still exist -- rollback isn't required to remove it), nothing published.
++    assert [p for p in (public_root / "note_archive").rglob("*") if p.is_file()] == []
++    assert list(shared_notes_dir.glob("consolidated-*.md")) == []
++
++    cache = load_consolidation_cache(public_root)
++    assert len(cache) == 1
++    entry = next(iter(cache.values()))
++    assert entry["status"] == "failed"
++    assert entry["note"] is None
++
++
+ def test_orchestrator_unreadable_member_skips_group_silently(tmp_path, monkeypatch):
+     public_root, shared_notes_dir = _public_dirs(tmp_path)
+     a = _write_note_file(shared_notes_dir / "a.md", "creator: agent-1\n", body="# A\nBody.\n")
+-- 
+2.45.1.windows.1
+

@@ -1,0 +1,301 @@
+From b6a23a3716f835c5e7065f22ddd9bd67a85dc7c5 Mon Sep 17 00:00:00 2001
+From: Steve <steventhanhtuan@gmail.com>
+Date: Fri, 10 Jul 2026 15:40:14 +0700
+Subject: [PATCH 03/17] Close two knowledge-channel leaks a live Condition A
+ run exposed
+
+Neither was visible from the config or from CORAL.md. Both were found by the
+integrity audit on the first real ablation run, not by inspection.
+
+1. Worktree symlinks. setup_shared_state linked every _SHARED_STATE_ITEMS entry
+   unconditionally. With knowledge off the targets do not exist, so
+   .claude/notes and .claude/skills became *dangling* symlinks: `ls .claude/`
+   still showed the agent a notes and a skills directory the ablation had
+   deleted. The grader link two lines below was already guarded on existence
+   for exactly this reason. Now takes `knowledge` and skips the four dirs.
+
+2. The restart prompt. _build_score_prompt is injected on every agent respawn --
+   a second channel into the agent, entirely separate from CORAL.md -- and it
+   told Condition A agents to "Check what other agents have tried via
+   `coral log -n 10`, `coral notes`, and `coral skills`" and to "Consolidate
+   scattered notes, distill reusable skills". Now knowledge-aware, falling back
+   to `coral log` / `coral show --diff` and dropping the organize bullet.
+
+KNOWLEDGE_SUBDIRS moves to coral/config.py so project.py (which creates the
+dirs) and worktree.py (which links them) cannot drift apart.
+
+Two regression tests, both parametrised over the flag. 15 ablation tests pass,
+plus config/hub/islands/workspace/manager/worktree; the byte-identity control
+test still holds.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ coral/agent/manager.py           | 38 ++++++++++++++++------
+ coral/config.py                  |  8 +++++
+ coral/workspace/project.py       | 11 +++----
+ coral/workspace/worktree.py      | 14 ++++++++-
+ tests/test_knowledge_ablation.py | 54 ++++++++++++++++++++++++++++++++
+ 5 files changed, 109 insertions(+), 16 deletions(-)
+
+diff --git a/coral/agent/manager.py b/coral/agent/manager.py
+index 7987254..40d5685 100644
+--- a/coral/agent/manager.py
++++ b/coral/agent/manager.py
+@@ -587,6 +587,7 @@ class AgentManager:
+             self.paths.coral_dir,
+             shared_dir_name,
+             island_id=island_id,
++            knowledge=self.config.agents.knowledge,
+         )
+ 
+         # Register agent with gateway if active (before settings so we have the key)
+@@ -1698,6 +1699,21 @@ class AgentManager:
+         ]
+         if feedback:
+             lines.append(f"Feedback: {feedback}")
++        # This prompt is injected on every agent restart, so it is a second,
++        # easily-missed channel into the agent — it must respect the ablation
++        # exactly as CORAL.md does.
++        knowledge = self.config.agents.knowledge
++        gather = (
++            "- **Gather new information.** Read parts of the codebase, docs, or "
++            "data you haven't touched. Profile or instrument what you've been "
++            "guessing at. Search the web for related work. Check what other "
++            "agents have tried via "
++            + (
++                "`coral log -n 10`, `coral notes`, and `coral skills`."
++                if knowledge
++                else "`coral log -n 10` and `coral show <hash> --diff`."
++            )
++        )
+         lines.extend(
+             [
+                 "",
+@@ -1706,26 +1722,30 @@ class AgentManager:
+                 "the task is intractable / saturated / done. Even when no immediate "
+                 "path forward is visible, there is always productive work to do:",
+                 "",
+-                "- **Gather new information.** Read parts of the codebase, docs, or "
+-                "data you haven't touched. Profile or instrument what you've been "
+-                "guessing at. Search the web for related work. Check what other "
+-                "agents have tried via `coral log -n 10`, `coral notes`, and "
+-                "`coral skills`.",
++                gather,
+                 "- **Run trial experiments.** Probe assumptions you've been treating "
+                 "as facts. Ablate components you've been treating as load-bearing. "
+                 "Where the grader supports it, sweep variants cheaply with "
+                 "`coral eval --tune` before committing a real eval.",
++            ]
++        )
++        if knowledge:
++            lines.append(
+                 "- **Organize existing knowledge.** Consolidate scattered notes, "
+                 "distill reusable skills, write down what you've ruled out and *why* "
+                 "so the next iteration starts informed instead of repeating dead "
+-                "ends.",
+-            ]
+-        )
++                "ends."
++            )
+         if self.config.agents.count > 1:
+             lines.append(
+                 "- **Find a complementary role on the team.** Reflect on what you've "
+                 "contributed so far and on what your teammates are working on "
+-                "(`coral log -n 10 --recent`, `coral notes --recent`). Pick a niche "
++                + (
++                    "(`coral log -n 10 --recent`, `coral notes --recent`)."
++                    if knowledge
++                    else "(`coral log -n 10 --recent` and their eval messages)."
++                )
++                + " Pick a niche "
+                 "that complements rather than duplicates them — investigate a "
+                 "sub-problem nobody is owning, build a shared tool they're missing, "
+                 "or pursue a direction they haven't explored."
+diff --git a/coral/config.py b/coral/config.py
+index 17e8240..204350d 100644
+--- a/coral/config.py
++++ b/coral/config.py
+@@ -9,6 +9,12 @@ from typing import Any
+ import yaml
+ from omegaconf import MISSING, OmegaConf
+ 
++# The shared-state subdirectories that make up CORAL's durable knowledge
++# channel. Neither created, seeded, nor symlinked into an agent's worktree when
++# ``agents.knowledge`` is false. Lives here so ``workspace.project`` (which
++# creates them) and ``workspace.worktree`` (which links them) cannot drift.
++KNOWLEDGE_SUBDIRS: frozenset[str] = frozenset({"notes", "skills", "roles", "agents"})
++
+ 
+ @dataclass
+ class TaskConfig:
+@@ -257,6 +263,8 @@ class AgentConfig:
+     # messages and `coral show --diff` are untouched: agents still see each
+     # other's code and scores. True reproduces upstream behaviour exactly.
+     knowledge: bool = True
++    # NOTE: the shared-state subdirectories that constitute the knowledge
++    # channel live in KNOWLEDGE_SUBDIRS (module level, below the dataclasses).
+     stagger_seconds: int = 0  # delay between spawning each agent (rate-limit backpressure)
+ 
+     # Reliability: crash-burst circuit breaker.
+diff --git a/coral/workspace/project.py b/coral/workspace/project.py
+index 35d01c2..f4289b7 100644
+--- a/coral/workspace/project.py
++++ b/coral/workspace/project.py
+@@ -10,7 +10,7 @@ from dataclasses import dataclass
+ from datetime import datetime
+ from pathlib import Path
+ 
+-from coral.config import CoralConfig
++from coral.config import KNOWLEDGE_SUBDIRS, CoralConfig
+ from coral.hub._island import island_root
+ from coral.hub.checkpoint import init_checkpoint_repo
+ from coral.workspace.repo import (
+@@ -58,11 +58,10 @@ _PER_ISLAND_SUBDIRS = (
+     "roles",
+ )
+ 
+-# The subdirectories that constitute the knowledge channel. Not created when
+-# ``agents.knowledge`` is false. Nothing stops an agent from mkdir-ing one
+-# anyway, so treat their absence at the end of a run as evidence, not as an
+-# enforced invariant.
+-_KNOWLEDGE_SUBDIRS = frozenset({"skills", "agents", "notes", "roles"})
++# Not created when ``agents.knowledge`` is false. Nothing stops an agent from
++# mkdir-ing one anyway, so treat their absence at the end of a run as evidence,
++# not as an enforced invariant.
++_KNOWLEDGE_SUBDIRS = KNOWLEDGE_SUBDIRS
+ 
+ 
+ def _island_id_from_root(coral_dir: Path, island_root: Path) -> str | None:
+diff --git a/coral/workspace/worktree.py b/coral/workspace/worktree.py
+index ff59754..49e97d6 100644
+--- a/coral/workspace/worktree.py
++++ b/coral/workspace/worktree.py
+@@ -9,6 +9,7 @@ import shutil
+ import subprocess
+ from pathlib import Path
+ 
++from coral.config import KNOWLEDGE_SUBDIRS
+ from coral.workspace.repo import (
+     _clean_env,
+     run_setup_commands,
+@@ -168,6 +169,7 @@ def setup_shared_state(
+     coral_dir: Path,
+     shared_dir_name: str = ".claude",
+     island_id: str | int | None = None,
++    knowledge: bool = True,
+ ) -> None:
+     """Create a shared state directory in the worktree with symlinks into the island root.
+ 
+@@ -180,11 +182,17 @@ def setup_shared_state(
+     in the worktree so ``coral eval`` and other CLI commands can determine which
+     island this agent belongs to without rescanning configuration.
+ 
++    With ``knowledge=False`` the knowledge subdirs are skipped. Without this the
++    links are still created and *dangle*, so the agent's ``.claude/`` advertises
++    a notes/ and skills/ directory that the ablation deleted — the same reason
++    the grader link below is guarded on existence.
++
+     Args:
+         worktree_path: Path to the agent's git worktree
+         coral_dir: Path to the shared .coral directory
+         shared_dir_name: Name of the shared dir in the worktree (e.g. ".claude")
+         island_id: The agent's island id (str/int), or None for single-island mode.
++        knowledge: False to omit the knowledge channel (see ``agents.knowledge``).
+     """
+     from coral.hub._island import island_root
+ 
+@@ -197,7 +205,11 @@ def setup_shared_state(
+ 
+     shared_dir.mkdir(exist_ok=True)
+ 
+-    for item in _SHARED_STATE_ITEMS:
++    items = _SHARED_STATE_ITEMS
++    if not knowledge:
++        items = tuple(i for i in items if i not in KNOWLEDGE_SUBDIRS)
++
++    for item in items:
+         src = state_root / item
+         dst = shared_dir / item
+         # If a previous (buggy) run wrote into a real local dir at this path
+diff --git a/tests/test_knowledge_ablation.py b/tests/test_knowledge_ablation.py
+index bef00f7..7dd5246 100644
+--- a/tests/test_knowledge_ablation.py
++++ b/tests/test_knowledge_ablation.py
+@@ -13,6 +13,7 @@ import pytest
+ import yaml
+ 
+ from coral.agent.heartbeat import HeartbeatAction, HeartbeatRunner
++from coral.agent.manager import AgentManager
+ from coral.config import AgentConfig, CoralConfig, GraderConfig, HeartbeatActionConfig, TaskConfig
+ from coral.hub.heartbeat import (
+     default_global_actions,
+@@ -24,6 +25,7 @@ from coral.hub.heartbeat import (
+ )
+ from coral.template.coral_md import generate_coral_md
+ from coral.workspace.project import _build_island_subtree
++from coral.workspace.worktree import setup_shared_state
+ 
+ UPSTREAM_REF = "upstream-base"
+ 
+@@ -122,6 +124,58 @@ def test_island_subtree_seeding_matches_knowledge_flag(tmp_path, knowledge):
+         assert (public / "agents" / "librarian.md").is_file()
+ 
+ 
++@pytest.mark.parametrize("knowledge", [True, False])
++def test_worktree_does_not_advertise_ablated_dirs(tmp_path, knowledge):
++    """Regression: the worktree symlinks leaked the knowledge channel.
++
++    `setup_shared_state` linked every _SHARED_STATE_ITEMS entry unconditionally.
++    With knowledge off the targets do not exist, so `.claude/notes` and
++    `.claude/skills` became *dangling* symlinks — `ls .claude/` still showed the
++    agent a notes and a skills directory the ablation had deleted. Caught in a
++    live Condition A run, not by inspection.
++    """
++    coral_dir = tmp_path / ".coral"
++    public = coral_dir / "public"
++    public.mkdir(parents=True)
++    _build_island_subtree(coral_dir, public, tmp_path, [], knowledge=knowledge)
++    (coral_dir / "config_dir").write_text(str(tmp_path))
++
++    wt = tmp_path / "wt"
++    wt.mkdir()
++    setup_shared_state(wt, coral_dir, ".claude", knowledge=knowledge)
++
++    shared = wt / ".claude"
++    for item in ("notes", "skills", "roles", "agents"):
++        link = shared / item
++        assert link.exists() is knowledge, f".claude/{item} presence should track knowledge"
++        assert link.is_symlink() is knowledge, f".claude/{item} must not dangle"
++    # Attempt plumbing is untouched by the ablation.
++    for item in ("attempts", "logs", "heartbeat", "eval_logs"):
++        assert (shared / item).exists(), f".claude/{item} must survive"
++
++
++def test_restart_prompt_respects_knowledge_ablation():
++    """The restart prompt is a second channel into the agent, injected on every
++    respawn. It told Condition A agents to run `coral notes` and `coral skills`
++    and to "consolidate scattered notes" — commands with nothing behind them.
++    """
++    build = AgentManager._build_score_prompt
++    attempt = {"score": 0.7, "commit_hash": "abc123def456", "title": "t", "feedback": "f"}
++
++    class _Fake:
++        def __init__(self, knowledge):
++            self.config = _config(knowledge=knowledge)
++
++    on = build(_Fake(True), attempt, eval_count=3)
++    off = build(_Fake(False), attempt, eval_count=3)
++
++    for banned in ("coral notes", "coral skills", "scattered notes", "reusable skills"):
++        assert banned in on, f"control restart prompt should mention {banned!r}"
++        assert banned not in off, f"ablated restart prompt still mentions {banned!r}"
++    for kept in ("coral log -n 10", "coral eval --tune", "Keep working"):
++        assert kept in off, f"ablated restart prompt dropped {kept!r}"
++
++
+ def test_knowledge_off_drops_note_writing_heartbeats():
+     on, off = _config(True), _config(False)
+     assert {a["name"] for a in default_local_actions(on)} == {"reflect", "pivot"}
+-- 
+2.45.1.windows.1
+

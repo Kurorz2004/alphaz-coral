@@ -1,0 +1,388 @@
+From 83eb878f3e47fd8411089ac7ebc78acc3a3fbfc0 Mon Sep 17 00:00:00 2001
+From: Steve <steventhanhtuan@gmail.com>
+Date: Tue, 14 Jul 2026 19:39:30 +0700
+Subject: [PATCH 12/17] task4: end-to-end acceptance tests for the publication
+ gate
+
+One synthetic two-agent run reproduces the report's evidence patterns
+through the real manager pass: a verified pair grouped by tag overlap
+(one representative, one see-also), an honest refuted note demoted, an
+evidence-free synthesis served as unverified, a score-mismatch failure
+ranked last; index tier order, stamps, settle-after-one-follow-up and
+no tmp debris all asserted. Plus a mid-pass-edit lock-in test and a
+strengthened manager-level flag-off control test.
+
+Reviewed with mutation checks (tier swap, representative flip, dropped
+clobber guard all caught). 73 gate tests, 702 full suite, ruff clean.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ tests/test_publication_gate.py | 341 ++++++++++++++++++++++++++++++++-
+ 1 file changed, 335 insertions(+), 6 deletions(-)
+
+diff --git a/tests/test_publication_gate.py b/tests/test_publication_gate.py
+index 62acf19..be9c2c9 100644
+--- a/tests/test_publication_gate.py
++++ b/tests/test_publication_gate.py
+@@ -1671,19 +1671,43 @@ def test_run_publication_pass_gate_on_harvests_verifies_and_regenerates_views(tm
+ 
+ def test_run_publication_pass_gate_off_is_a_full_noop(tmp_path):
+     """Gate off: the very first guard returns before touching disk at all --
+-    no ``.coral/public/`` gets created, and the agent's view is untouched."""
++    the agent's view is untouched.
++
++    Extended (reviewer lock-in) to also confirm the control arm end-to-end
++    at the MANAGER level, not just setup_shared_state in isolation (see
++    test_publication_gate_off_notes_skills_stay_symlinks for that): the same
++    kind of synthetic run this file's other manager-level tests build, but
++    with publication_gate=False -- notes/skills come out of
++    setup_shared_state as plain symlinks (the pre-gate behavior, never real
++    per-agent dirs), and _run_publication_pass leaves shared state and those
++    symlinks completely untouched."""
+     mgr, coral_dir = _make_manager(tmp_path, publication_gate=False)
+     agent1_id = mgr.specs[0].agent_id
+     worktree = tmp_path / "agents" / agent1_id
+     mgr.handles = [_make_handle(agent1_id, worktree, tmp_path / "a1.log")]
+-    (worktree / ".claude" / "notes").mkdir(parents=True)
+-    (worktree / ".claude" / "skills").mkdir(parents=True)
++
++    public = coral_dir / "public"
++    _seed_state_root(public)
++    setup_shared_state(worktree, coral_dir, ".claude", knowledge=True, publication_gate=False)
++
++    shared = worktree / ".claude"
++    notes_link = shared / "notes"
++    skills_link = shared / "skills"
++    assert notes_link.is_symlink()
++    assert skills_link.is_symlink()
++    note_text_before = (public / "notes" / "note.md").read_text()
+ 
+     mgr._run_publication_pass()
+ 
+-    assert not (coral_dir / "public").exists()
+-    assert list((worktree / ".claude" / "notes").iterdir()) == []
+-    assert list((worktree / ".claude" / "skills").iterdir()) == []
++    # Full no-op: still plain symlinks to the same shared targets, shared
++    # content byte-identical, and no publication-gate machinery (manifests)
++    # ever got created.
++    assert notes_link.is_symlink()
++    assert notes_link.resolve() == (public / "notes").resolve()
++    assert skills_link.is_symlink()
++    assert skills_link.resolve() == (public / "skills").resolve()
++    assert (public / "notes" / "note.md").read_text() == note_text_before
++    assert not (public / ".publication").exists()
+ 
+ 
+ def test_run_publication_pass_stabilizes_after_one_follow_up_pass(tmp_path, monkeypatch):
+@@ -1977,3 +2001,308 @@ def test_raw_dir_and_notes_md_never_manifested_stamped_or_pruned(tmp_path):
+     # Sanity check the pass actually ran and processed the real user note.
+     index_text = (view_notes_dir / "index.md").read_text()
+     assert "Finding" in index_text
++
++
++# --------------------------------------------------------------------------- #
++# Task 10 — consolidated end-to-end test + reviewer lock-ins                  #
++# --------------------------------------------------------------------------- #
++
++
++def test_publication_gate_end_to_end_report_scenario(tmp_path):
++    """One synthetic single-island run, two agents, five notes -- reproduces
++    every evidence pattern the Task 4 report calls out, driven through the
++    real manager entrypoint (``_run_publication_pass``) rather than calling
++    ``coral.hub.publication`` functions directly:
++
++      A: real scored attempt cited by its own creator, quoted score matches
++         -> verified/high, ``coral_verified: true``.
++      B: same shape as A, authored by the OTHER agent, tags nearly identical
++         to A's (Jaccard >= 0.5) but citing a DIFFERENT attempt -> grouped
++         with A via Rule 2 (``group_notes``); same tier as A, so the more
++         recent of the two (B) is the representative and A renders as its
++         see-also subline.
++      C: self-declared ``status: refuted`` with evidence that still checks
++         out -> verified True, confidence low -- demoted to the tier directly
++         above genuine failures (tier 3 of 4), never conflated with a
++         mechanically-failed note.
++      D: an evidence-free synthesis note (self-stamped ``status: confirmed`` /
++         ``confidence: high`` in ITS OWN frontmatter, but no ``evidence``
++         block for the framework to check) filed as an ordinary user note
++         (``synthesis.md`` -- not ``_``-prefixed, so it's harvested/verified
++         like any other note, unlike the housekeeping ``_``-prefixed
++         aggregates) -> unverifiable/medium, renders ``[unverified]``.
++      E: cites a real attempt but quotes a score that does NOT match the
++         attempt's recorded score -> verified False, ranked strictly last,
++         annotated ``[failed]`` in the index.
++    """
++    mgr, coral_dir = _make_manager(tmp_path, publication_gate=True)
++    agent1_id, agent2_id = (s.agent_id for s in mgr.specs)
++
++    (coral_dir / "public" / "notes").mkdir(parents=True)
++    (coral_dir / "public" / "attempts").mkdir(parents=True)
++
++    a_hash, b_hash, c_hash, e_hash = "a" * 40, "b" * 40, "c" * 40, "e" * 40
++    write_attempt(
++        coral_dir,
++        Attempt(
++            commit_hash=a_hash,
++            agent_id=agent1_id,
++            title="Clarke-Wright with swap",
++            score=0.50,
++            status="improved",
++            parent_hash=None,
++            timestamp="2026-03-10T00:00:00-00:00",
++        ),
++    )
++    write_attempt(
++        coral_dir,
++        Attempt(
++            commit_hash=b_hash,
++            agent_id=agent2_id,
++            title="Clarke-Wright with or-opt",
++            score=0.65,
++            status="improved",
++            parent_hash=None,
++            timestamp="2026-03-12T00:00:00-00:00",
++        ),
++    )
++    write_attempt(
++        coral_dir,
++        Attempt(
++            commit_hash=c_hash,
++            agent_id=agent1_id,
++            title="an approach that did not pan out",
++            score=0.30,
++            status="improved",
++            parent_hash=None,
++            timestamp="2026-03-08T00:00:00-00:00",
++        ),
++    )
++    write_attempt(
++        coral_dir,
++        Attempt(
++            commit_hash=e_hash,
++            agent_id=agent1_id,
++            title="mystery result",
++            score=0.99,
++            status="improved",
++            parent_hash=None,
++            timestamp="2026-03-13T00:00:00-00:00",
++        ),
++    )
++
++    agent1_worktree = tmp_path / "agents" / agent1_id
++    agent2_worktree = tmp_path / "agents" / agent2_id
++    mgr.handles = [
++        _make_handle(agent1_id, agent1_worktree, tmp_path / "a1.log"),
++        _make_handle(agent2_id, agent2_worktree, tmp_path / "a2.log"),
++    ]
++    for wt in (agent1_worktree, agent2_worktree):
++        (wt / ".claude" / "notes").mkdir(parents=True)
++        (wt / ".claude" / "skills").mkdir(parents=True)
++
++    # Note A -- drafted in agent1's own view.
++    (agent1_worktree / ".claude" / "notes" / "note-a.md").write_text(
++        "---\n"
++        f"creator: {agent1_id}\n"
++        "created: 2026-03-10T00:00:00-00:00\n"
++        "tags: [cw, 2opt, relocate, swap]\n"
++        "evidence:\n"
++        f"  attempt: {a_hash[:12]}\n"
++        '  score: "0.5000"\n'
++        "---\n\n# Clarke-Wright with swap\nSwap-based local search on the CW savings tour.\n"
++    )
++    # Note B -- drafted in agent2's view: near-identical tags to A, cites a
++    # DIFFERENT (also real, also matching) attempt.
++    (agent2_worktree / ".claude" / "notes" / "note-b.md").write_text(
++        "---\n"
++        f"creator: {agent2_id}\n"
++        "created: 2026-03-12T00:00:00-00:00\n"
++        "tags: [cw, 2opt, relocate, or-opt]\n"
++        "evidence:\n"
++        f"  attempt: {b_hash[:12]}\n"
++        '  score: "0.6500"\n'
++        "---\n\n# Clarke-Wright with or-opt\nOr-opt local search on the CW savings tour.\n"
++    )
++    # Note C -- honestly self-refuted, but the cited evidence still checks out.
++    (agent1_worktree / ".claude" / "notes" / "note-c.md").write_text(
++        "---\n"
++        f"creator: {agent1_id}\n"
++        "created: 2026-03-08T00:00:00-00:00\n"
++        "status: refuted\n"
++        "evidence:\n"
++        f"  attempt: {c_hash[:12]}\n"
++        '  score: "0.3000"\n'
++        "---\n\n# An approach that did not pan out\nDid not beat the baseline; keeping the record.\n"
++    )
++    # Note D -- a plain (not "_"-prefixed) synthesis note, self-stamped
++    # confident in ITS OWN frontmatter but with nothing the framework can
++    # mechanically check.
++    (agent2_worktree / ".claude" / "notes" / "synthesis.md").write_text(
++        "---\n"
++        f"creator: {agent2_id}\n"
++        "created: 2026-03-11T00:00:00-00:00\n"
++        "status: confirmed\n"
++        "confidence: high\n"
++        "---\n\n# Synthesis of Clarke-Wright variants\nBoth swap and or-opt beat the baseline.\n"
++    )
++    # Note E -- cites a real attempt, but the quoted score is wrong.
++    (agent1_worktree / ".claude" / "notes" / "note-e.md").write_text(
++        "---\n"
++        f"creator: {agent1_id}\n"
++        "created: 2026-03-13T00:00:00-00:00\n"
++        "evidence:\n"
++        f"  attempt: {e_hash[:12]}\n"
++        '  score: "0.1000"\n'
++        "---\n\n# Wrong score claim\nQuoted number does not match the attempt store.\n"
++    )
++
++    mgr._run_publication_pass()
++
++    view1 = agent1_worktree / ".claude" / "notes"
++    view2 = agent2_worktree / ".claude" / "notes"
++    note_names = ("note-a.md", "note-b.md", "note-c.md", "synthesis.md", "note-e.md")
++
++    # (1) Both agents' views hold every stamped note plus a generated index.
++    for view in (view1, view2):
++        assert (view / "index.md").is_file()
++        for name in note_names:
++            assert (view / name).is_file(), f"{name} missing from {view}"
++
++    idx1 = (view1 / "index.md").read_text()
++    idx2 = (view2 / "index.md").read_text()
++    assert idx1 == idx2  # both regenerated from the same shared/ranked state
++
++    # (2) index order: verified/high tier (B, the A/B group rep) first, then
++    # unverifiable (D), then refuted (C), then failed (E) last.
++    pos_b = idx1.index("Clarke-Wright with or-opt")
++    pos_a_seealso = idx1.index("Clarke-Wright with swap")
++    pos_d = idx1.index("Synthesis of Clarke-Wright variants")
++    pos_c = idx1.index("An approach that did not pan out")
++    pos_e = idx1.index("Wrong score claim")
++    assert pos_b < pos_a_seealso < pos_d < pos_c < pos_e
++
++    assert "[verified/high]" in idx1
++    assert "[unverified]" in idx1
++    assert "[refuted]" in idx1
++    assert "[failed]" in idx1
++
++    # (3) The A/B group renders exactly one representative header (B) plus
++    # one see-also subline (A) -- not two independent top-level entries.
++    assert idx1.count("Clarke-Wright with or-opt") == 1
++    assert idx1.count("Clarke-Wright with swap") == 1
++    seealso_lines = [ln for ln in idx1.splitlines() if ln.strip().startswith("- see also:")]
++    assert len(seealso_lines) == 1
++    assert "Clarke-Wright with swap" in seealso_lines[0]
++    assert "(note-a.md)" in seealso_lines[0]
++
++    # (4) Shared copies carry the correct coral_* fields.
++    shared_notes = coral_dir / "public" / "notes"
++    meta_a, _ = _parse_frontmatter((shared_notes / "note-a.md").read_text())
++    assert meta_a["coral_verified"] is True
++    assert meta_a["coral_confidence"] == "high"
++
++    meta_b, _ = _parse_frontmatter((shared_notes / "note-b.md").read_text())
++    assert meta_b["coral_verified"] is True
++    assert meta_b["coral_confidence"] == "high"
++
++    meta_c, _ = _parse_frontmatter((shared_notes / "note-c.md").read_text())
++    assert meta_c["coral_verified"] is True
++    assert meta_c["coral_confidence"] == "low"
++
++    meta_d, _ = _parse_frontmatter((shared_notes / "synthesis.md").read_text())
++    assert meta_d.get("coral_verified") is None  # absent/null -- see _coral_verified_value
++    assert meta_d["coral_confidence"] == "medium"
++
++    meta_e, _ = _parse_frontmatter((shared_notes / "note-e.md").read_text())
++    assert meta_e["coral_verified"] is False
++    assert meta_e["coral_confidence"] == "low"
++
++    # D's absent-verified/medium-confidence combination is exactly what
++    # coral.hub.notes._publication_status_token renders as "[unverified]" in
++    # the list_notes()/format_notes_list() view too (a separate vocabulary
++    # from render_index's tier labels checked above -- see publication.py's
++    # _status_label docstring for why they deliberately differ).
++    formatted = format_notes_list(list_notes(coral_dir))
++    d_line = next(ln for ln in formatted.splitlines() if "Synthesis of Clarke-Wright variants" in ln)
++    assert d_line.endswith("[unverified]")
++
++    # (5) No tmp debris anywhere in the run dir, and a further pass changes
++    # nothing (settle) -- content, not just the manager's short-circuit
++    # guard, since one active pass always triggers exactly one cheap
++    # follow-up (see _run_publication_pass's docstring).
++    assert list(tmp_path.rglob("*.tmp")) == []
++
++    checked_at_a = meta_a["coral_checked_at"]
++
++    mgr._run_publication_pass()  # the follow-up pass triggered by pass 1's own writes
++    assert (view1 / "index.md").read_text() == idx1
++    meta_a_after_followup, _ = _parse_frontmatter((shared_notes / "note-a.md").read_text())
++    assert meta_a_after_followup["coral_checked_at"] == checked_at_a
++
++    mgr._run_publication_pass()  # now genuinely stable
++    assert (view1 / "index.md").read_text() == idx1
++    meta_a_after_third, _ = _parse_frontmatter((shared_notes / "note-a.md").read_text())
++    assert meta_a_after_third["coral_checked_at"] == checked_at_a
++
++    assert list(tmp_path.rglob("*.tmp")) == []
++
++
++def test_mid_pass_view_edit_during_stamp_survives_and_is_harvested_next_tick(tmp_path, monkeypatch):
++    """Reviewer lock-in: a genuine agent edit landing in the SERVED VIEW copy
++    of a note, in the window between harvest (step 1) and regenerate (step
++    4) -- here injected right after ``stamp_verdicts`` (step 2) runs, via
++    monkeypatch -- must survive that pass's regenerate untouched (the
++    three-way clobber guard in ``_mirror_into_view`` leaves a view file alone
++    once its on-disk hash diverges from both the manifest's prior hash and
++    the freshly-computed target hash), the manifest must still carry the
++    PRE-edit hash (neither the edit's hash nor the unwritten target's), and
++    the very next pass's harvest must pick the edit up as a fresh draft."""
++    mgr, coral_dir = _make_manager(tmp_path, publication_gate=True)
++    agent1_id = mgr.specs[0].agent_id
++    worktree = tmp_path / "agents" / agent1_id
++    mgr.handles = [_make_handle(agent1_id, worktree, tmp_path / "a1.log")]
++    (coral_dir / "public" / "notes").mkdir(parents=True)
++    (coral_dir / "public" / "attempts").mkdir(parents=True)
++    (worktree / ".claude" / "notes").mkdir(parents=True)
++    (worktree / ".claude" / "skills").mkdir(parents=True)
++
++    view_note = worktree / ".claude" / "notes" / "finding.md"
++    view_note.write_text("---\ncreator: agent-1\n---\n\n# Finding\nOriginal agent-authored note.\n")
++
++    mgr._run_publication_pass()  # tick 1: establishes the framework-owned baseline
++
++    public = coral_dir / "public"
++    baseline_manifest = load_manifest(public, agent1_id, kind="notes")
++    baseline_hash = baseline_manifest["finding.md"]
++
++    real_stamp_verdicts = stamp_verdicts
++
++    def _stamp_then_inject_mid_pass_edit(*args, **kwargs):
++        result = real_stamp_verdicts(*args, **kwargs)
++        # Simulate a genuine agent edit landing in the served VIEW copy,
++        # after this tick's harvest already ran but before regenerate --
++        # exactly the clobber window _mirror_into_view's guard exists for.
++        view_note.write_text(
++            "---\ncreator: agent-1\n---\n\n# Finding\nEDITED mid-pass, between harvest and regenerate.\n"
++        )
++        return result
++
++    monkeypatch.setattr("coral.agent.manager.stamp_verdicts", _stamp_then_inject_mid_pass_edit)
++
++    mgr._run_publication_pass()  # tick 2: the mid-pass edit lands during this tick's body
++
++    # The edit survives the regenerate step untouched.
++    assert "EDITED mid-pass" in view_note.read_text()
++
++    # The manifest still holds the PRE-edit hash -- neither the edit's hash
++    # nor the (unwritten) freshly-regenerated target hash.
++    manifest_after = load_manifest(public, agent1_id, kind="notes")
++    assert manifest_after["finding.md"] == baseline_hash
++
++    monkeypatch.undo()
++
++    mgr._run_publication_pass()  # tick 3: harvests the edit as a fresh draft
++
++    shared_note = public / "notes" / "finding.md"
++    assert "EDITED mid-pass" in shared_note.read_text()
+-- 
+2.45.1.windows.1
+

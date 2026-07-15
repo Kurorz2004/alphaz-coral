@@ -1,0 +1,512 @@
+From da5283e310535af7ffdb60289f8edf80b2a1a1e3 Mon Sep 17 00:00:00 2001
+From: Steve <steventhanhtuan@gmail.com>
+Date: Tue, 14 Jul 2026 14:11:02 +0700
+Subject: [PATCH 05/17] task4: publication gate groundwork, config flag +
+ notes.py plumbing
+
+agents.publication_gate (default False keeps vanilla symlink behavior).
+notes.py: coral_* trace fields; upsert_frontmatter as a line-based
+minimal patch (untouched frontmatter lines byte-identical, atomic
+tmp+replace, idempotent); format_notes_list shows a status token only
+for notes carrying computed verdict fields.
+
+Reviewed: one blocking issue (yaml round-trip reformatting) found and
+fixed. Tests 643 passed, ruff clean.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ coral/_version.py              |   4 +-
+ coral/config.py                |   6 +
+ coral/hub/notes.py             | 137 ++++++++++++++++-
+ tests/test_publication_gate.py | 265 +++++++++++++++++++++++++++++++++
+ 4 files changed, 409 insertions(+), 3 deletions(-)
+ create mode 100644 tests/test_publication_gate.py
+
+diff --git a/coral/_version.py b/coral/_version.py
+index 58bf104..e3a380a 100644
+--- a/coral/_version.py
++++ b/coral/_version.py
+@@ -18,7 +18,7 @@ version_tuple: tuple[int | str, ...]
+ commit_id: str | None
+ __commit_id__: str | None
+ 
+-__version__ = version = '0.7.7.dev5+gb6a23a371.d20260714'
+-__version_tuple__ = version_tuple = (0, 7, 7, 'dev5', 'gb6a23a371.d20260714')
++__version__ = version = '0.7.7.dev6+g74aa74109.d20260714'
++__version_tuple__ = version_tuple = (0, 7, 7, 'dev6', 'g74aa74109.d20260714')
+ 
+ __commit_id__ = commit_id = None
+diff --git a/coral/config.py b/coral/config.py
+index 204350d..6ecf93a 100644
+--- a/coral/config.py
++++ b/coral/config.py
+@@ -265,6 +265,12 @@ class AgentConfig:
+     knowledge: bool = True
+     # NOTE: the shared-state subdirectories that constitute the knowledge
+     # channel live in KNOWLEDGE_SUBDIRS (module level, below the dataclasses).
++    # Publication gate: verifies an agent's notes against the attempt store
++    # (claims get checked against real graded results) before peers read them.
++    # False (default) is byte-identical vanilla CORAL — notes/skills stay
++    # plain symlinks, nothing is checked or stamped. Only meaningful when
++    # ``agents.knowledge`` is True; a False knowledge channel has no notes to gate.
++    publication_gate: bool = False
+     stagger_seconds: int = 0  # delay between spawning each agent (rate-limit backpressure)
+ 
+     # Reliability: crash-burst circuit breaker.
+diff --git a/coral/hub/notes.py b/coral/hub/notes.py
+index ea6168f..a612417 100644
+--- a/coral/hub/notes.py
++++ b/coral/hub/notes.py
+@@ -35,6 +35,7 @@ from __future__ import annotations
+ 
+ import os
+ import re
++import tempfile
+ from datetime import UTC, datetime
+ from pathlib import Path
+ from typing import Any
+@@ -65,6 +66,10 @@ _TRACE_FIELDS = (
+     "touched",
+     "tags",
+     "next",
++    "coral_verified",
++    "coral_confidence",
++    "coral_checked_at",
++    "coral_reason",
+ )
+ 
+ 
+@@ -162,6 +167,109 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
+     return {}, text
+ 
+ 
++# A top-level frontmatter key: column-0, ``identifier:``. Deliberately does
++# NOT match indented lines, so a key of the same name nested inside another
++# mapping (e.g. ``verified:`` inside an ``evidence:`` block) is never mistaken
++# for a top-level key by :func:`upsert_frontmatter`.
++_TOP_LEVEL_KEY_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*):")
++
++
++def _render_scalar_line(key: str, value: Any) -> str:
++    """Render one ``key: value`` frontmatter line for a scalar update.
++
++    String values are flattened to a single line (embedded newlines become
++    spaces — a frontmatter line must stay one line) and quoted only when the
++    value needs it, by delegating to ``yaml.safe_dump`` on the lone key/value
++    pair and keeping just that rendered line.
++    """
++    if isinstance(value, str):
++        value = value.replace("\r\n", " ").replace("\n", " ")
++    return yaml.safe_dump({key: value}).strip("\n") + "\n"
++
++
++def upsert_frontmatter(path: str | Path, updates: dict[str, Any]) -> bool:
++    """Insert or update top-level scalar keys in a note's YAML frontmatter.
++
++    Edits the raw frontmatter *text* line by line instead of parsing the
++    whole block and re-dumping it, so every line the caller didn't ask to
++    change — an ISO datetime, a quoted string, a flow-style list, a nested
++    ``evidence:`` mapping, a folded/literal block scalar — survives
++    byte-for-byte. Only *top-level* keys (column 0, matching
++    :data:`_TOP_LEVEL_KEY_RE`) are matched or written; supports scalar values
++    only (bool / str / timestamp string) — everything the publication gate
++    stamps (``coral_verified`` / ``coral_confidence`` / ``coral_checked_at`` /
++    ``coral_reason``).
++
++    For each key in ``updates``: if a top-level line for it already exists,
++    that line — plus any indented/continuation lines belonging to it (e.g. a
++    multiline block scalar) — is replaced with a single new line. If no such
++    key exists yet, the new line is appended at the end of the frontmatter
++    block, just before the closing ``---``. Every other line is left
++    untouched. Idempotent — calling this again with the same ``updates``
++    leaves the file's content unchanged.
++
++    Written atomically (tmp file in the same directory + ``os.replace``,
++    mirroring ``coral.hub.attempts._write_attempt_json``) so concurrent
++    readers never observe a partial write.
++
++    Returns ``False`` and touches nothing if ``path`` has no parseable
++    frontmatter block (no leading ``---`` delimiter pair) — there is nothing
++    safe to merge into.
++    """
++    path = Path(path)
++    text = path.read_text()
++    # Same block-detection _parse_frontmatter uses; also run it so a file
++    # whose frontmatter can't even survive the YAML/lenient fallback is
++    # treated the same way every reader treats it (never touched below).
++    _parse_frontmatter(text)
++    if not (text.startswith("---") and text.find("---", 3) != -1):
++        return False
++
++    lines = text.splitlines(keepends=True)
++    delim_idxs = [i for i, ln in enumerate(lines) if ln.rstrip("\r\n") == "---"]
++    if len(delim_idxs) < 2:
++        return False
++    start, end = delim_idxs[0], delim_idxs[1]
++    front_lines = list(lines[start + 1 : end])
++    rest_lines = lines[end:]  # closing '---' onward — never touched
++
++    for key, value in updates.items():
++        rendered = _render_scalar_line(key, value)
++        replaced = False
++        i = 0
++        while i < len(front_lines):
++            m = _TOP_LEVEL_KEY_RE.match(front_lines[i])
++            if m and m.group(1) == key:
++                j = i + 1
++                while j < len(front_lines) and not _TOP_LEVEL_KEY_RE.match(front_lines[j]):
++                    j += 1
++                front_lines[i:j] = [rendered]
++                replaced = True
++                break
++            i += 1
++        if not replaced:
++            front_lines.append(rendered)
++
++    new_text = "".join(lines[: start + 1] + front_lines + rest_lines)
++    if new_text == text:
++        return True
++
++    fd, tmp_path = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
++    try:
++        with os.fdopen(fd, "w") as f:
++            f.write(new_text)
++            f.flush()
++            os.fsync(f.fileno())
++        os.replace(tmp_path, path)
++    except Exception:
++        try:
++            os.unlink(tmp_path)
++        except OSError:
++            pass
++        raise
++    return True
++
++
+ def _parse_legacy_entries(text: str) -> list[dict[str, Any]]:
+     """Parse legacy notes.md (## [date] title format) into entries."""
+     pattern = re.compile(r"^## ", re.MULTILINE)
+@@ -371,6 +479,27 @@ def get_recent_notes(
+     return entries[-n:] if len(entries) > n else entries
+ 
+ 
++def _publication_status_token(entry: dict[str, Any]) -> str:
++    """Terse ``[verified/high]`` / ``[unverified]`` / ``[refuted]`` suffix.
++
++    Only produced when the entry carries a ``coral_verified`` or
++    ``coral_confidence`` frontmatter field (stamped by the publication gate,
++    see ``agents.publication_gate``) — notes without either field get no
++    suffix, so plain/legacy notes render exactly as before.
++    """
++    has_verified = "coral_verified" in entry
++    has_confidence = "coral_confidence" in entry
++    if not has_verified and not has_confidence:
++        return ""
++    if not has_verified:
++        return " [unverified]"
++    label = "verified" if entry["coral_verified"] else "refuted"
++    confidence = entry.get("coral_confidence")
++    if confidence:
++        label = f"{label}/{confidence}"
++    return f" [{label}]"
++
++
+ def format_notes_list(entries: list[dict[str, Any]]) -> str:
+     """Format note entries for terminal display.
+ 
+@@ -378,6 +507,11 @@ def format_notes_list(entries: list[dict[str, Any]]) -> str:
+     frontmatter field display as ``(unknown)`` so an agent who forgot the
+     field sees the gap in `coral notes` output immediately instead of
+     discovering it later via silent exclusion from team-level views.
++
++    Entries stamped by the publication gate (``coral_verified`` and/or
++    ``coral_confidence`` in frontmatter) get a trailing status token — see
++    :func:`_publication_status_token`. Entries without those fields render
++    exactly as they did before the gate existed.
+     """
+     if not entries:
+         return "No notes yet."
+@@ -385,7 +519,8 @@ def format_notes_list(entries: list[dict[str, Any]]) -> str:
+     for i, e in enumerate(entries, 1):
+         date_str = f"[{e['date']}] " if e.get("date") else ""
+         creator = e.get("creator") or UNATTRIBUTED_CREATOR
+-        lines.append(f"  {i}. {date_str}{e['title']} ({creator})")
++        status = _publication_status_token(e)
++        lines.append(f"  {i}. {date_str}{e['title']} ({creator}){status}")
+     return "\n".join(lines)
+ 
+ 
+diff --git a/tests/test_publication_gate.py b/tests/test_publication_gate.py
+new file mode 100644
+index 0000000..9c3fad7
+--- /dev/null
++++ b/tests/test_publication_gate.py
+@@ -0,0 +1,265 @@
++"""Tests for the publication gate (config flag + notes.py plumbing).
++
++Task 1: ``agents.publication_gate`` config flag (default False, dotlist
++override). Task 2: ``coral.hub.notes.upsert_frontmatter`` and the
++``format_notes_list`` status-token suffix. This file grows as later tasks
++land the gate's verification logic.
++"""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++from coral.config import AgentConfig, CoralConfig, TaskConfig
++from coral.hub.notes import _parse_frontmatter, format_notes_list, list_notes, upsert_frontmatter
++
++# --------------------------------------------------------------------------- #
++# Task 1 — config flag
++# --------------------------------------------------------------------------- #
++
++
++def test_publication_gate_default_false():
++    config = AgentConfig()
++    assert config.publication_gate is False
++
++
++def test_publication_gate_dotlist_override():
++    config = CoralConfig(
++        task=TaskConfig(name="test", description="A test"),
++        agents=AgentConfig(),
++    )
++    assert config.agents.publication_gate is False
++
++    merged = CoralConfig.merge_dotlist(config, ["agents.publication_gate=true"])
++    assert merged.agents.publication_gate is True
++    # Original unchanged
++    assert config.agents.publication_gate is False
++
++
++# --------------------------------------------------------------------------- #
++# Task 2 — upsert_frontmatter
++# --------------------------------------------------------------------------- #
++
++
++def _write_note(path: Path, text: str) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(text)
++
++
++def test_upsert_frontmatter_adds_and_updates_keys(tmp_path):
++    note = tmp_path / "public" / "notes" / "note.md"
++    _write_note(
++        note,
++        "---\n"
++        "creator: agent-1\n"
++        "created: 2026-03-14T00:00:00-00:00\n"
++        "claim: matmul tiling helps\n"
++        "---\n"
++        "\n"
++        "# Title\n"
++        "Body text.\n",
++    )
++
++    ok = upsert_frontmatter(note, {"coral_verified": True, "coral_confidence": "high"})
++    assert ok is True
++
++    entries = list_notes(tmp_path)
++    assert len(entries) == 1
++    entry = entries[0]
++    assert entry["coral_verified"] is True
++    assert entry["coral_confidence"] == "high"
++    # Untouched fields preserved
++    assert entry["creator"] == "agent-1"
++    assert entry["claim"] == "matmul tiling helps"
++    assert entry["body"] == "# Title\nBody text."
++
++
++def test_upsert_frontmatter_preserves_body_byte_for_byte(tmp_path):
++    note = tmp_path / "note.md"
++    body = "# Title\n\nSome body text with\nmultiple lines.\n\n- a\n- b\n"
++    _write_note(note, f"---\ncreator: agent-1\n---\n\n{body}")
++
++    upsert_frontmatter(note, {"coral_verified": False})
++
++    _, parsed_body = _parse_frontmatter(note.read_text())
++    assert parsed_body == body.strip()
++
++
++def test_upsert_frontmatter_idempotent(tmp_path):
++    note = tmp_path / "note.md"
++    _write_note(
++        note,
++        "---\ncreator: agent-1\nclaim: something\n---\n\n# Title\nBody.\n",
++    )
++
++    upsert_frontmatter(note, {"coral_verified": True, "coral_reason": "matches attempt 7b1e4d"})
++    after_first = note.read_text()
++
++    upsert_frontmatter(note, {"coral_verified": True, "coral_reason": "matches attempt 7b1e4d"})
++    after_second = note.read_text()
++
++    assert after_first == after_second
++
++
++def test_upsert_frontmatter_no_frontmatter_is_noop(tmp_path):
++    note = tmp_path / "note.md"
++    original = "# Just a title\nNo frontmatter here.\n"
++    _write_note(note, original)
++
++    ok = upsert_frontmatter(note, {"coral_verified": True})
++
++    assert ok is False
++    assert note.read_text() == original
++
++
++def test_upsert_frontmatter_atomic_no_leftover_tmp(tmp_path):
++    note = tmp_path / "note.md"
++    _write_note(note, "---\ncreator: agent-1\n---\n\n# Title\nBody.\n")
++
++    upsert_frontmatter(note, {"coral_verified": True})
++
++    leftover = [p for p in tmp_path.iterdir() if p.name != "note.md"]
++    assert leftover == []
++
++
++# Frontmatter exercising every shape a line-based patch must leave alone:
++# an ISO datetime, a double-quoted string, a flow-style list, a nested
++# mapping (with a key name — ``verified``— that collides with a top-level
++# key we upsert elsewhere), and a folded block scalar.
++_RICH_FRONTMATTER = (
++    "---\n"
++    "creator: agent-1\n"
++    'created: 2026-03-14T17:35:00-00:00\n'
++    'claim: "matmul inner-loop tiling at tile=32 improves score"\n'
++    "supersedes: [research/old-idea.md]\n"
++    "evidence:\n"
++    "  attempt: 7b1e4d\n"
++    "  verified: true\n"
++    "summary: >\n"
++    "  This is a folded\n"
++    "  multiline scalar that\n"
++    "  spans several lines.\n"
++    "---\n"
++    "\n"
++    "# Title\n"
++    "Body text.\n"
++)
++
++
++def test_upsert_frontmatter_preserves_rich_yaml_byte_for_byte(tmp_path):
++    note = tmp_path / "note.md"
++    _write_note(note, _RICH_FRONTMATTER)
++
++    upsert_frontmatter(note, {"coral_verified": True, "coral_confidence": "high"})
++    new_text = note.read_text()
++
++    # Every original line survives byte-for-byte, untouched.
++    for original_line in _RICH_FRONTMATTER.splitlines():
++        if original_line in ("---", ""):
++            continue
++        assert original_line in new_text, f"line mutated or dropped: {original_line!r}"
++
++    # New keys were appended inside the frontmatter block (before the
++    # closing '---'), not into the body.
++    _, front, body = new_text.split("---\n", 2)
++    assert "coral_verified: true" in front
++    assert "coral_confidence: high" in front
++    assert "coral_verified" not in body
++    assert "coral_confidence" not in body
++
++
++def test_upsert_frontmatter_replace_path_touches_only_that_line(tmp_path):
++    note = tmp_path / "note.md"
++    _write_note(note, _RICH_FRONTMATTER)
++
++    upsert_frontmatter(note, {"coral_reason": "matches attempt 7b1e4d"})
++    first_text = note.read_text()
++    assert "coral_reason: matches attempt 7b1e4d" in first_text
++
++    upsert_frontmatter(note, {"coral_reason": "score confirmed at 0.42"})
++    second_text = note.read_text()
++
++    # Old value gone, new value present, exactly one coral_reason line.
++    assert "coral_reason: matches attempt 7b1e4d" not in second_text
++    assert "coral_reason: score confirmed at 0.42" in second_text
++    assert second_text.count("coral_reason:") == 1
++
++    # Every other original line is still untouched.
++    for original_line in _RICH_FRONTMATTER.splitlines():
++        if original_line in ("---", ""):
++            continue
++        assert original_line in second_text, f"line mutated: {original_line!r}"
++
++
++def test_upsert_frontmatter_nested_key_not_confused_with_top_level(tmp_path):
++    note = tmp_path / "note.md"
++    _write_note(note, _RICH_FRONTMATTER)
++
++    # "verified" only exists nested inside evidence: — there is no top-level
++    # "verified:" key yet. Upserting it must append a new top-level line and
++    # must NOT touch (or match against) the nested "  verified: true" line.
++    upsert_frontmatter(note, {"verified": "pending"})
++    new_text = note.read_text()
++
++    assert "  verified: true\n" in new_text  # nested line untouched
++    front = new_text.split("---\n", 2)[1]
++    front_lines = front.splitlines()
++    top_level_verified = [ln for ln in front_lines if ln.startswith("verified:")]
++    assert top_level_verified == ["verified: pending"]
++
++
++# --------------------------------------------------------------------------- #
++# Task 2 — format_notes_list status token
++# --------------------------------------------------------------------------- #
++
++
++def test_format_notes_list_unchanged_without_coral_fields(tmp_path):
++    (tmp_path / "public" / "notes").mkdir(parents=True)
++    notes_file = tmp_path / "public" / "notes" / "notes.md"
++    notes_file.write_text(
++        "## [2026-03-11] ReLU works better\nDetails about ReLU activation...\n"
++    )
++
++    entries = list_notes(tmp_path)
++    formatted = format_notes_list(entries)
++
++    assert formatted == "  1. [2026-03-11] ReLU works better (unknown)"
++
++
++def test_format_notes_list_shows_verified_status(tmp_path):
++    notes_dir = tmp_path / "public" / "notes"
++    notes_dir.mkdir(parents=True)
++    (notes_dir / "a.md").write_text(
++        "---\ncreator: agent-1\ncoral_verified: true\ncoral_confidence: high\n---\n\n# Verified note\nBody.\n"
++    )
++
++    entries = list_notes(tmp_path)
++    formatted = format_notes_list(entries)
++
++    assert formatted.endswith("[verified/high]")
++
++
++def test_format_notes_list_shows_refuted_status(tmp_path):
++    notes_dir = tmp_path / "public" / "notes"
++    notes_dir.mkdir(parents=True)
++    (notes_dir / "a.md").write_text(
++        "---\ncreator: agent-1\ncoral_verified: false\n---\n\n# Refuted note\nBody.\n"
++    )
++
++    entries = list_notes(tmp_path)
++    formatted = format_notes_list(entries)
++
++    assert formatted.endswith("[refuted]")
++
++
++def test_format_notes_list_shows_unverified_status(tmp_path):
++    notes_dir = tmp_path / "public" / "notes"
++    notes_dir.mkdir(parents=True)
++    (notes_dir / "a.md").write_text(
++        "---\ncreator: agent-1\ncoral_confidence: medium\n---\n\n# Pending note\nBody.\n"
++    )
++
++    entries = list_notes(tmp_path)
++    formatted = format_notes_list(entries)
++
++    assert formatted.endswith("[unverified]")
+-- 
+2.45.1.windows.1
+

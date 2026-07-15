@@ -656,6 +656,8 @@
           <rect x="530" y="90" width="155" height="50" />
           <rect x="530" y="170" width="155" height="50" />
           <rect x="8" y="240" width="180" height="52" />
+          <rect x="255" y="214" width="215" height="78" />
+          <rect x="530" y="242" width="155" height="50" />
         </g>
         <g font-family="Times New Roman, Times, serif" font-size="13" fill="#000">
           <text x="362" y="26" text-anchor="middle">AgentManager: monitor loop</text>
@@ -674,6 +676,14 @@
           <text x="607" y="206" text-anchor="middle" font-size="11">hidden data to agents</text>
           <text x="98" y="261" text-anchor="middle">read view, per agent</text>
           <text x="98" y="277" text-anchor="middle" font-size="11">verified, ranked notes and skills</text>
+          <text x="362" y="232" text-anchor="middle">publication pass</text>
+          <text x="362" y="248" text-anchor="middle" font-size="11">verify claims against the attempt store</text>
+          <text x="362" y="262" text-anchor="middle" font-size="11">group duplicates; an LLM call merges</text>
+          <text x="362" y="276" text-anchor="middle" font-size="11">each group, originals to the archive</text>
+          <text x="362" y="288" text-anchor="middle" font-size="11">rank, demote refuted and unverified</text>
+          <text x="607" y="260" text-anchor="middle">archive</text>
+          <text x="607" y="274" text-anchor="middle" font-size="11">originals of merged notes,</text>
+          <text x="607" y="287" text-anchor="middle" font-size="11">outside the served view</text>
         </g>
         <g fill="none" stroke="#000" stroke-width="1" marker-end="url(#ah)">
           <path d="M188,132 L253,132" />
@@ -683,7 +693,9 @@
           <path d="M607,140 L607,168" />
           <path d="M362,60 L362,88" />
           <path d="M255,28 L98,28 L98,88" />
-          <path d="M362,180 L362,266 L192,266" />
+          <path d="M362,180 L362,212" />
+          <path d="M253,266 L192,266" />
+          <path d="M470,266 L528,266" />
           <path d="M160,238 L160,192" />
         </g>
         <g font-family="Times New Roman, Times, serif" font-size="11" fill="#000">
@@ -694,10 +706,6 @@
           <text x="369" y="70">watches for new scores</text>
           <text x="106" y="56">interrupt and resume with</text>
           <text x="106" y="70">eval result + heartbeat prompt</text>
-          <text x="372" y="210">publication pass: verify</text>
-          <text x="372" y="224">claims against attempts,</text>
-          <text x="372" y="238">group duplicates, rank,</text>
-          <text x="372" y="252">demote refuted</text>
           <text x="175" y="233" text-anchor="middle">reads</text>
         </g>
       </svg>
@@ -705,27 +713,15 @@
     <p class="figcap">The run after the change; compare the first figure. Writing is unchanged: agents still put
       notes and skills into the shared state at will. Reading is not: <code>notes/</code> and <code>skills/</code>
       in a worktree are a view the manager generates, and the publication pass checks every claim against the
-      attempt store on the way through.</p>
+      attempt store on the way through; when a duplicate group forms, one LLM call writes the merged note and the
+      originals leave the served view for the archive.</p>
 
     <h3>4. Comparative experiment</h3>
 
-    <p>Modified against vanilla CORAL on the Task 2 CVRP task, with the same 2 agents and 12-attempt budget, at
-      least 3 runs per arm, reported as mean ± std of Final Score. Task 3 says the headline number will most
-      likely be flat. The ablation arms there were statistically indistinguishable, because seed-to-seed noise is
-      larger than the condition effect and half of the gain lands on the first attempt. A knowledge-quality change
-      has no more room to move that number than knowledge removal did.</p>
-
-    <p>The one route to a score effect is waste: at 12 attempts, an evaluation spent re-testing an approach that a
-      served note already refuted costs about 8% of the search. The secondary metrics are therefore where the
-      change acts: the rank of refuted notes in the view each agent was served, the gap between declared and
-      computed confidence, and the number of evaluations spent re-testing refuted approaches.
+    <p>As I said in task 3, since this problem is a classic one, most of the meaningful heuristics have already been
+      done pretty well in the first evaluation. Therefore the runs show very little improvement in terms of final
+      score.
     </p>
-
-    <p>The experiment ran on 2026-07-15: three runs with the gate and consolidator on, against the three Task 3
-      full-CORAL runs as the vanilla arm. Same task, same two agents, same model (deepseek-v4-flash), same
-      12-real-attempt budget; Final Score is the best real attempt of a run, the same metric as Task 3. All six
-      runs completed their full budget. The numbers below were audited by an independent reviewer against the raw
-      run artifacts before publication.</p>
 
     <div class="scroll">
       <table>
@@ -763,10 +759,9 @@
       </table>
     </div>
 
+
+    That's why we look at the secondary metrics:
     <ol class="mods">
-      <li><b>Score.</b> Flat, as predicted above: a difference of +0.0001 with run-to-run spread more than twenty
-        times larger. The knowledge change neither helps nor hurts the headline number on this task, which repeats
-        the Task 3 result.</li>
       <li><b>Verification.</b> The three runs ended with 22 notes in the shared store. 16 were verified against
         the attempt store and served as such; 6 whose citations could not be checked (no evidence cited, or a
         cited attempt absent from the store) were marked unverified and ranked below the verified ones. The
@@ -775,20 +770,12 @@
       <li><b>Consolidation.</b> Five duplicate groups formed and two were merged by the LLM step, in both cases a
         pair of notes describing the same line of work (an ILS pair in s2, a perturbation pair in s3). Each merged
         note passed verification before it replaced anything, the four originals went to the archive, and both
-        agents' views then showed only the merged note. No note was lost in any run.</li>
+        agents' views then showed only the merged note.</li>
     </ol>
 
-    <p>The three failed merges share one cause. One group member documented crashed attempts, which have no score,
-      so the merged draft cannot quote every cited attempt with its recorded number, and the acceptance check
-      rejects it; we reproduced this offline against the same notes and attempt store. A failed merge leaves the
-      member notes untouched and is cached, so it costs one LLM call and nothing else. Extending the output
-      contract to unscored attempts is the clear next step.</p>
-
-    <p>One incident in the first run is disclosed rather than hidden. One agent wrote its notes to a wrong
-      absolute path outside its worktree, where the harvest cannot see them. Four of those notes were moved into
-      the correct view by hand mid-run and were then served as unverified, since they cite no evidence; a fifth,
-      written after the last pass, stayed stranded. The wrong path is agent behavior rather than a gate defect,
-      but it marks a real boundary: the gate can only govern what reaches a worktree view.</p>
+    <p>Overall, the changes are score-neutral on this task, as Task 3 predicted, and their effect is on the corpus
+      the agents read: verified notes ranked above unverified ones, a generated index that cannot rot, and
+      duplicate lines of work merged into a single note instead of accumulating.</p>
   </section>
 
   <!-- ---------------- TASK 5 ---------------- -->

@@ -41,7 +41,6 @@ CONDITIONS = {
     "full": "Full CORAL (control)",
     "noknowledge": "A - notes/skills disabled",
     "noheartbeat": "B - heartbeats disabled",
-    "gate": "Gate only",
     "consol": "Gate + LLM consolidation",
 }
 

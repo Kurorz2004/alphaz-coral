@@ -18,7 +18,8 @@ rm -rf "$DEST"
 mkdir -p "$DEST"
 EVID="$(pwd)/$DEST"
 
-CONDITIONS="full noknowledge noheartbeat gate consol"
+# "gate" (one incomplete 7/12 run, not cited in the report) is deliberately excluded.
+CONDITIONS="full noknowledge noheartbeat consol"
 PUBLIC_DIRS="attempts notes skills roles diagnostics heartbeat .publication"
 
 run_count=0
@@ -78,7 +79,7 @@ done
 find "$DEST" -type d -name __pycache__ -prune -exec rm -rf {} +
 
 # Results-root files (< 2MB each; skip + warn otherwise)
-for f in ablation.log gate.log consol.log manifest.jsonl; do
+for f in ablation.log consol.log manifest.jsonl; do
     src="results/$f"
     if [ -f "$src" ]; then
         size=$(wc -c < "$src" | tr -d ' ')

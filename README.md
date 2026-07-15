@@ -11,7 +11,7 @@ Task specification: [`TE M2-1.pdf`](./TE%20M2-1.pdf).
 | `taskdata/` | The 50 hidden CVRP instances and their reference labels; `vrp/task.yaml` grades against `../taskdata`. |
 | `coral-upstream/` | CORAL clone (gitignored). |
 | `vrp/evidence/` | Per-run evidence: attempt store, notes/skills corpora, publication verdicts, config, and a `repo.bundle` with the full git history of each run's evolved program. |
-| `coral-patches/` | The CORAL modifications (Tasks 3–4) as a patch series against upstream c535d91a; also on the fork's `task4-llm-consolidation` branch. |
+| `coral-patches/` | The CORAL modifications (Tasks 3–4) as a patch series against upstream c535d91a; also on [the fork's `task4-llm-consolidation` branch](https://github.com/Kurorz2004/CORAL/tree/task4-llm-consolidation). |
 
 Run results land in `vrp/results/` (gitignored).
 

@@ -19,4 +19,4 @@ Verified clean (`git am`, 17/17 applied, no conflicts) against a fresh clone
 of the base commit.
 
 The same series is published on the fork's `task4-llm-consolidation` branch:
-<FORK-URL-TBD>.
+https://github.com/Kurorz2004/CORAL/tree/task4-llm-consolidation.

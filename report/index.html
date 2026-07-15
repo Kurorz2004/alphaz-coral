@@ -176,13 +176,30 @@
       font-weight: 700;
       margin: 0 0 2px;
     }
+
+    @media print {
+
+      .fig,
+      .scroll,
+      table,
+      dl.kv {
+        break-inside: avoid;
+      }
+
+      h2,
+      h3,
+      h4,
+      .hdr {
+        break-after: avoid;
+      }
+    }
   </style>
 </head>
 
 <body>
 
   <h1>Alpha Z Technical Assessment: CORAL</h1>
-  <p>The experiments and reports are done with the help of Claude Code.</p>
+  <p>The experiments and reports were done with the help of Claude Code.</p>
   <section>
     <h2>What I understand about CORAL</h2>
     <p>CORAL is a harness that evolves a program. It launches N coding agents as ordinary CLI subprocesses, each working
@@ -226,7 +243,7 @@
           <text x="607" y="110" text-anchor="middle">Grader</text>
           <text x="607" y="126" text-anchor="middle" font-size="11">isolated checkout</text>
           <text x="607" y="190" text-anchor="middle">.coral/private/</text>
-          <text x="607" y="206" text-anchor="middle" font-size="11">hidden data to agents</text>
+          <text x="607" y="206" text-anchor="middle" font-size="11">data hidden from agents</text>
         </g>
         <g fill="none" stroke="#000" stroke-width="1" marker-end="url(#ah)">
           <path d="M188,132 L253,132" />
@@ -258,7 +275,8 @@
 
     <dl class="kv">
       <dt>Final Score</dt>
-      <dd><span class="v">1.000002</span>. Sum of radii 2.635983084918, from a seed measured at 0.364102.</dd>
+      <dd><span class="v">1.000002</span>. Sum of radii 2.635983084918, from a seed measured at 0.364102 (sum of
+        radii 0.959764).</dd>
       <dt>#Evals</dt>
       <dd><span class="v">2</span>. The run auto-stopped on <code>score_threshold</code> after roughly 54 minutes.</dd>
     </dl>
@@ -342,8 +360,8 @@
     <p>Instances were generated with the XML100 generator published alongside CVRPLIB
       (galgos.inf.puc-rio.br/cvrplib/uploads/files/xml100/generator.py), described in Uchoa et al. (2017),
       <i>New benchmark instances for the Capacitated Vehicle Routing Problem</i>, EJOR, and Queiroga et al. (2022),
-      <i>10,000 optimal CVRP solutions for testing machine learning based heuristics</i>. Sixty instances were
-      generated, stratified across the generator's four factors (depot position, customer position, demand
+      <i>10,000 optimal CVRP solutions for testing machine learning based heuristics</i>. 60 instances were
+      generated, stratified across the generator's 4 factors (depot position, customer position, demand
       distribution and average route size), then split into 50 hidden instances for grading and 10 disjoint public
       instances for development. They were generated fresh rather than taken from CVRPLIB Set X because Set X's
       optimal routes are published and its <code>dimension</code> field uniquely identifies each instance, so an
@@ -353,12 +371,12 @@
     <p><code>grader.py</code> loads the hidden instances, calls the agent's
       <code>solve()</code> once per instance, rejects any solution that revisits a customer, misses one, overloads a
       route or opens too many, and scores the run as the mean of <code>reference_distance / solver_distance</code>
-      over the 50 instances. The reference distance for each instance is PyVRP's hybrid genetic search, best of three
+      over the 50 instances. The reference distance for each instance is PyVRP's hybrid genetic search, best of 3
       seeds at 60 seconds each, with every label independently re-validated against the grader's own feasibility
       rules. The seed program is a greedy nearest-neighbour construction with no improvement step.
-      <code>task.yaml</code> runs 2 agents on <code>deepseek-v4-flash</code> with a fixed budget of 12 evaluations
-      and no score threshold, and states the problem, the interface and the rules without naming any algorithm,
-      library or reference solver.
+      The run uses 2 agents on <code>deepseek-v4-flash</code> (set at launch and verified from the agent logs) with
+      a fixed budget of 12 evaluations and no score threshold; <code>task.yaml</code> states the problem, the
+      interface and the rules without naming any algorithm, library or reference solver.
     </p>
 
     <dl class="kv">
@@ -404,7 +422,8 @@
       </table>
     </div>
 
-    <p class="note">Reading of the numbers. CORAL improved the seed by 24.8% in score, closing the gap to the
+    <p class="note">Reading of the numbers. CORAL improved the seed score by 0.196 (a 24.8% relative gain), closing the
+      gap to the
       reference from +28.24% to +1.50%. The winning program is a construction heuristic followed by local search with
       incremental delta evaluation, discovered by the agents themselves; the task briefing names no algorithm. The
       reference is not a proven optimum, only a
@@ -416,7 +435,7 @@
   <!-- ---------------- TASK 3 ---------------- -->
   <section id="task3">
     <h2>Task 3: Ablation study</h2>
-    <p>Three conditions × three runs: <b>control</b> (full CORAL), <b>A</b> with the notes
+    <p>I ran the experiment 3 times for each of these conditions: <b>control</b> (full CORAL), <b>A</b> with the notes
       and skills directories disabled, and <b>B</b> with heartbeats disabled. CORAL's <code>agents.model</code> is only
       a runtime alias, so each run's model is verified from the agent logs rather than the config, and any run that
       drifts off-model or ends early is excluded from the pool rather than silently averaged in.</p>
@@ -488,10 +507,10 @@
     <p class="note">Reading of the numbers. The three arms are statistically indistinguishable: the largest separation
       from the control (0.0072, condition A) lies within the between-run dispersion of the conditions themselves
       (sd 0.0024–0.0120). The likely explanation is that this task leaves the agents little to accumulate. The seed
-      scores 0.789815, yet the first evaluated attempt of almost every run already scores between 0.94 and 0.98, so
+      scores 0.789815, yet the first evaluated attempt of almost every run already scores between 0.94 and 0.99, so
       the greater part of the total improvement is realised before any note, skill or heartbeat can have taken effect.
       CVRP is a canonical operations-research problem with an extensive published literature, and an agent with web
-      access can therefore retrieve an established construction heuristic (Clarke–Wright savings, a Prins-style
+      access can therefore retrieve an established construction heuristic (Clarke-Wright savings, a Prins-style
       optimal split of a giant tour) together with a standard local-search refinement, and reconstruct a competitive
       solver at the first attempt.
       That's why I think even if we run more than 3 times for each condition, the result is still likely to be
@@ -501,29 +520,26 @@
 
   <!-- ---------------- TASK 4 ---------------- -->
   <section id="task4">
-    <h2>Task 4: Improve CORAL, knowledge distillation and memory management</h2>
+    <h2>Task 4: Improve CORAL &mdash; knowledge distillation and memory management</h2>
 
     <h3>1. The failure mode, with evidence</h3>
 
-    <p>The assessment names three expected problems: noise accumulation, retrieval degradation and redundancy. All
-      three appear in the Task 3 runs, and they share one root cause. A note becomes visible to every agent the
+    <p>The assessment names three expected problems: noise accumulation, retrieval degradation and redundancy. One of
+      the causes might be that a note becomes visible to every agent the
       moment it is written, because <code>notes/</code> and <code>skills/</code> in each worktree are symlinks into
-      the shared state, and nothing evaluates it afterwards. The attempt store that could check every claim sits in
-      the same directory, but no code path joins the two.</p>
+      the shared state, and nothing evaluates it afterwards.</p>
 
     <p>A note's <code>status</code> and <code>confidence</code> fields are self-declared, and nothing reads them
       except a format linter and the dashboard. The only ordering in the retrieval path (<code>_sort_key</code>) is
       the timestamp. The listing an agent sees (<code>format_notes_list</code>) prints date, title and creator
       only. A refuted note and a confirmed one therefore look the same everywhere except inside the file body.</p>
 
+
+    <p>In my experiments, the problems appeared in these forms:</p>
     <ol class="mods">
       <li><b>Noise accumulation.</b> Six notes across the three runs are marked <code>refuted</code> by their own
         authors. Nothing demotes or flags them, and they are served to every later reader in the same way as the
         confirmed ones.</li>
-      <li><b>Retrieval degradation.</b> The only upkeep the corpus gets is an <code>index.md</code> the agents
-        maintain by hand, and it broke within one run. The index of <code>full-s1</code> lists six entries: one
-        links to a note that does not exist, five real notes are missing, and a refuted experiment is shown with a
-        healthy-looking score and no marker.</li>
       <li><b>Redundancy.</b> In <code>full-s1</code> the two agents built the same first improvement separately,
         Clarke-Wright construction plus local search, and wrote it up as two confirmed notes scoring 0.952658 and
         0.952742.</li>
@@ -581,16 +597,6 @@
       </table>
     </div>
 
-    <p class="note">Reading of the numbers. The corpus is honest: every note that cites evidence cites a real,
-      scored attempt made by its own author, and every score quoted in a note matches the store. The notes that
-      cite no evidence are the three <code>_synthesis</code> summaries, which exist to sum up the corpus for the
-      next reader, and all three stamp themselves <code>confirmed</code>. 19 of the 24 notes declare high
-      confidence, so the declared confidence carries no signal.</p>
-
-    <p>The failure is therefore not fabrication that has to be policed when a note is written. The failure is that
-      the reader has no way to tell a verified note from an unverified one, although everything needed to tell them
-      apart is already machine-checkable on the host.</p>
-
     <h3>2. The change: a publication gate</h3>
 
     <p>The gate runs on its existing monitor loop, over every note that is new or has changed
@@ -599,8 +605,7 @@
       comparison, and set overlap on tags; there is no LLM call and no embedding model in the path. A model-based
       judge would be slower, non-deterministic, and itself a new source of wrong verdicts, while every check here
       is exact and reproducible.</p>
-
-    <p>The gate will help prevent 2 things:</p>
+    <p>The gate mechanics aim to prevent 2 things:</p>
 
     <ol class="mods">
       <li><b>Noise accumulation.</b> For each note, the pass parses the evidence block and looks the cited hash up
@@ -616,17 +621,18 @@
         Notes that cite the same attempt hash describe the same experiment and are folded into one entry; notes
         whose frontmatter tag sets overlap beyond a set threshold are grouped, with the best-verified note as the
         entry and the rest as "see also" lines under it. The duplicated Clarke-Wright pair in <code>full-s1</code>
-        is caught by the tag rule, since the two notes cite different attempts but share nearly the same tags. A
-        paraphrase written with fresh tags escapes both rules; an embedding-similarity check could be added later,
-        but the duplicates observed in the runs do not need one.</li>
+        is caught by the tag rule, since the two notes cite different attempts but share nearly the same tags.
+        On top of the grouping there is one model-assisted step, added for the experiment below: when a duplicate
+        group forms, a single LLM call drafts one merged note, and the draft is accepted only if it passes the
+        same mechanical verification as any other note &mdash; every attempt it cites must resolve in the store
+        with the exact recorded score. On success the originals move to an archive outside the served view, so
+        the agents see only the merged note; on any failure nothing is touched and the group is cached so the
+        call is not repeated. The model only writes prose; what counts as true is still decided by the mechanical
+        checks. A paraphrase written with fresh tags escapes both rules; an embedding-similarity check could be
+        added later, but the duplicates observed in the runs do not need one.</li>
     </ol>
 
-    <p>On top of the grouping there is one model-assisted step, added for the experiment below. When a duplicate
-      group forms, a single LLM call drafts one merged note, and the draft is accepted only if it passes the same
-      mechanical verification as any other note: every attempt it cites must resolve in the store with the exact
-      recorded score. On success the originals move to an archive outside the served view, so the agents see only
-      the merged note; on any failure nothing is touched and the group is cached so the call is not repeated. The
-      model only writes prose; what counts as true is still decided by the mechanical checks.</p>
+
 
     <p>What lands in each worktree is a generated view: <code>notes/</code> and <code>skills/</code> stop being
       symlinks and become a directory the manager writes, one file at a time with atomic renames, because under
@@ -673,11 +679,11 @@
           <text x="607" y="110" text-anchor="middle">Grader</text>
           <text x="607" y="126" text-anchor="middle" font-size="11">isolated checkout</text>
           <text x="607" y="190" text-anchor="middle">.coral/private/</text>
-          <text x="607" y="206" text-anchor="middle" font-size="11">hidden data to agents</text>
+          <text x="607" y="206" text-anchor="middle" font-size="11">data hidden from agents</text>
           <text x="98" y="261" text-anchor="middle">read view, per agent</text>
           <text x="98" y="277" text-anchor="middle" font-size="11">verified, ranked notes and skills</text>
           <text x="362" y="232" text-anchor="middle">publication pass</text>
-          <text x="362" y="248" text-anchor="middle" font-size="11">verify claims against the attempt store</text>
+          <text x="362" y="248" text-anchor="middle" font-size="11">verify claims against the attempt; store</text>
           <text x="362" y="262" text-anchor="middle" font-size="11">group duplicates; an LLM call merges</text>
           <text x="362" y="276" text-anchor="middle" font-size="11">each group, originals to the archive</text>
           <text x="362" y="288" text-anchor="middle" font-size="11">rank, demote refuted and unverified</text>
@@ -718,15 +724,16 @@
 
     <h3>4. Comparative experiment</h3>
 
-    <p>As I said in task 3, since this problem is a classic one, most of the meaningful heuristics have already been
+    <p>As I said in Task 3, since this problem is a classic one, most of the meaningful heuristics have already been
       done pretty well in the first evaluation. Therefore the runs show very little improvement in terms of final
       score.
     </p>
 
     <div class="scroll">
       <table>
-        <caption>Final Score per run and per arm. Runs are independent seeds, not pairs; the row alignment is
-          positional only.</caption>
+        <caption>Final Score per run and per arm. The vanilla arm reuses the three Task 3 control runs: with the
+          gate flag off, the code path is identical to the one they ran. Runs are independent seeds, not pairs; the
+          row alignment is positional only.</caption>
         <thead>
           <tr>
             <th>Run</th>
@@ -760,11 +767,12 @@
     </div>
 
 
-    That's why we look at the secondary metrics:
+    <p>That's why we look at the secondary metrics:</p>
     <ol class="mods">
       <li><b>Verification.</b> The three runs ended with 22 notes in the shared store. 16 were verified against
         the attempt store and served as such; 6 whose citations could not be checked (no evidence cited, or a
-        cited attempt absent from the store) were marked unverified and ranked below the verified ones. The
+        cited attempt absent from the store or unscored) were marked unverified and ranked below the verified
+        ones. The
         generated index stayed correct in all three runs; the hand-kept index rot seen in <code>full-s1</code> did
         not recur.</li>
       <li><b>Consolidation.</b> Five duplicate groups formed and two were merged by the LLM step, in both cases a
@@ -929,11 +937,11 @@
 
     <h3>3. Multi-tenant isolation</h3>
 
-    <p>I have not deployed a system of this kind for enterprise customers, so I will not pretend that I know the detail
-      tech stack for this part. But I will try to describe what I think should be private and what should be shared
-      accross tenants. </p>
+    <p>I have not deployed a system of this kind for enterprise customers, so I will not pretend that I know the
+      detailed tech stack for this part. But I will try to describe what I think should be private and what should be
+      shared across tenants. </p>
     <p>A piece of knowledge is general if it applies to any instance of the problem, and private if it depends on one
-      customer's instance. So the knowledge that should be shared is the one that can help optimize the solver
+      customer's instance. So the knowledge that should be shared is the one that can help optimise the solver
       searching technique and searching time like: solver operators, savings insertion and 2-opt;
       search control schedules; evaluation-speed engineering such as incremental scoring and caching; and defects in
       the platform itself.</p>
@@ -957,8 +965,7 @@
       Only the second class drives evolution.</p>
 
     <p>The path is not a set of independent channels but a single pipeline of three stages: a divergence is detected, a
-      question is asked about that specific divergence, and the answer is classified. No stage asks the user to
-      quantify anything.</p>
+      question is asked about that specific divergence, and the answer is classified. </p>
 
     <ol class="mods">
       <li><b>Detection.</b> Dispatchers edit a plan before releasing it. The planning interface records both the plan
@@ -974,7 +981,7 @@
         bottleneck. Knowledge is obtained only when the question is specific enough to touch the rule in question;
         the divergence recorded in stage 1 supplies that specificity, and is put back to the
         dispatcher as a contrastive question about that case, for example "stop 14 was moved from route B to route C
-        before release; what made route B unusable". The record localises the unstated rule; the question extracts
+        before release; what made route B unusable?". The record localises the unstated rule; the question extracts
         it.</li>
       <li><b>Classification.</b> The answer returns as natural language, as does any unprompted comment left against
         a plan. A model maps that language onto the objective's existing terms: which term is implicated (driver
@@ -995,7 +1002,7 @@
 
     <h3>5. Foreseeable failure modes</h3>
 
-    <p>I think the most deployments of this kind fail because the problem was modelled wrongly, not because the search
+    <p>I think most deployments of this kind fail because the problem was modelled wrongly, not because the search
       was weak.</p>
 
     <h4>Failure 1. Model and data</h4>
@@ -1011,7 +1018,8 @@
 
     <p class="hdr">Strategy to mitigate</p>
     <p>We need constant discussion with the customer to ensure the objective states what the customer actually wants.
-      As for data accuracy, we want a checking layer runs before the solver and rejects bad input rather than repairing
+      As for data accuracy, we want a checking layer that runs before the solver and rejects bad input rather than
+      repairing
       it. Every rule the customer
       states is tested against the record of past approved plans before it is accepted, because a rule that a fair
       number
@@ -1019,16 +1027,16 @@
       hard rule instead, it would cut away part of the legal solution space, and the agent could never again find the
       better plan that was inside it.</p>
 
-    <h4>Failure 2. The self directed agent</h4>
+    <h4>Failure 2. The self-directed agent</h4>
 
     <p class="hdr">Problem</p>
     <p>The agent can read exactly how it is scored. In CORAL the grading code sits in the task's <code>grader/</code>
-      folder and is shown to every agent as read only, and this stays true even when the agent runs inside a sandbox or
+      folder and is shown to every agent as read-only, and this stays true even when the agent runs inside a sandbox or
       a container, because only the hidden data, not the scoring code, is placed behind that wall. So an agent that
       writes its own program, sees its own score, and can read the code that produced it will, after several hundred
       rounds, drift toward the cheapest way to raise the number. Often the cheapest way is not to solve the problem but
       to cheat the measurement. It may store answers for instances it has already seen, read a known optimum from a
-      value in the input, use a rounding or tie breaking detail in the grader, or special case the few visible
+      value in the input, use a rounding or tie-breaking detail in the grader, or special-case the few visible
       development instances. The score is then high and the solver is useless.</p>
 
     <p class="hdr">Strategy to mitigate</p>
@@ -1037,8 +1045,22 @@
       sees, and the gap between the development score and the holdout score tells us how far the agent has fitted the
       grader instead of the problem. Second, the promotion gate scores the champion again on instances created after it
       was written, and probes change an instance in ways that must not change the answer, so a program that only
-      memorised or special cased earlier cases is exposed. This does not eliminate the risk entirely, but it makes it
-      harder for the agent to cheat the measurement. </p>
+      memorised or special-cased earlier cases is exposed. This does not eliminate the risk entirely, but it makes it
+      harder for the agent to cheat the measurement.</p>
+  </section>
+  <section id="task6">
+    <h2>Task 6: Reflections</h2>
+    <p>This week of experiments and iteration has been a genuinely valuable exercise. In my opinion, Task 2 should
+      have been built on a less classical problem, so that the evolutionary behaviour of the agents would have had
+      more room to show itself. Overall, the tasks taught me a good deal: how to orchestrate the agents, and how
+      objectives and knowledge can be brought into the agents' consideration by adjusting the weights and the
+      objective.</p>
+    <p>I also want to say that I am a recent graduate in Data Science, and my expertise does not yet match that of those
+      with years
+      of industry experience. However I can learn things quickly, and I am confident that I can catch up with whatever
+      the
+      work requires.</p>
+
   </section>
 </body>
 

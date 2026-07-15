@@ -1,6 +1,7 @@
 # Alpha Z Technical Assessment — CORAL
 
 **Report (the deliverable): [`report/index.html`](./report/index.html)** — open it in a browser.
+(GitHub does not render HTML in-repo; [`report/report.pdf`](./report/report.pdf) is the same report and views directly on GitHub.)
 Task specification: [`TE M2-1.pdf`](./TE%20M2-1.pdf).
 
 | Path | What is in it |
@@ -25,5 +26,5 @@ uv run --project ../coral-upstream python analyze.py evidence
 To open an evolved-program repo from a run's git bundle:
 
 ```
-git clone vrp/evidence/gate/gate-s1/repo.bundle <dir>
+git clone vrp/evidence/full/full-s1/repo.bundle <dir>
 ```

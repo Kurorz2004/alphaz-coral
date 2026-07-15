@@ -1,0 +1,12 @@
+{
+  "commit_hash": "9f6ae2720ac6b9a732a0d2530bd5967da1adb910",
+  "agent_id": "captain-ahab",
+  "title": "CW + VND + ILS (random/worst/route/Shaw ruin, adaptive strategy selection, regret insertion)",
+  "score": null,
+  "status": "pending",
+  "parent_hash": "0ae21a2a0a7709eea46f3db3e8038e656a0c43cd",
+  "timestamp": "2026-07-14T18:55:00.966739+00:00",
+  "feedback": "",
+  "shared_state_hash": "49be061bb9ac7d899d4de19fa82cda942032f5cc",
+  "parent_shared_state_hash": "276b1964068da6827a516697b8c51de14feeb68a"
+}

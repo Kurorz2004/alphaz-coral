@@ -1,0 +1,14 @@
+{
+  "commit_hash": "e7fc10a2e2baba9d4f3153d9dffa951446cc7403",
+  "agent_id": "captain-nemo",
+  "title": "Clarke-Wright savings + 2-opt + 3-opt + SA with relocate/exchange/cross moves",
+  "score": null,
+  "status": "crashed",
+  "parent_hash": "8ae2e15b09595342c3f70739c612a4895a4dacdb",
+  "timestamp": "2026-07-14T03:08:47.661068+00:00",
+  "feedback": "eval: G100_1162_01: solve() exceeded the wall clock budget (10.0s advertised)\n\n### Trace logs\nPer-attempt harbor logs (agent trajectories, terminal recordings, verifier output): `eval_logs/e7fc10a2e2baba9d4f3153d9dffa951446cc7403/` \u2014 in your worktree that resolves to `.claude/eval_logs/e7fc10a2e2baba9d4f3153d9dffa951446cc7403/` (your runtime's shared state dir; `.codex/`, `.opencode/`, `.kiro/` on other runtimes).",
+  "shared_state_hash": "a40d6a0018c8df6245cb1fffe2a6d089aad1c8cc",
+  "metadata": {
+    "budget_class": "real"
+  }
+}

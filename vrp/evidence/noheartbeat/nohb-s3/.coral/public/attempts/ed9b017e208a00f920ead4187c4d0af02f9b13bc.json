@@ -1,0 +1,12 @@
+{
+  "commit_hash": "ed9b017e208a00f920ead4187c4d0af02f9b13bc",
+  "agent_id": "captain-ahab",
+  "title": "Or-opt intra-route + Shaw removal (70% similar customers) + wider ruin range (10-40%) + multi-start construction (6 CW \u03bb + 6 sweep)",
+  "score": null,
+  "status": "pending",
+  "parent_hash": "942f4e167f1ba4a2494b6a08cf9c4534c22c4673",
+  "timestamp": "2026-07-14T01:53:50.559096+00:00",
+  "feedback": "",
+  "shared_state_hash": "6932629df55f6c908df77d87901f3293c87f43f3",
+  "parent_shared_state_hash": "2bd10352c1e981047024838bae81c44bbc598d84"
+}

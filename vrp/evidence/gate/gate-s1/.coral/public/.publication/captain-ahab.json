@@ -1,0 +1,10 @@
+{
+  "experiments/eval-1-cw-sa.md": "3a033639d7d0cec707f1a1bc4db82cbbb2a6edf237fa9a18973253a53357cec6",
+  "experiments/eval-2-cw-vnd-ils.md": "d08be9a0b3ce4e8ec594a434a051478c091923adbde1a76cf7e422bd038cd346",
+  "experiments/eval-2-multi-restart-sa.md": "bb2c4f4ab53aa6beb99d2a3be8c6fdc9bd50e44bed7cf4b138aee34d421a0c17",
+  "experiments/eval-3-fast-sa.md": "93b00c53137807ce894e04e861bd23e77c1c26e00af0ec08c367dc573c24fd40",
+  "experiments/eval-3-sweep-sa.md": "a5e53e3c1450a82eed8ac7aa47855956963c23c386a5c8731b33fa1854827a36",
+  "experiments/eval-4-granular-oropt.md": "f75b215845985a4f19c7a007000aee2fbcf0fbf982ff0c34f7ebcfbfd442795a",
+  "index.md": "516fd19bb206a7698e259282da2e353102f7cd756e278145ab639f4184c100b8",
+  "research/cvrp-approaches.md": "8a194be28951510a9eda4c162c5cf777fac366c489b5262f14b4311ae9c55497"
+}

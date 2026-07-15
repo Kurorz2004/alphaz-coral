@@ -1,0 +1,12 @@
+{
+  "commit_hash": "5edacd8be101f6aa2794d0326fb47898969c1373",
+  "agent_id": "captain-nemo",
+  "title": "3-pass ILS VND + post-optimization: 3 VND passes in ILS, 5-pass post-opt, 300 max-no-improve, aggressive ruin 0.15-0.35, hybrid ruin strategy",
+  "score": null,
+  "status": "pending",
+  "parent_hash": "4b9543e33c160bd30fd66ce6482f62805fe94458",
+  "timestamp": "2026-07-13T17:08:18.195014+00:00",
+  "feedback": "",
+  "shared_state_hash": "e2e7443758c394349b969d864362a59d8e212920",
+  "parent_shared_state_hash": "6a6202cd78aa90c511bdda1bb17efcfa42f721ab"
+}

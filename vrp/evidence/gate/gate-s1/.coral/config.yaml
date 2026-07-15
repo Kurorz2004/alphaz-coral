@@ -1,0 +1,162 @@
+task:
+  name: Capacitated Vehicle Routing Problem
+  description: "Solve the Capacitated Vehicle Routing Problem (CVRP), minimising the\
+    \ total\ndistance travelled by a fleet of vehicles.\n\nYou are given a set of\
+    \ customers, each with a location and a demand. A fleet\nof identical vehicles,\
+    \ each with the same capacity, serves all customers\nstarting and ending at a\
+    \ single depot. Every customer must be visited exactly\nonce; the total demand\
+    \ on any route must not exceed the vehicle capacity.\n\nYour program `solution.py`\
+    \ must define:\n\n    solve(dimension, capacity, node_coords, demands, n_vehicles,\
+    \ time_limit, seed) -> routes\n\n  dimension     int, total number of nodes (depot\
+    \ + customers)\n  capacity      int, vehicle capacity\n  node_coords   list[tuple[int,int]],\
+    \ coordinates of each node. Node 0 is\n                the depot; nodes 1..dimension-1\
+    \ are customers.\n  demands       list[int], demand at each node. demands[0] =\
+    \ 0.\n  n_vehicles    int, number of vehicles available (always dimension - 1,\
+    \ i.e.\n                one per customer \u2014 effectively unlimited). You may\
+    \ use fewer\n                vehicles but not more.\n  time_limit    float, seconds\
+    \ you may spend on THIS instance\n  seed          int, for reproducible randomisation\n\
+    \  routes        list[list[int]], each inner list is one vehicle's route\n   \
+    \             (a sequence of customer indices starting and ending at the\n   \
+    \             depot, which is implied \u2014 do NOT include 0 in the route).\n\
+    \n**Distances.** The edge weight type is EUC_2D: Euclidean distance rounded to\n\
+    the nearest integer, with double-precision computations:\n\n    dx = x[i] - x[j];\
+    \ dy = y[i] - y[j]\n    d = int(math.sqrt(dx*dx + dy*dy) + 0.5)\n\n**Feasibility.**\
+    \ A solution is infeasible if ANY of these holds:\n  1. A customer is visited\
+    \ more than once or not at all\n  2. A route's total demand exceeds `capacity`\n\
+    \  3. More than `n_vehicles` routes are used\n  4. A route contains an invalid\
+    \ customer index (< 1 or >= dimension)\n**Any infeasible or malformed solution\
+    \ fails the entire evaluation.**\n\n**Scoring.** Score = mean over the hidden\
+    \ instances of\n`reference_distance / solver_distance`. The reference distance\
+    \ for each\ninstance is a fixed constant computed in advance. It is NOT a proven\
+    \ optimum\n\u2014 it is close to one, but slightly loose.\n\nHigher is strictly\
+    \ better, and there is no fixed ceiling on the score: if\nyour solver beats the\
+    \ reference on an instance, your score on that instance\nwill slightly exceed\
+    \ 1.0.\n\n**Instances.** Every instance is a freshly generated CVRP with n = 100\n\
+    customers (dimension 101). None have ever been published, and no optimum\nis known\
+    \ for them, publicly or privately. There are 50 hidden instances\nused for grading\
+    \ and 10 public instances for development, and the two\nsets are disjoint \u2014\
+    \ the dev set is not a subset of the graded set.\n\n**Instances for development.**\
+    \ `instances/` holds 10 CVRP instances with\nreference distances in `instances/reference.json`.\
+    \ Run `python\nevaluate_local.py` to score yourself with the exact grader formula.\n"
+  tips: "- Score = mean(reference_distance / solver_distance) over hidden instances;\n\
+    \  it can slightly exceed 1.0 if you beat the reference on an instance.\n- Distances\
+    \ are EUC_2D: compute `int(sqrt(dx\xB2+dy\xB2) + 0.5)`. Getting this\n  wrong\
+    \ silently invalidates your gaps.\n- `n_vehicles` is always dimension - 1 (effectively\
+    \ unlimited); you may use\n  fewer but not more.\n- `time_limit` is 10 seconds\
+    \ PER INSTANCE. At n=100 this is tight.\n- `solve()` must be deterministic given\
+    \ `seed`. The grader fixes PYTHONHASHSEED\n  and seeds `random` before each call.\n\
+    - Your program runs inside a fixed virtualenv that you cannot add packages to.\n\
+    \  Adding a pyproject.toml will not change the interpreter you get. Check what\n\
+    \  is importable before you rely on it.\n- `python evaluate_local.py` scores you\
+    \ on the visible instances for free \u2014 use\n  it liberally before spending\
+    \ an eval.\n"
+grader:
+  entrypoint: vrp_grader.grader:Grader
+  setup:
+  - uv pip install -e ./grader
+  timeout: 1200
+  args:
+    program_file: solution.py
+    time_limit: 10.0
+    base_seed: 12345
+  private:
+  - ../taskdata
+  direction: maximize
+  max_pending_per_agent: 1
+  parallel:
+    max_workers: 1
+agents:
+  count: 2
+  runtime: claude_code
+  model: deepseek-v4-flash
+  gateway:
+    enabled: false
+    port: 4000
+    config: ''
+    api_key: ''
+  warmstart:
+    enabled: false
+  runtime_options: {}
+  isolate_user: ''
+  sandbox:
+    enabled: false
+    provider: srt
+    network: open
+    srt_command:
+    - npx
+    - --no-install
+    - srt
+    allowed_domains: []
+    deny_read: []
+    allow_read: []
+    allow_write: []
+    extra_settings: {}
+  assignments: []
+  max_turns: 0
+  timeout: 1200
+  heartbeat:
+  - name: reflect
+    every: 1
+    trigger: interval
+    prompt: ''
+    options: {}
+    global: false
+  - name: consolidate
+    every: 10
+    trigger: interval
+    prompt: ''
+    options: {}
+    global: true
+  - name: pivot
+    every: 5
+    trigger: plateau
+    prompt: ''
+    options: {}
+    global: false
+  - name: lint_wiki
+    every: 10
+    trigger: interval
+    prompt: ''
+    options: {}
+    global: true
+  skills: []
+  research: true
+  knowledge: true
+  publication_gate: true
+  stagger_seconds: 0
+  restart_burst_threshold: 3
+  restart_burst_window: 30
+  restart_pause_seconds: 300
+  grader_pending_max_age: 1800
+  min_clean_runtime_seconds: 60
+islands:
+  count: 1
+  migration:
+    enabled: true
+    every: 50
+    rank_window: 20
+    min_evals: 3
+    dest_weighting: score
+    max_per_cycle: 2
+    notify_island: true
+    resync_bystanders: true
+sharing:
+  attempts: true
+  notes: true
+  skills: true
+workspace:
+  results_dir: ./results/gate
+  repo_path: /mnt/d/Code/Fun/coral/task3_vrp/seed
+  setup:
+  - uv venv
+  - uv pip install numpy
+  base_dir: ''
+  run_dir: ./results/gate/gate-s1
+run:
+  verbose: false
+  ui: false
+  session: tmux
+  docker_image: ''
+  stop:
+    score_threshold: null
+    max_real_attempts: 12

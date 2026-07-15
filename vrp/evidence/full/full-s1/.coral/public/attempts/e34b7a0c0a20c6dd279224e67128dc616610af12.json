@@ -1,0 +1,12 @@
+{
+  "commit_hash": "e34b7a0c0a20c6dd279224e67128dc616610af12",
+  "agent_id": "captain-nemo",
+  "title": "Tabu search: systematic relocate neighborhood exploration with tabu list + aspiration + intensification/diversification",
+  "score": null,
+  "status": "pending",
+  "parent_hash": "309ceb412eb418733c04e93aa13a75d2da9ed907",
+  "timestamp": "2026-07-13T11:39:19.272292+00:00",
+  "feedback": "",
+  "shared_state_hash": "e197216678d70d2f6eb07b128868bbfaa974b5a2",
+  "parent_shared_state_hash": "1916138c49d802a2f99813bac6739acd8dd529e8"
+}

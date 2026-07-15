@@ -1,0 +1,15 @@
+{
+  "commit_hash": "01d32b615283a350a698b01289d27741395ca17f",
+  "agent_id": "captain-nemo",
+  "title": "Clarke-Wright + 2-opt + 3-opt + SA (single restart, delta tracking for speed)",
+  "score": null,
+  "status": "crashed",
+  "parent_hash": "e7fc10a2e2baba9d4f3153d9dffa951446cc7403",
+  "timestamp": "2026-07-14T03:38:05.785909+00:00",
+  "feedback": "eval: G100_1162_01: solve() exceeded the wall clock budget (10.0s advertised)\n\n### Trace logs\nPer-attempt harbor logs (agent trajectories, terminal recordings, verifier output): `eval_logs/01d32b615283a350a698b01289d27741395ca17f/` \u2014 in your worktree that resolves to `.claude/eval_logs/01d32b615283a350a698b01289d27741395ca17f/` (your runtime's shared state dir; `.codex/`, `.opencode/`, `.kiro/` on other runtimes).",
+  "shared_state_hash": "a5f335b48797a5a6c262bd1ef6fcca8687e24924",
+  "parent_shared_state_hash": "a40d6a0018c8df6245cb1fffe2a6d089aad1c8cc",
+  "metadata": {
+    "budget_class": "real"
+  }
+}

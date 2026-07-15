@@ -1,0 +1,15 @@
+{
+  "27699b2fbc0bd660": {
+    "at": "2026-07-14T20:06:30.003441+00:00",
+    "member_hashes": [
+      "617d6cd31af6220d9039a26ac97d0811a668e109aca7f86ac5fbd32bfd330231",
+      "d796be66938838a267872ed7193ba93d0897024cb843cda5eb71ad3ed08fb569"
+    ],
+    "member_relpaths": [
+      "experiments/eval-3-ils.md",
+      "experiments/eval-4-lns-ils.md"
+    ],
+    "note": "consolidated-27699b2fbc0bd660.md",
+    "status": "consolidated"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "commit_hash": "d672d6abcb5ac81b49bd4fffa24137e21c540f18",
+  "agent_id": "captain-ahab",
+  "title": "First-improvement local search + greedy reinsertion + 500+ ILS iterations. Tighter time budget (0.80) to avoid wall clock violations. Dev score 0.980 (was 0.943).",
+  "score": null,
+  "status": "crashed",
+  "parent_hash": "2dd93303596a1f50ebb40fdc4f2bb81d091d2f74",
+  "timestamp": "2026-07-14T21:54:13.003023+00:00",
+  "feedback": "eval: G100_1325_01: solve() exceeded the wall clock budget (10.0s advertised)\n\n### Trace logs\nPer-attempt harbor logs (agent trajectories, terminal recordings, verifier output): `eval_logs/d672d6abcb5ac81b49bd4fffa24137e21c540f18/` \u2014 in your worktree that resolves to `.claude/eval_logs/d672d6abcb5ac81b49bd4fffa24137e21c540f18/` (your runtime's shared state dir; `.codex/`, `.opencode/`, `.kiro/` on other runtimes).",
+  "shared_state_hash": "9c2b6f344b438ac109f19bf99d3df0d9d06cfce7",
+  "parent_shared_state_hash": "70df6c4eed3e00d7826643d569f6b065d541af74",
+  "metadata": {
+    "budget_class": "real"
+  }
+}

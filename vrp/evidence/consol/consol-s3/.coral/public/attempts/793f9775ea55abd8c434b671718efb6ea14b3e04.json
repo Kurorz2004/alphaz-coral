@@ -1,0 +1,15 @@
+{
+  "commit_hash": "793f9775ea55abd8c434b671718efb6ea14b3e04",
+  "agent_id": "captain-nemo",
+  "title": "Add Or-opt (segment relocation, len=2/3) to local search, increase ILS to 200 iterations with adaptive perturbations. Score 0.978 on dev set (was 0.965).",
+  "score": null,
+  "status": "crashed",
+  "parent_hash": "d5a5c37a23189eb57a3a56347ccb7588d9e9a534",
+  "timestamp": "2026-07-14T21:14:18.531764+00:00",
+  "feedback": "eval: G100_1244_01: solve() exceeded the wall clock budget (10.0s advertised)\n\n### Trace logs\nPer-attempt harbor logs (agent trajectories, terminal recordings, verifier output): `eval_logs/793f9775ea55abd8c434b671718efb6ea14b3e04/` \u2014 in your worktree that resolves to `.claude/eval_logs/793f9775ea55abd8c434b671718efb6ea14b3e04/` (your runtime's shared state dir; `.codex/`, `.opencode/`, `.kiro/` on other runtimes).",
+  "shared_state_hash": "17cbe0bef56865e5bf433436c9c5c61d5d18d043",
+  "parent_shared_state_hash": "25b5d640a466b87d32931cf8ae8e429c75ac9054",
+  "metadata": {
+    "budget_class": "real"
+  }
+}

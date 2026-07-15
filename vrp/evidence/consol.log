@@ -1,0 +1,32 @@
+[22:42:22] preflight OK — model=deepseek-v4-flash, 16 cores, timeout 14400s/run
+[22:42:22] START consol-s1 (consol) try 1/2
+[22:43:17] END   consol-s1 (consol) status=start_failed elapsed=0m attempts=0
+[22:43:17]   run consol-s1 did not complete cleanly
+[22:44:17] START consol-s2 (consol) try 1/2
+[22:45:09] END   consol-s2 (consol) status=start_failed elapsed=0m attempts=0
+[22:45:09]   run consol-s2 did not complete cleanly
+[22:46:09] START consol-s3 (consol) try 1/2
+[22:47:03] END   consol-s3 (consol) status=start_failed elapsed=0m attempts=0
+[22:47:03]   run consol-s3 did not complete cleanly
+[22:50:53] preflight OK — model=deepseek-v4-flash, 16 cores, timeout 14400s/run
+[22:50:53] START consol-s1 (consol) try 1/2
+[00:03:52] preflight OK — model=deepseek-v4-flash, 16 cores, timeout 14400s/run
+[00:03:52] START consol-s1 (consol) try 1/2
+rm: cannot remove '/mnt/d/Code/Fun/coral/task3_vrp/results/consol/consol-s1': Directory not empty
+[00:09:13] preflight OK — model=deepseek-v4-flash, 16 cores, timeout 14400s/run
+[00:09:13] START consol-s1 (consol) try 1/2
+[02:00:22]   gate verified: 2 worktrees with real notes/skills dirs
+[02:00:22]   actual model = deepseek/deepseek-v4-flash
+[02:00:22]   condition verified (model=deepseek-v4-flash); polling every 60s
+[02:00:22] END   consol-s1 (consol) status=auto_stop elapsed=111m attempts=13
+[02:01:22] START consol-s2 (consol) try 1/2
+[03:57:54]   gate verified: 2 worktrees with real notes/skills dirs
+[03:57:54]   actual model = deepseek/deepseek-v4-flash
+[03:57:54]   condition verified (model=deepseek-v4-flash); polling every 60s
+[03:57:54] END   consol-s2 (consol) status=auto_stop elapsed=116m attempts=13
+[03:58:54] START consol-s3 (consol) try 1/2
+[05:18:40]   gate verified: 2 worktrees with real notes/skills dirs
+[05:18:40]   actual model = deepseek/deepseek-v4-flash
+[05:18:40]   condition verified (model=deepseek-v4-flash); polling every 60s
+[05:18:40] END   consol-s3 (consol) status=auto_stop elapsed=79m attempts=12
+[05:19:40] CONSOL ARM DONE — 0 run(s) did not reach auto_stop

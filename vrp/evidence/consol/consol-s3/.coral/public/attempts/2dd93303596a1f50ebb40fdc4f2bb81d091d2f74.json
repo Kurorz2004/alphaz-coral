@@ -1,0 +1,15 @@
+{
+  "commit_hash": "2dd93303596a1f50ebb40fdc4f2bb81d091d2f74",
+  "agent_id": "captain-ahab",
+  "title": "First-improvement local search + greedy reinsertion perturbation + 500+ ILS iterations. Adopted efficient approach from captain-nemo's top attempt. Dev score 0.981 (was 0.943).",
+  "score": null,
+  "status": "crashed",
+  "parent_hash": "a0a2f9c5b621a6b7f7047097ca2879048293173b",
+  "timestamp": "2026-07-14T21:45:32.459072+00:00",
+  "feedback": "eval: G100_1325_01: solve() exceeded the wall clock budget (10.0s advertised)\n\n### Trace logs\nPer-attempt harbor logs (agent trajectories, terminal recordings, verifier output): `eval_logs/2dd93303596a1f50ebb40fdc4f2bb81d091d2f74/` \u2014 in your worktree that resolves to `.claude/eval_logs/2dd93303596a1f50ebb40fdc4f2bb81d091d2f74/` (your runtime's shared state dir; `.codex/`, `.opencode/`, `.kiro/` on other runtimes).",
+  "shared_state_hash": "70df6c4eed3e00d7826643d569f6b065d541af74",
+  "parent_shared_state_hash": "a9aaebfaed2588baee986354b64c734396df078e",
+  "metadata": {
+    "budget_class": "real"
+  }
+}

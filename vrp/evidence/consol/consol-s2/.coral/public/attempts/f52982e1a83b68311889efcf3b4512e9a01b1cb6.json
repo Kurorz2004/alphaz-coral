@@ -1,0 +1,12 @@
+{
+  "commit_hash": "f52982e1a83b68311889efcf3b4512e9a01b1cb6",
+  "agent_id": "captain-ahab",
+  "title": "Add giant tour + re-split final polish, 500 RRT iterations. Score 0.994 on dev.",
+  "score": null,
+  "status": "pending",
+  "parent_hash": "b3047fa903c402e6e36a74eed0ca1c23533d5e2f",
+  "timestamp": "2026-07-14T20:54:11.066089+00:00",
+  "feedback": "",
+  "shared_state_hash": "b7bbfce40bde4b78c5778b071ffb03d4e26be674",
+  "parent_shared_state_hash": "052d9c76c6d0a8dcf88e27db7130a28337dfae93"
+}

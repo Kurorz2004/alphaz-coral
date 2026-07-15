@@ -1,0 +1,1 @@
+coral start -c ./task.yaml agents.model=deepseek-v4-flash workspace.repo_path=/mnt/d/Code/Fun/coral/task3_vrp/seed workspace.results_dir=./results/consol workspace.run_dir=./results/consol/consol-s2 agents.publication_gate=true agents.gate_consolidator_model=deepseek-v4-flash

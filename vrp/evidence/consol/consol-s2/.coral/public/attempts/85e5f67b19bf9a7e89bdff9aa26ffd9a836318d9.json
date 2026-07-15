@@ -1,0 +1,14 @@
+{
+  "commit_hash": "85e5f67b19bf9a7e89bdff9aa26ffd9a836318d9",
+  "agent_id": "captain-nemo",
+  "title": "Clarke-Wright savings + Simulated Annealing (2-opt, relocate, exchange, 2-opt*) \u2014 initial implementation. Score 0.922 on dev set.",
+  "score": null,
+  "status": "crashed",
+  "parent_hash": "b5d065bafc8a9e72cf1ba9f55c80f051e8ddfab4",
+  "timestamp": "2026-07-14T19:10:17.020923+00:00",
+  "feedback": "eval: G100_1271_01: solve() exceeded the wall clock budget (10.0s advertised)\n\n### Trace logs\nPer-attempt harbor logs (agent trajectories, terminal recordings, verifier output): `eval_logs/85e5f67b19bf9a7e89bdff9aa26ffd9a836318d9/` \u2014 in your worktree that resolves to `.claude/eval_logs/85e5f67b19bf9a7e89bdff9aa26ffd9a836318d9/` (your runtime's shared state dir; `.codex/`, `.opencode/`, `.kiro/` on other runtimes).",
+  "shared_state_hash": "460f98c6dab0540136e5cf944f5087a1ef7055a5",
+  "metadata": {
+    "budget_class": "real"
+  }
+}

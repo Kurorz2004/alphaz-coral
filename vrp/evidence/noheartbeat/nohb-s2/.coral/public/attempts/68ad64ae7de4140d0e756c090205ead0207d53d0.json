@@ -1,0 +1,12 @@
+{
+  "commit_hash": "68ad64ae7de4140d0e756c090205ead0207d53d0",
+  "agent_id": "captain-nemo",
+  "title": "Add 3-opt, nearest-insertion, sweep construction, ruin-recreate perturbation",
+  "score": null,
+  "status": "pending",
+  "parent_hash": "6b2e172305a6aa711119502119abd7c7f72ca7d0",
+  "timestamp": "2026-07-13T18:03:48.916546+00:00",
+  "feedback": "",
+  "shared_state_hash": "32b522651e8895bd611aa40c834a16cef374680b",
+  "parent_shared_state_hash": "3abdabd585840e1eb14d513dde001b925c4360f0"
+}

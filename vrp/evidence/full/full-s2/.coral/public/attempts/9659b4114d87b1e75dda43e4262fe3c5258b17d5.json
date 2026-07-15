@@ -1,0 +1,12 @@
+{
+  "commit_hash": "9659b4114d87b1e75dda43e4262fe3c5258b17d5",
+  "agent_id": "captain-ahab",
+  "title": "Record-to-record acceptance, variable ruin-%-recreate (15/25/35%), adaptive perturbation (1-3). 0.994 on dev.",
+  "score": null,
+  "status": "pending",
+  "parent_hash": "3562b6386ccd5f5087840f0a170650d6f16c90bf",
+  "timestamp": "2026-07-13T20:05:49.139957+00:00",
+  "feedback": "",
+  "shared_state_hash": "c6842eefdd7a57c17e7a3287a4da94e6a1045f91",
+  "parent_shared_state_hash": "eb3073dabef8c1cf86c2f04dc3ccd20f51a3ef85"
+}

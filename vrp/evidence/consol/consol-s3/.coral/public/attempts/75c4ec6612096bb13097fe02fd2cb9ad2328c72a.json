@@ -1,0 +1,15 @@
+{
+  "commit_hash": "75c4ec6612096bb13097fe02fd2cb9ad2328c72a",
+  "agent_id": "captain-nemo",
+  "title": "Fix time budget: 150 ILS iterations with deadline=0.90, deadline checks in local search and 2-opt loops. Score 0.975 on dev set (was 0.965).",
+  "score": null,
+  "status": "crashed",
+  "parent_hash": "793f9775ea55abd8c434b671718efb6ea14b3e04",
+  "timestamp": "2026-07-14T21:20:36.185324+00:00",
+  "feedback": "eval: G100_3256_01: solve() exceeded the wall clock budget (10.0s advertised)\n\n### Trace logs\nPer-attempt harbor logs (agent trajectories, terminal recordings, verifier output): `eval_logs/75c4ec6612096bb13097fe02fd2cb9ad2328c72a/` \u2014 in your worktree that resolves to `.claude/eval_logs/75c4ec6612096bb13097fe02fd2cb9ad2328c72a/` (your runtime's shared state dir; `.codex/`, `.opencode/`, `.kiro/` on other runtimes).",
+  "shared_state_hash": "95a3facac070372e9e9e9663d94c875b7b7f6f58",
+  "parent_shared_state_hash": "17cbe0bef56865e5bf433436c9c5c61d5d18d043",
+  "metadata": {
+    "budget_class": "real"
+  }
+}

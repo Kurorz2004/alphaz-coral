@@ -1,0 +1,39 @@
+[16:57:45] preflight OK — model=deepseek-v4-flash, 16 cores, timeout 14400s/run
+[16:57:45] START full-s1 (full) try 1/2
+[18:43:32]   actual model = deepseek/deepseek-v4-flash
+[18:43:32]   condition verified (model=deepseek-v4-flash); polling every 60s
+[18:43:32] END   full-s1 (full) status=auto_stop elapsed=105m attempts=13
+[18:44:32] START nok-s1 (noknowledge) try 1/2
+[20:51:03]   actual model = deepseek/deepseek-v4-flash
+[20:51:03]   condition verified (model=deepseek-v4-flash); polling every 60s
+[20:51:03] END   nok-s1 (noknowledge) status=auto_stop elapsed=126m attempts=12
+[20:52:03] START nohb-s1 (noheartbeat) try 1/2
+[22:40:16]   actual model = deepseek/deepseek-v4-flash
+[22:40:16]   condition verified (model=deepseek-v4-flash); polling every 60s
+[22:40:16] END   nohb-s1 (noheartbeat) status=auto_stop elapsed=108m attempts=12
+[22:41:16] START nok-s2 (noknowledge) try 1/2
+[00:13:49]   actual model = deepseek/deepseek-v4-flash
+[00:13:49]   condition verified (model=deepseek-v4-flash); polling every 60s
+[00:13:49] END   nok-s2 (noknowledge) status=auto_stop elapsed=92m attempts=13
+[00:14:49] START nohb-s2 (noheartbeat) try 1/2
+[01:05:28]   actual model = deepseek/deepseek-v4-flash
+[01:05:28]   condition verified (model=deepseek-v4-flash); polling every 60s
+[01:05:29] END   nohb-s2 (noheartbeat) status=auto_stop elapsed=50m attempts=14
+[01:06:29] START full-s2 (full) try 1/2
+[03:10:45]   actual model = deepseek/deepseek-v4-flash
+[03:10:45]   condition verified (model=deepseek-v4-flash); polling every 60s
+[03:10:45] END   full-s2 (full) status=auto_stop elapsed=124m attempts=13
+[03:11:45] START nok-s3 (noknowledge) try 1/2
+[06:23:05]   actual model = deepseek/deepseek-v4-flash
+[06:23:05]   condition verified (model=deepseek-v4-flash); polling every 60s
+[06:23:05] END   nok-s3 (noknowledge) status=auto_stop elapsed=191m attempts=13
+[06:24:05] START nohb-s3 (noheartbeat) try 1/2
+[08:55:22]   actual model = deepseek/deepseek-v4-flash
+[08:55:22]   condition verified (model=deepseek-v4-flash); polling every 60s
+[08:55:22] END   nohb-s3 (noheartbeat) status=auto_stop elapsed=151m attempts=13
+[08:56:22] START full-s3 (full) try 1/2
+[12:12:05]   actual model = deepseek/deepseek-v4-flash
+[12:12:05]   condition verified (model=deepseek-v4-flash); polling every 60s
+[12:12:05] END   full-s3 (full) status=auto_stop elapsed=195m attempts=12
+[12:13:05] ALL DONE — 0 run(s) did not reach auto_stop
+[12:13:05] next: uv run --project ../coral-upstream python analyze.py

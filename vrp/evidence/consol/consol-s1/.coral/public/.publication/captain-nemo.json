@@ -1,0 +1,13 @@
+{
+  "experiments/001-cw-vnd-ils.md": "0572a4ca5a07d61c57516518a7d5144e54e3b010f91f7b83990003e8f2aa79ee",
+  "experiments/002-ils-ruin-and-recreate.md": "d7728fcdfa337eaf8bb562329b8f268a63767d77cb5afa4c1643f5a2786fccb6",
+  "experiments/003-ils-multiple-ruin-strategies.md": "f37cd2446c5f368d9fd59e6bd76197b4d20da498b741249c78b8675dc7a16064",
+  "experiments/004-adaptive-shaw-ils.md": "d54c185cfa97a7310c20a9363cc057aaae25445c29a4a9223ee1d5245e4f7687",
+  "experiments/eval-1-baseline-nn.md": "553f8b5dde8450c115432fd6e011a77cbcd6a51beb7a59a89f14dda1e2051450",
+  "experiments/eval-2-cw-ls.md": "49fa8ceec435fdc817cb0abf9e9e6c05a732c18491069f67fbfcbf9b91676713",
+  "experiments/eval-3-sa.md": "a6122c82e8bdfcbbc15150064e55b637f88a8218ba2af32503f763f2c6a363f1",
+  "experiments/eval-4-sa-reheat.md": "d9ee68168ded6115864c9a12949d9281bbcb70493638ef4f8b8a07be39a13e8e",
+  "experiments/eval-5-oropt.md": "adbd3a52bc80c40eb17befce8b3d96d6068620bb97c3a1a797540421a8d895c3",
+  "experiments/eval-6-final-oropt.md": "acf2e43da3ebf1bbfafdb7ff97916e9be1e1d4f5d0b11da6810d43ae1895d851",
+  "index.md": "ff7418d50bef6648c93e08e3c236d42a6b580d2e8daa11e74c870f6dba0d50c4"
+}

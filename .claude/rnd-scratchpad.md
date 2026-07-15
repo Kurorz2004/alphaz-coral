@@ -1,8 +1,8 @@
 # R&D scratchpad
 
-## task3_vrp — HGS-as-labeler validation (XML100)
+## vrp — HGS-as-labeler validation (XML100)
 
-Scripts: `task3_vrp/data/_labelval/`. Python: `/d/Libs/Miniforge2/python`. pyvrp 0.11.3, numpy 1.26.4, 16 CPUs.
+Scripts: `vrp/data/_labelval/`. Python: `/d/Libs/Miniforge2/python`. pyvrp 0.11.3, numpy 1.26.4, 16 CPUs.
 Frozen ground truth: 10,000 XML100 instances + proven-optimal .sol from the same generator.
 
 - [.sol integrity] ran audit_all_sols.py over ALL 10,000 .sol -> 91 (0.91%) are MALFORMED

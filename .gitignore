@@ -23,3 +23,7 @@ venv/
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# Committed run evidence (built by vrp/collect_evidence.sh): keep everything,
+# even where the runtime patterns above (.coral/, *.log) would match.
+!vrp/evidence/**

@@ -21,12 +21,13 @@ import json
 import math
 import re
 import statistics
+import sys
 from dataclasses import dataclass, field
 from itertools import combinations
 from pathlib import Path
 
 HERE = Path(__file__).parent
-RESULTS = HERE / "results"
+RESULTS = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else HERE / "results"
 SEED_BASELINE = HERE / "seed_baseline.json"
 
 # The ablation runs MODEL=deepseek-v4-flash, the same model task.yaml uses for
@@ -40,6 +41,8 @@ CONDITIONS = {
     "full": "Full CORAL (control)",
     "noknowledge": "A - notes/skills disabled",
     "noheartbeat": "B - heartbeats disabled",
+    "gate": "Gate only",
+    "consol": "Gate + LLM consolidation",
 }
 
 
